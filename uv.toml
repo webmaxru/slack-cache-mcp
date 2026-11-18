@@ -1,5 +1,0 @@
-# Local/dev note: files.pythonhosted.org TLS fails on some Windows hosts.
-# CI (GitHub Actions) can use the default PyPI index.
-[[index]]
-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-default = true

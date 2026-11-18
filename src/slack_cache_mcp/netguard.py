@@ -9,16 +9,14 @@ from __future__ import annotations
 import ipaddress
 import socket
 import sys
+from pathlib import Path
 from typing import Any
 
 _INSTALLED = False
 
-# Basename prefixes allowed for subprocess.Popen (local admin helpers only).
-_SUBPROCESS_ALLOW = (
-    "schtasks",
-    "powershell",
-    "pwsh",
-)
+# Exact executable basenames (no prefix matching).
+# icacls removed: data-dir ACLs use Win32 APIs in paths.py (no subprocess).
+_ALLOWED_EXACT = frozenset({"schtasks", "powershell", "pwsh"})
 
 
 class NetworkGuardError(RuntimeError):
@@ -39,7 +37,6 @@ def _is_loopback_host(host: str | bytes | None) -> bool:
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
-        # Unresolved names are not allowed through connect/sendto/getaddrinfo.
         return False
 
 
@@ -49,36 +46,111 @@ def _addr_is_loopback(address: Any) -> bool:
     if isinstance(address, tuple) and address:
         return _is_loopback_host(address[0])
     if isinstance(address, str):
-        # AF_UNIX / abstract — treat as local
         return True
     return False
 
 
-def _check_subprocess(args: Any) -> None:
+def _exe_basename(exe: str) -> str:
+    base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return base.removesuffix(".exe")
+
+
+def _argv_list(args: Any) -> list[str]:
     if not args:
         raise NetworkGuardError("subprocess.Popen with empty args blocked")
     if isinstance(args, (str, bytes)):
-        cmd = args if isinstance(args, str) else args.decode("utf-8", "replace")
-        exe = cmd.split()[0] if cmd.strip() else ""
-    else:
-        try:
-            exe = str(args[0])
-        except Exception as exc:
-            raise NetworkGuardError(f"subprocess.Popen blocked: {exc}") from exc
-    base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    base = base.removesuffix(".exe")
-    if not any(base == a or base.startswith(a) for a in _SUBPROCESS_ALLOW):
-        raise NetworkGuardError(f"subprocess.Popen blocked for executable: {exe!r}")
+        raise NetworkGuardError("string/bytes subprocess commands blocked by netguard")
+    try:
+        return [str(a) for a in args]
+    except Exception as exc:
+        raise NetworkGuardError(f"subprocess.Popen blocked: {exc}") from exc
+
+
+def _tokenize_windows_cmdline(cmdline: str) -> list[str]:
+    """Minimal Windows command-line tokenizer for audit allowlisting."""
+    out: list[str] = []
+    buf: list[str] = []
+    in_quote = False
+    i = 0
+    while i < len(cmdline):
+        ch = cmdline[i]
+        if ch == '"':
+            in_quote = not in_quote
+            i += 1
+            continue
+        if ch in {" ", "\t"} and not in_quote:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _check_subprocess_windows_cmdline(executable: str | None, cmdline: str | bytes) -> None:
+    if isinstance(cmdline, bytes):
+        cmdline = cmdline.decode("utf-8", errors="replace")
+    tokens = _tokenize_windows_cmdline(cmdline)
+    if executable:
+        # Prefer the resolved executable basename when present.
+        tokens = [executable, *tokens[1:]] if tokens else [executable]
+    _check_subprocess(tokens)
+
+
+def _check_subprocess(args: Any) -> None:
+    """Allow only specific read-only local helpers with validated argv."""
+    if isinstance(args, (str, bytes)):
+        raise NetworkGuardError("string/bytes subprocess commands blocked by netguard")
+    argv = _argv_list(args)
+    exe = _exe_basename(argv[0])
+    if exe not in _ALLOWED_EXACT:
+        raise NetworkGuardError(f"subprocess.Popen blocked for executable: {argv[0]!r}")
+
+    rest_lower = [a.lower() for a in argv[1:]]
+
+    if exe == "schtasks":
+        # Read-only query only (task install uses XML generation + /Create later in M2
+        # and will need an explicit allow once implemented).
+        if rest_lower and rest_lower[0] == "/query":
+            return
+        raise NetworkGuardError("schtasks only /Query is allowed under netguard")
+
+    if exe in {"powershell", "pwsh"}:
+        # Require -NoProfile and only Get-AppxPackage (read-only Slack Store version lookup).
+        if "-noprofile" not in rest_lower:
+            raise NetworkGuardError("powershell requires -NoProfile")
+        joined = " ".join(rest_lower)
+        banned = (
+            "invoke-webrequest",
+            "invoke-restmethod",
+            "invoke-expression",
+            "iex ",
+            "curl ",
+            "wget ",
+            "start-process",
+            "new-object net.",
+            "downloadstring",
+            "downloadfile",
+        )
+        if any(b in joined for b in banned):
+            raise NetworkGuardError("powershell network/exec cmdlets blocked")
+        if "get-appxpackage" not in joined:
+            raise NetworkGuardError("powershell only Get-AppxPackage is allowed")
+        return
+
+    raise NetworkGuardError(f"subprocess.Popen blocked for executable: {argv[0]!r}")
 
 
 def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
     if event == "socket.connect":
-        # args: (sock, address)
         if len(args) >= 2 and not _addr_is_loopback(args[1]):
             raise NetworkGuardError(f"socket.connect blocked to non-loopback: {args[1]!r}")
         return
     if event in {"socket.sendto", "socket.sendmsg"}:
-        # args: (sock, address); sendmsg's address is None on connected sockets
         addr = args[-1] if args else None
         if isinstance(addr, tuple) and not _addr_is_loopback(addr):
             raise NetworkGuardError(f"{event} blocked to non-loopback: {addr!r}")
@@ -110,9 +182,19 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
     if event == "webbrowser.open":
         raise NetworkGuardError("webbrowser.open blocked by netguard")
     if event == "subprocess.Popen":
-        # args: (executable, args, cwd, env) — CPython 3.8+ audit uses (args, ...)
-        if args:
-            _check_subprocess(args[0])
+        # Audit payload is (executable, args, cwd, env).
+        # On Windows, `args` is list2cmdline'd to a string before the audit fires;
+        # reconstruct a token list from that cmdline for allowlist checks.
+        executable = args[0] if args else None
+        argv = args[1] if len(args) > 1 else None
+        if isinstance(argv, (list, tuple)):
+            _check_subprocess(list(argv))
+        elif isinstance(argv, (str, bytes)):
+            _check_subprocess_windows_cmdline(executable, argv)
+        elif executable is not None:
+            _check_subprocess([executable])
+        else:
+            raise NetworkGuardError("subprocess.Popen with empty args blocked")
         return
 
 
@@ -134,3 +216,11 @@ def assert_loopback_allowed() -> None:
     install()
     with socket.create_connection(("127.0.0.1", 9), timeout=0.2):
         pass
+
+
+def allowlisted_exe_names() -> frozenset[str]:
+    return _ALLOWED_EXACT
+
+
+def path_basename(path: str | Path) -> str:
+    return _exe_basename(str(path))

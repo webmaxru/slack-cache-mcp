@@ -34,6 +34,51 @@ def _ts_num(ts: str) -> float:
         return 0.0
 
 
+def _filter_clause(filters: dict[str, Any], *, alias: str = "m") -> tuple[str, list[Any]]:
+    """Shared WHERE fragments for FTS, trigram, and filter-only search."""
+    sql = ""
+    params: list[Any] = []
+    channel_ids = filters.get("channel_ids") or (
+        [filters["channel_id"]] if filters.get("channel_id") else None
+    )
+    user_ids = filters.get("user_ids") or (
+        [filters["user_id"]] if filters.get("user_id") else None
+    )
+    if channel_ids:
+        placeholders = ",".join("?" for _ in channel_ids)
+        sql += f" AND {alias}.channel_id IN ({placeholders})"
+        params.extend(channel_ids)
+    if user_ids:
+        placeholders = ",".join("?" for _ in user_ids)
+        sql += f" AND {alias}.user_id IN ({placeholders})"
+        params.extend(user_ids)
+    if filters.get("workspace_key"):
+        sql += f" AND {alias}.workspace_key=?"
+        params.append(filters["workspace_key"])
+    deleted_mode = filters.get("deleted_mode", "exclude")
+    if deleted_mode == "exclude":
+        sql += f" AND {alias}.deleted_state='none'"
+    elif deleted_mode == "only":
+        sql += f" AND {alias}.deleted_state!='none'"
+    # deleted_mode == "include" → no predicate
+    if filters.get("after") is not None:
+        sql += f" AND {alias}.ts_num >= ?"
+        params.append(float(filters["after"]))
+    if filters.get("before") is not None:
+        sql += f" AND {alias}.ts_num < ?"
+        params.append(float(filters["before"]))
+    if filters.get("has_files"):
+        sql += f" AND {alias}.has_files=1"
+    if filters.get("has_links"):
+        sql += f" AND {alias}.has_links=1"
+    if filters.get("is_thread"):
+        sql += (
+            f" AND ({alias}.thread_ts IS NOT NULL OR "
+            f"COALESCE({alias}.reply_count, 0) > 0)"
+        )
+    return sql, params
+
+
 class SqliteRepository:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
@@ -468,6 +513,19 @@ class SqliteRepository:
         last_seen = max(r["last_seen"] for r in rows)
         is_reply = 1 if chosen.thread_ts and chosen.thread_ts != ts else 0
         has_links = 1 if "http://" in chosen.text or "https://" in chosen.text else 0
+        has_files = 0
+        try:
+            raw_obj = json.loads(
+                self._conn.execute(
+                    "SELECT raw_json FROM message_versions WHERE channel_id=? AND ts=? AND content_sha256=?",
+                    (channel_id, ts, chosen.content_sha256),
+                ).fetchone()["raw_json"]
+            )
+            files = raw_obj.get("files") if isinstance(raw_obj, dict) else None
+            if isinstance(files, list) and files:
+                has_files = 1
+        except (TypeError, KeyError, json.JSONDecodeError):
+            has_files = 0
         # Upsert messages
         existing = self._conn.execute(
             "SELECT rowid FROM messages WHERE channel_id=? AND ts=?",
@@ -483,7 +541,7 @@ class SqliteRepository:
                   ts_num=?, workspace_key=?, user_id=?, thread_ts=?, is_reply=?,
                   subtype=?, text=?, search_text=?, current_sha256=?, version_count=?,
                   edited_ts=?, deleted_state=?, reply_count=?, latest_reply=?,
-                  reply_users_json=?, has_links=?, first_seen=?, last_seen=?
+                  reply_users_json=?, has_files=?, has_links=?, first_seen=?, last_seen=?
                 WHERE rowid=?
                 """,
                 (
@@ -502,6 +560,7 @@ class SqliteRepository:
                     reply_count,
                     latest_reply,
                     json.dumps(reply_users),
+                    has_files,
                     has_links,
                     first_seen,
                     last_seen,
@@ -516,7 +575,7 @@ class SqliteRepository:
                   subtype, text, search_text, current_sha256, version_count, edited_ts,
                   deleted_state, reply_count, latest_reply, reply_users_json,
                   has_files, has_links, first_seen, last_seen
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel_id,
@@ -536,6 +595,7 @@ class SqliteRepository:
                     reply_count,
                     latest_reply,
                     json.dumps(reply_users),
+                    has_files,
                     has_links,
                     first_seen,
                     last_seen,
@@ -761,9 +821,11 @@ class SqliteRepository:
         kind: str = "any",
         workspace: str | None = None,
     ) -> list[dict[str, Any]]:
-        q = name_or_id.lstrip("#@")
+        raw = name_or_id.strip()
+        q = raw.lstrip("#@")
+        wants_dm = raw.startswith("@") or kind == "im"
         out: list[dict[str, Any]] = []
-        if kind in ("any", "channel"):
+        if kind in ("any", "channel", "im"):
             sql = "SELECT * FROM channels WHERE channel_id=? OR name=? OR name LIKE ?"
             params: list[Any] = [q, q, f"%{q}%"]
             if workspace:
@@ -780,6 +842,29 @@ class SqliteRepository:
                         "confidence": conf,
                     }
                 )
+            # PLAN §10.5: in:@user resolves to IM channel via im_user_id
+            if wants_dm or kind in ("any", "im"):
+                user_hits = self._conn.execute(
+                    "SELECT user_id FROM users WHERE user_id=? OR name=? OR display_name=?",
+                    (q, q, q),
+                ).fetchall()
+                user_ids = [r["user_id"] for r in user_hits] or ([q] if q.startswith("U") else [])
+                for uid in user_ids:
+                    im_sql = "SELECT * FROM channels WHERE kind='im' AND im_user_id=?"
+                    im_params: list[Any] = [uid]
+                    if workspace:
+                        im_sql += " AND workspace_key=?"
+                        im_params.append(workspace)
+                    for r in self._conn.execute(im_sql + " LIMIT 5", im_params).fetchall():
+                        out.append(
+                            {
+                                "id": r["channel_id"],
+                                "kind": "channel",
+                                "name": r["name"] or f"@{uid}",
+                                "workspace": r["workspace_key"],
+                                "confidence": 0.95,
+                            }
+                        )
         if kind in ("any", "user"):
             sql = "SELECT * FROM users WHERE user_id=? OR name=? OR display_name=? OR real_name LIKE ?"
             params = [q, q, q, f"%{q}%"]
@@ -866,33 +951,19 @@ class SqliteRepository:
         limit: int,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        sql = """
+        filt = dict(filters or {})
+        if "deleted_mode" not in filt:
+            filt["deleted_mode"] = "include" if filt.get("include_deleted") else "exclude"
+        clause, fparams = _filter_clause(filt)
+        sql = f"""
         SELECT m.*, bm25(messages_fts) AS rank
         FROM messages_fts
         JOIN messages m ON m.rowid = messages_fts.rowid
         WHERE messages_fts MATCH ?
+        {clause}
+        ORDER BY rank LIMIT ?
         """
-        params: list[Any] = [match_sql]
-        filt = filters or {}
-        if filt.get("channel_id"):
-            sql += " AND m.channel_id=?"
-            params.append(filt["channel_id"])
-        if filt.get("workspace_key"):
-            sql += " AND m.workspace_key=?"
-            params.append(filt["workspace_key"])
-        if filt.get("user_id"):
-            sql += " AND m.user_id=?"
-            params.append(filt["user_id"])
-        if not filt.get("include_deleted"):
-            sql += " AND m.deleted_state='none'"
-        if filt.get("after"):
-            sql += " AND m.ts_num >= ?"
-            params.append(_ts_num(str(filt["after"])))
-        if filt.get("before"):
-            sql += " AND m.ts_num < ?"
-            params.append(_ts_num(str(filt["before"])))
-        sql += " ORDER BY rank LIMIT ?"
-        params.append(limit)
+        params: list[Any] = [match_sql, *fparams, limit]
         try:
             rows = self._conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
@@ -906,24 +977,46 @@ class SqliteRepository:
         limit: int,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        # trigram MATCH needs quoted phrase for substring
+        filt = dict(filters or {})
+        if "deleted_mode" not in filt:
+            filt["deleted_mode"] = "include" if filt.get("include_deleted") else "exclude"
+        clause, fparams = _filter_clause(filt)
         q = '"' + needle.replace('"', "") + '"'
-        sql = """
+        sql = f"""
         SELECT m.*
         FROM messages_trigram
         JOIN messages m ON m.rowid = messages_trigram.rowid
         WHERE messages_trigram MATCH ?
+        {clause}
+        LIMIT ?
         """
-        params: list[Any] = [q]
-        filt = filters or {}
-        if not filt.get("include_deleted"):
-            sql += " AND m.deleted_state='none'"
-        sql += " LIMIT ?"
-        params.append(limit)
+        params: list[Any] = [q, *fparams, limit]
         try:
             rows = self._conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
             return []
+        return [self._msg_dict(r) for r in rows]
+
+    def search_filtered(
+        self,
+        *,
+        limit: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Filter-only search when the query has operators but no free text."""
+        filt = dict(filters or {})
+        if "deleted_mode" not in filt:
+            filt["deleted_mode"] = "include" if filt.get("include_deleted") else "exclude"
+        clause, fparams = _filter_clause(filt)
+        sql = f"""
+        SELECT m.*
+        FROM messages m
+        WHERE 1=1
+        {clause}
+        ORDER BY m.ts_num DESC
+        LIMIT ?
+        """
+        rows = self._conn.execute(sql, [*fparams, limit]).fetchall()
         return [self._msg_dict(r) for r in rows]
 
     def scan_for_token_leak(self) -> list[str]:

@@ -46,9 +46,11 @@ def choose_current(versions: Sequence[VersionCandidate]) -> VersionCandidate | N
 
 
 def deleted_state_for(versions: Sequence[VersionCandidate], chosen: VersionCandidate) -> str:
-    chosen_key = _edit_key(chosen)
+    # Explicit tombstones are facts (PLAN §8.2). A tombstone without edited_ts still
+    # marks the message deleted even when a later-edited content version is current.
+    _ = chosen  # projection still picks content separately
     for v in versions:
-        if v.is_deletion and _edit_key(v) >= chosen_key:
+        if v.is_deletion:
             return "deleted"
     return "none"
 

@@ -1,0 +1,56 @@
+"""Pipeline path/permission/DM/capture policy tests."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from slack_cache_mcp.config import Settings, load_settings
+from slack_cache_mcp.paths import PathOverlapError, assert_data_dir_outside_sources
+from slack_cache_mcp.pipeline import run_snapshot_once
+from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+from tests.fixture_gen.build_profile import build_synthetic_profile
+
+
+def test_reject_overlapping_data_dir(tmp_path: Path) -> None:
+    profile = build_synthetic_profile(tmp_path / "profile")
+    with pytest.raises(PathOverlapError):
+        assert_data_dir_outside_sources(profile, [profile])
+    settings = load_settings(data_dir=profile, source=profile)
+    with pytest.raises(PathOverlapError):
+        run_snapshot_once(settings)
+
+
+def test_capture_dms_false_skips_im(tmp_path: Path) -> None:
+    profile = build_synthetic_profile(tmp_path / "profile")
+    settings = Settings(data_dir=tmp_path / "data", source_overrides=[profile], capture_dms=False)
+    run_snapshot_once(settings)
+    repo = SqliteRepository(settings.archive_db, read_only=True)
+    ims = repo._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) AS c FROM channels WHERE kind IN ('im','mpim')"
+    ).fetchone()["c"]
+    assert ims == 0
+    repo.close()
+
+
+def test_local_storage_scrubbed_after_snapshot(tmp_path: Path) -> None:
+    profile = build_synthetic_profile(tmp_path / "profile")
+    settings = load_settings(data_dir=tmp_path / "data", source=profile)
+    result = run_snapshot_once(settings)
+    mirror = settings.mirror_dir / result["source_id"]
+    assert not (mirror / "Local Storage" / "leveldb").exists()
+    assert not (mirror / "Local Storage" / "localConfig_v2.json").exists()
+    manifest = (mirror / "manifest.json").read_text(encoding="utf-8")
+    assert "localConfig_v2.json" not in manifest
+    assert "Local Storage/leveldb" not in manifest
+
+
+def test_known_generation_short_circuit(tmp_path: Path) -> None:
+    profile = build_synthetic_profile(tmp_path / "profile")
+    settings = load_settings(data_dir=tmp_path / "data", source=profile)
+    r1 = run_snapshot_once(settings)
+    assert r1["messages_ingested"] > 0
+    r2 = run_snapshot_once(settings)
+    assert r2["skipped_known_generations"] >= r1["states_decoded"]
+    assert r2["messages_ingested"] == 0

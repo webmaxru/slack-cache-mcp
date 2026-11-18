@@ -35,3 +35,34 @@ def test_guard_blocks_http_client_connect() -> None:
 
     with pytest.raises(netguard.NetworkGuardError):
         http.client.HTTPSConnection("example.com").connect()
+
+
+def test_guard_blocks_arbitrary_powershell() -> None:
+    with pytest.raises(netguard.NetworkGuardError):
+        netguard._check_subprocess(  # noqa: SLF001
+            ["powershell", "-Command", "Invoke-WebRequest https://example.com"]
+        )
+
+
+def test_guard_allows_get_appxpackage() -> None:
+    netguard._check_subprocess(  # noqa: SLF001
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-AppxPackage -Name *Slack*",
+        ]
+    )
+
+
+def test_guard_blocks_schtasks_create() -> None:
+    with pytest.raises(netguard.NetworkGuardError):
+        netguard._check_subprocess(["schtasks", "/Create", "/TN", "x"])  # noqa: SLF001
+
+
+def test_guard_blocks_icacls() -> None:
+    # ACL hardening uses Win32 APIs; icacls must stay blocked under netguard.
+    with pytest.raises(netguard.NetworkGuardError):
+        netguard._check_subprocess(  # noqa: SLF001
+            ["icacls", r"C:\tmp\data", "/inheritance:r", "/grant:r", "user:(OI)(CI)F"]
+        )

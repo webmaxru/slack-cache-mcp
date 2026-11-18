@@ -9,7 +9,6 @@ plus Blink envelope + V8 (incl. wire v16 -> v15 relabel).
 from __future__ import annotations
 
 import io
-import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +38,32 @@ class DecodeInfo:
 
 
 BlobLookup = Callable[[int], bytes | None]
+
+
+def _read_le_varint(data: bytes, offset: int = 0) -> tuple[int, int]:
+    """Decode an unsigned little-endian varint; return (value, new_offset)."""
+    result = 0
+    shift = 0
+    i = offset
+    while i < len(data):
+        b = data[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return result, i
+        shift += 7
+        if shift > 70:
+            break
+    raise ValueError("truncated varint")
+
+
+def parse_blob_ref(value_bytes: bytes) -> tuple[int, int]:
+    """Parse `ff 11 01` wrapper: returns (serialized_size, external_object_index)."""
+    if value_bytes[:3] != b"\xff\x11\x01":
+        raise ValueError("not a blob-ref wrapper")
+    size, off = _read_le_varint(value_bytes, 3)
+    index, _ = _read_le_varint(value_bytes, off)
+    return size, index
 
 
 def locate_v8_offset(data: bytes) -> tuple[int | None, int | None, int | None]:
@@ -158,20 +183,13 @@ def unwrap(value_bytes: bytes, blob_lookup: BlobLookup | None = None) -> Any:
     if len(value_bytes) >= 3 and value_bytes[0] == 0xFF and value_bytes[1] == 0x11:
         tag = value_bytes[2]
         if tag == 0x01:
-            # Blob reference: remaining bytes encode blob index (varint / le)
-            rest = value_bytes[3:]
-            if not rest:
-                raise ValueError("empty blob reference")
-            # Chromium typically stores a little-endian blob number; try uint64 then varint-ish int
-            if len(rest) >= 8:
-                blob_no = struct.unpack("<Q", rest[:8])[0]
-            else:
-                blob_no = int.from_bytes(rest, "little")
+            # Chromium IDBValueWrapper: size varint, then external-object index varint
+            _size, blob_index = parse_blob_ref(value_bytes)
             if blob_lookup is None:
                 raise ValueError("blob_ref requires blob_lookup")
-            raw = blob_lookup(int(blob_no))
+            raw = blob_lookup(int(blob_index))
             if raw is None:
-                raise FileNotFoundError(f"blob {blob_no} missing")
+                raise FileNotFoundError(f"blob {blob_index} missing")
             info, val = decode_blob_bytes(raw)
             if info.error:
                 raise ValueError(info.error)

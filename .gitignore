@@ -17,5 +17,8 @@ Thumbs.db
 .env
 .env.*
 
+# Local-only PyPI mirror overrides (never ship to CI).
+uv.toml
+
 .import_linter_cache/
 
