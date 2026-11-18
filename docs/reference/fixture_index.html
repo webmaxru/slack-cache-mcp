@@ -1,0 +1,15 @@
+<!doctype html><html><body><script>
+// Synthetic, Slack-shaped redux state (fake data, no Slack involved)
+const msgs = {};
+for (let i=0;i<3000;i++){ const ts=(1763400000+i)+".000"+String(i).padStart(3,"0");
+  msgs[ts]={type:"message",ts,user:"U0FAKE"+(i%7),text:"synthetic message #"+i+" lorem ipsum dolor sit amet "+"x".repeat(40),thread_ts: i%50===0?ts:undefined, channel:"C0GUEST1"}; }
+const state = { channels:{C0GUEST1:{id:"C0GUEST1",name:"guest-shared",is_private:true,is_ext_shared:true}},
+  members:{U0FAKE1:{id:"U0FAKE1",name:"alice",real_name:"Alice Example",profile:{display_name:"alice"}}},
+  messages:{C0GUEST1:msgs}, selfTeamIds:{teamId:"T0FAKE"}, bootData:{team_id:"T0FAKE"} };
+const req = indexedDB.open("reduxPersistence", 1);
+req.onupgradeneeded = e => e.target.result.createObjectStore("reduxPersistenceStore");
+req.onsuccess = e => { const db=e.target.result; const tx=db.transaction("reduxPersistenceStore","readwrite");
+  tx.objectStore("reduxPersistenceStore").put(state, "persist:T0FAKE_U0FAKE1");
+  tx.objectStore("reduxPersistenceStore").put({small:true, note:"inline value"}, "small");
+  tx.oncomplete=()=>{document.title="DONE"; document.body.textContent="DONE";}; };
+</script></body></html>

@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(uv)",
+      "Shell(python)",
+      "Shell(pytest)",
+      "Shell(ruff)",
+      "Shell(mypy)",
+      "Shell(git)",
+      "Shell(node)",
+      "Shell(npm)",
+      "Read(**)",
+      "Write(**)"
+    ],
+    "deny": [
+      "Read(**/AppData/Roaming/Slack/**)",
+      "Read(**/AppData/Local/Packages/*Slack*/**)",
+      "Read(**/AppData/Local/slackcache/**)",
+      "Read(**/Library/Application Support/Slack/**)",
+      "Read(**/Library/Containers/com.tinyspeck.slackmacgap/**)",
+      "Read(**/.config/Slack/**)",
+      "Read(**/.env*)",
+      "Write(**/AppData/Roaming/Slack/**)",
+      "Write(**/AppData/Local/Packages/*Slack*/**)",
+      "Write(**/.env*)",
+      "Write(**/*.key)",
+      "WebFetch(*.slack.com)",
+      "WebFetch(slack.com)",
+      "WebFetch(*.slack-edge.com)",
+      "Shell(curl)",
+      "Shell(wget)",
+      "Shell(Invoke-WebRequest)",
+      "Shell(iwr)",
+      "Shell(robocopy)",
+      "Shell(rm)"
+    ]
+  }
+}
