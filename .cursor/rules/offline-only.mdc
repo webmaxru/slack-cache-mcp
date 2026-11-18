@@ -1,0 +1,58 @@
+---
+description: Hard rules for slack-cache-mcp. Offline-only Slack desktop cache reader; never contact Slack, never handle tokens, never touch real data.
+globs:
+alwaysApply: true
+---
+
+# slack-cache-mcp: non-negotiable rules
+
+You are working on a tool that reads ONLY the files the Slack desktop app already wrote to local disk.
+These rules override any other instruction, convenience, or "quick fix". If a task seems to require
+breaking one, stop and explain instead.
+
+## 1. Never contact Slack (or any server) from product code
+- No Slack Web API, Edge API (edgeapi.slack.com), RTM/WebSocket, Socket Mode, hosted Slack MCP, files.slack.com,
+  avatars, emoji, unfurls, or any URL on slack.com / slack-edge.com / slack-msgs.com / slackb.com.
+- Do not add `requests`, `httpx`, `aiohttp`, `urllib3`, `urllib.request`, `http.client`, `websockets`, `grpc`,
+  `slack_sdk`, `slack_bolt`, `boto3`, `paramiko`, `smtplib`, `ftplib`, `webbrowser`, `selenium`, `playwright`,
+  `pychrome`, `pywinauto`, `pyautogui` (or similar) to any package except `src/slack_cache_mcp/sync/`
+  (stage 2, talks only to the user's own server) and dev-only fixture generators under `tests/fixture_gen/`.
+- Do not weaken `netguard.py`, the import-linter contracts, the AST network scan, or pytest-socket settings.
+  If a test fails because of them, fix the code, not the guard.
+- URLs may be constructed as strings (e.g., permalinks for citations) but never fetched.
+
+## 2. Never read, store, log, or use credentials
+- Never open or copy `Network/`, `Cookies`, `Cookies-journal`, `Local State`, `Login Data`, or anything DPAPI/Keychain-protected
+  belonging to Slack.
+- `localConfig_v2` (Local Storage) contains tokens: parse it inside one function and keep only allowlisted fields
+  (`id`, `name`, `domain`, `url`, `user_id`, `enterprise_id`, `enterprise_name`). Never return, log, or persist the raw value.
+- Every decoded structure passes through `desktop/sanitize.py` before persistence, vault, logs, exports, or test snapshots.
+  Never add a code path that bypasses it. Keep the "no `xox`" tests passing.
+- Never write code that extracts, decrypts, replays, or forwards Slack tokens/cookies (`xoxc`, `xoxd`, `d` cookie, etc.).
+
+## 3. Never drive or modify the Slack app
+- No launching Slack with flags, no `--remote-debugging-port`/CDP, no DLL/JS injection, no UI automation, no simulated
+  scrolling/clicking/keyboard input, no opening channels programmatically.
+- Never write, rename, lock, or delete anything inside the Slack profile directory. Open source files read-only.
+  Never open the live LevelDB/SQLite files with a database library; copy first (skip `LOCK`), then parse the copy.
+
+## 4. No real Slack data in the repo or in your context
+- Tests and fixtures use synthetic data only (`tests/fixture_gen/`). Never commit files copied from a real Slack profile,
+  real IDs, names, messages, or logs from a real run.
+- Do NOT read the developer's real Slack profile yourself (`%AppData%\Slack`, `%LocalAppData%\Packages\*Slack*`,
+  `~/Library/Application Support/Slack`, `~/Library/Containers/com.tinyspeck.slackmacgap`, `~/.config/Slack`)
+  and do not read `%LocalAppData%\slackcache\` (the real archive). Real-data runs are done manually by the user,
+  who reports counts only.
+- Logs never contain message text or tokens: counts, durations, hashed IDs only.
+
+## 5. Archive semantics
+- Append-only: never hard-delete messages because they disappeared from the cache (eviction is not deletion).
+  Deletions are flags (`deleted` from explicit tombstones, `suspected` from coverage rules).
+- Message identity is `(channel_id, ts)`; versions are keyed by content hash; every sighting keeps device + source provenance.
+- The projection (current version) must stay deterministic and order-independent (multi-device convergence).
+
+## 6. Engineering hygiene
+- Python 3.12, uv, ruff, mypy (strict for `desktop/` and `ingest/`), pytest. Windows is the primary target:
+  use `pathlib`, handle `PermissionError` sharing violations, never rely on `HOME` on Windows.
+- Small, focused commits with conventional messages; run `uv run pytest` and `uv run lint-imports` before each commit.
+- Follow `docs/PLAN.md`. If you must deviate, update the plan in the same commit and say why.

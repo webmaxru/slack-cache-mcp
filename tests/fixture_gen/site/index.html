@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><title>slack-cache-mcp synthetic fixture</title></head>
+<body>
+<p>PoC starter (see docs/reference/fixture_index.html). CI uses the pure-Python builder.</p>
+<script>
+// Extended sketch: multiple workspaces incl. E... key — not required for CI.
+const req = indexedDB.open("reduxPersistence", 1);
+req.onupgradeneeded = e => e.target.result.createObjectStore("reduxPersistenceStore");
+req.onsuccess = e => {
+  const db = e.target.result;
+  const tx = db.transaction("reduxPersistenceStore", "readwrite");
+  const store = tx.objectStore("reduxPersistenceStore");
+  store.put({bootData:{team_id:"T0FAKE", user_id:"U0FAKE1", api_token:"xoxc-FAKE"}}, "persist:slack-client-T0FAKE-U0FAKE1");
+  store.put({bootData:{team_id:"T0GRID", user_id:"U0GUEST", api_token:"xoxc-FAKE"}}, "persist:slack-client-E0FAKE-U0GUEST");
+  tx.oncomplete = () => { document.title = "DONE"; document.body.textContent = "DONE"; };
+};
+</script>
+</body>
+</html>

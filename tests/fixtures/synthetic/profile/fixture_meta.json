@@ -1,0 +1,23 @@
+{
+  "fixture_version": "1",
+  "blobs": [
+    {
+      "persist_key": "persist:slack-client-T0SYNTHAAA-U0SELF0001",
+      "blob": "1/00/1",
+      "workspace_key": "T0SYNTHAAA",
+      "bytes": 5410
+    },
+    {
+      "persist_key": "persist:slack-client-T0SYNTHBBB-U0SELF0002",
+      "blob": "1/01/2",
+      "workspace_key": "T0SYNTHBBB",
+      "bytes": 5410
+    },
+    {
+      "persist_key": "persist:slack-client-E0SYNTHENT-U0GUEST001",
+      "blob": "1/02/3",
+      "workspace_key": "E0SYNTHENT",
+      "bytes": 5422
+    }
+  ]
+}

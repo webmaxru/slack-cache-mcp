@@ -1,0 +1,153 @@
+[project]
+name = "slack-cache-mcp"
+version = "0.1.0"
+description = "Offline-only Slack desktop cache archive and MCP server"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Maxim Salnikov" }]
+dependencies = [
+    "mcp==2.3.0",
+    "typer>=0.16.0",
+    "ulid-py>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.12.0",
+    "mypy>=1.17.0",
+    "pytest>=8.4.0",
+    "pytest-socket>=0.7.0",
+    "pytest-cov>=6.0.0",
+    "hypothesis>=6.135.0",
+    "import-linter>=2.3",
+]
+
+[project.scripts]
+slackcache = "slack_cache_mcp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slack_cache_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/slack_cache_mcp/store/sqlite/schema.sql" = "slack_cache_mcp/store/sqlite/schema.sql"
+
+[tool.uv]
+dev-dependencies = [
+    "ruff>=0.12.0",
+    "mypy>=1.17.0",
+    "pytest>=8.4.0",
+    "pytest-socket>=0.7.0",
+    "pytest-cov>=6.0.0",
+    "hypothesis>=6.135.0",
+    "import-linter>=2.3",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["src/slack_cache_mcp/_vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "B008", "SIM102", "SIM103", "SIM222"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+mypy_path = "src"
+explicit_package_bases = true
+files = [
+    "src/slack_cache_mcp",
+]
+exclude = [
+    "src/slack_cache_mcp/_vendor/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "slack_cache_mcp.desktop.*",
+    "slack_cache_mcp.ingest.*",
+]
+strict = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "slack_cache_mcp.mcp_server.*",
+]
+disable_error_code = ["untyped-decorator"]
+
+[[tool.mypy.overrides]]
+module = [
+    "ccl_chromium_reader",
+    "ccl_chromium_reader.*",
+    "ccl_simplesnappy",
+    "ccl_simplesnappy.*",
+    "ulid",
+    "ulid.*",
+    "mcp",
+    "mcp.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "--disable-socket --allow-hosts=127.0.0.1,::1 -q"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.coverage.run]
+source = ["slack_cache_mcp"]
+omit = ["*/_vendor/*"]
+
+[tool.importlinter]
+root_packages = ["slack_cache_mcp"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Offline packages may not import network clients"
+type = "forbidden"
+source_modules = [
+    "slack_cache_mcp.desktop",
+    "slack_cache_mcp.ingest",
+    "slack_cache_mcp.store",
+    "slack_cache_mcp.search",
+    "slack_cache_mcp.mcp_server",
+    "slack_cache_mcp.export",
+    "slack_cache_mcp.domain",
+]
+forbidden_modules = [
+    "requests",
+    "httpx",
+    "httpx2",
+    "aiohttp",
+    "urllib3",
+    "websockets",
+    "grpc",
+    "slack_sdk",
+    "slack_bolt",
+    "boto3",
+    "paramiko",
+    "ftplib",
+    "smtplib",
+    "webbrowser",
+    "selenium",
+    "playwright",
+    "pychrome",
+    "pywinauto",
+    "pyautogui",
+]
+# urllib.request / http.client enforced by AST scan (import-linter rejects external subpackages)
+
+[tool.ruff.lint.per-file-ignores]
+"src/slack_cache_mcp/desktop/chromium/idb_values.py" = ["E402", "I001"]
+

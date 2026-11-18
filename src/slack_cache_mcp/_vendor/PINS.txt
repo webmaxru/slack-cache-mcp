@@ -1,0 +1,2 @@
+ccl_chromium_reader 0.3.19 @ 7a01b07dc5205a9c12004f2c9eabce0bb4697860
+ccl_simplesnappy 0.4 @ 3d085230baa8c46cf2090ebba29bf6e8eab31087
