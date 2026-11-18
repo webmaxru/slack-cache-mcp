@@ -105,8 +105,10 @@ def snapshot_profile(
     require_stable_blobs: bool = True,
 ) -> SnapshotStats:
     """Copy allowlisted paths from source -> mirror. Never deletes source files."""
-    source = Path(source)
-    mirror = Path(mirror)
+    source = Path(source).resolve()
+    mirror = Path(mirror).resolve()
+    if source == mirror or source in mirror.parents or mirror in source.parents:
+        raise ValueError("Source and mirror directories must not overlap")
     mirror.mkdir(parents=True, exist_ok=True)
     stats = SnapshotStats()
     manifest_path = mirror / "manifest.json"
@@ -116,7 +118,9 @@ def snapshot_profile(
     origin = idb_origin_dir_name()
     allow_trees = [
         source / "IndexedDB",
-        source / "Local Storage" / "leveldb",
+        # NOTE: `Local Storage/leveldb` holds localConfig_v2 (xoxc/xoxd tokens). M1 does not
+        # parse it, so do not persist a raw copy in the mirror until the allowlist parser and
+        # end-of-cycle cleanup (PLAN §5.2) exist.
         source / "Session Storage",
     ]
     allow_files = [
@@ -140,10 +144,19 @@ def snapshot_profile(
             stats.errors.append(f"{rel_s}: size not stable")
             return
         dst = mirror / rel
+        try:
+            before = src_file.stat()
+        except OSError as exc:
+            stats.errors.append(f"{rel_s}: pre-stat {exc}")
+            return
         err = copy_file(src_file, dst, open_func=open_func)
         if err is None:
             try:
                 st = src_file.stat()
+                if (st.st_size, st.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+                    # Changed while copying: don't record it so the next cycle re-copies.
+                    stats.errors.append(f"{rel_s}: changed during copy")
+                    return
                 digest = _sha256_file(dst)
                 files_meta[rel_s] = {
                     "size": st.st_size,

@@ -71,6 +71,9 @@ def _module_name_from_import(node: ast.AST) -> list[str]:
     elif isinstance(node, ast.ImportFrom):
         if node.module:
             names.append(node.module)
+            names.extend(
+                f"{node.module}.{alias.name}" for alias in node.names if alias.name != "*"
+            )
     return names
 
 

@@ -77,16 +77,31 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         if len(args) >= 2 and not _addr_is_loopback(args[1]):
             raise NetworkGuardError(f"socket.connect blocked to non-loopback: {args[1]!r}")
         return
-    if event == "socket.sendto":
-        # args vary; address often last
+    if event in {"socket.sendto", "socket.sendmsg"}:
+        # args: (sock, address); sendmsg's address is None on connected sockets
         addr = args[-1] if args else None
         if isinstance(addr, tuple) and not _addr_is_loopback(addr):
-            raise NetworkGuardError(f"socket.sendto blocked to non-loopback: {addr!r}")
+            raise NetworkGuardError(f"{event} blocked to non-loopback: {addr!r}")
         return
     if event == "socket.getaddrinfo":
         host = args[0] if args else None
         if host is not None and not _is_loopback_host(host):
             raise NetworkGuardError(f"socket.getaddrinfo blocked for host: {host!r}")
+        return
+    if event in {"socket.gethostbyname", "socket.gethostbyaddr"}:
+        host = args[0] if args else None
+        if not _is_loopback_host(host):
+            raise NetworkGuardError(f"{event} blocked for host: {host!r}")
+        return
+    if event == "socket.getnameinfo":
+        if args and not _addr_is_loopback(args[0]):
+            raise NetworkGuardError(f"socket.getnameinfo blocked for: {args[0]!r}")
+        return
+    if event in {"os.system", "os.startfile"}:
+        raise NetworkGuardError(f"{event} blocked by netguard")
+    if event in {"os.exec", "os.posix_spawn", "os.spawn"}:
+        path = args[1] if event == "os.spawn" and len(args) > 1 else (args[0] if args else None)
+        _check_subprocess([path] if path else None)
         return
     if event == "urllib.Request":
         raise NetworkGuardError("urllib.Request blocked by netguard")

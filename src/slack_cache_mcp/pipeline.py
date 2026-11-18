@@ -148,27 +148,30 @@ def run_snapshot_once(settings: Settings) -> dict[str, Any]:
                 )
                 messages_ingested += 1
 
-    # Ensure root-state workspaces exist even without blobs
-    for key, meta in root_ws.items():
-        from slack_cache_mcp.domain.models import Workspace
+    # Ensure root-state workspaces exist even without blobs. Grid orgs are keyed by E... in
+    # root-state but by their T... teamId in the decoded state, so match on both.
+    from slack_cache_mcp.domain.models import Workspace
 
-        if not any(
-            w["key"] == key for w in repo.list_workspaces()
-        ):
-            repo.upsert_workspace(
-                Workspace(
-                    workspace_key=key,
-                    team_id=meta.get("teamId") or meta.get("id"),
-                    enterprise_id=key if key.startswith("E") else None,
-                    name=meta.get("name"),
-                    domain=meta.get("domain"),
-                    self_user_id=None,
-                    self_is_guest=False,
-                    raw=meta,
-                ),
-                hlc.now(),
-                seen_at,
-            )
+    known_keys = {w["key"] for w in repo.list_workspaces()}
+    for key, meta in root_ws.items():
+        team_id = meta.get("teamId") or meta.get("id")
+        if key in known_keys or team_id in known_keys:
+            continue
+        repo.upsert_workspace(
+            Workspace(
+                workspace_key=key,
+                team_id=team_id,
+                enterprise_id=key if key.startswith("E") else None,
+                name=meta.get("name"),
+                domain=meta.get("domain"),
+                self_user_id=None,
+                self_is_guest=False,
+                raw=meta,
+            ),
+            hlc.now(),
+            seen_at,
+        )
+        known_keys.add(key)
 
     repo.finish_snapshot(
         snapshot_id,

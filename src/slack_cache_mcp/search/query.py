@@ -8,7 +8,7 @@ from typing import Any
 
 _OP_RE = re.compile(
     r"""
-    (?P<op>in|from|with|before|after|on|during|has|is|workspace):
+    (?<!\S)(?P<op>in|from|with|before|after|on|during|has|is|workspace):
     (?P<val>"[^"]+"|\S+)
     """,
     re.VERBOSE | re.IGNORECASE,
@@ -56,7 +56,7 @@ def fts_match_from_terms(terms: str, mode: str) -> str:
         return '""'
     if mode == "phrase":
         return f'"{terms.replace(chr(34), "")}"'
-    tokens = [t for t in re.split(r"\s+", terms) if t]
+    tokens = ['"' + t.replace('"', '""') + '"' for t in re.split(r"\s+", terms) if t]
     if mode == "any":
         return " OR ".join(tokens)
     # all / auto / lexical default: AND

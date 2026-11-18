@@ -53,7 +53,11 @@ def scrub_string(s: str) -> str:
 
 
 def sanitize(value: Any, *, path: tuple[str, ...] = ()) -> Any:
-    """Recursively drop sensitive keys and scrub token-shaped strings."""
+    """Recursively drop sensitive keys, scrub token-shaped strings, and coerce
+    V8-only values (bytes, undefined, Date, Set, ...) into JSON-safe types."""
+    if isinstance(value, bytes):
+        # ccl returns non-ASCII one-byte (Latin-1) V8 strings as bytes.
+        value = value.decode("latin-1")
     if isinstance(value, str):
         return scrub_string(value)
     if isinstance(value, Mapping):
@@ -66,7 +70,7 @@ def sanitize(value: Any, *, path: tuple[str, ...] = ()) -> Any:
             return out
         out_m: dict[str, Any] = {}
         for k, v in value.items():
-            ks = str(k)
+            ks = k.decode("latin-1") if isinstance(k, bytes) else str(k)
             if _key_sensitive(ks):
                 continue
             out_m[ks] = sanitize(v, path=path + (ks,))
@@ -75,7 +79,14 @@ def sanitize(value: Any, *, path: tuple[str, ...] = ()) -> Any:
         return [sanitize(v, path=path) for v in value]
     if isinstance(value, tuple):
         return tuple(sanitize(v, path=path) for v in value)
-    return value
+    if isinstance(value, (set, frozenset)):
+        return sorted((sanitize(v, path=path) for v in value), key=repr)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if hasattr(value, "isoformat"):  # V8 Date -> datetime
+        return value.isoformat()
+    # V8 undefined / array holes, RegExp, host objects: not JSON-serializable.
+    return None
 
 
 LOCALCONFIG_ALLOW = (

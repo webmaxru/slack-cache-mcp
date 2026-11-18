@@ -86,7 +86,18 @@ def decode_blob_bytes(raw: bytes) -> tuple[DecodeInfo, Any | None]:
     d = raw
     snappy = False
     if raw[:3] == b"\xff\x11\x02":
-        d = ccl_simplesnappy.decompress(io.BytesIO(raw[3:]))
+        try:
+            d = ccl_simplesnappy.decompress(io.BytesIO(raw[3:]))
+        except Exception as exc:  # noqa: BLE001 — surface as decode info
+            return (
+                DecodeInfo(
+                    size=len(raw),
+                    head_hex=raw[:3].hex(),
+                    snappy=True,
+                    error=f"{type(exc).__name__}: {exc}",
+                ),
+                None,
+            )
         snappy = True
     elif raw[:3] == b"\xff\x11\x01":
         # Blob ref without lookup — cannot decode alone

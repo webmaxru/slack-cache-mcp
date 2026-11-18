@@ -36,14 +36,18 @@ class SearchService:
         if before or parsed.filters.get("before"):
             filters["before"] = before or parsed.filters.get("before")
         if parsed.filters.get("on"):
-            # treat on:YYYY-MM-DD as after that day start / before next (simple)
-            filters["after"] = parsed.filters["on"]
+            from datetime import UTC, datetime, timedelta
+
+            start = datetime.fromisoformat(parsed.filters["on"]).replace(tzinfo=UTC)
+            filters["after"] = str(start.timestamp())
+            filters["before"] = str((start + timedelta(days=1)).timestamp())
         if channels:
             filters["channel_id"] = channels[0]
         elif parsed.filters.get("in"):
             resolved = self.repo.resolve(parsed.filters["in"], kind="channel")
-            if resolved:
-                filters["channel_id"] = resolved[0]["id"]
+            if not resolved:
+                raise ValueError(f"Unknown channel: {parsed.filters['in']}")
+            filters["channel_id"] = resolved[0]["id"]
         if users:
             filters["user_id"] = users[0]
         elif parsed.filters.get("from"):
