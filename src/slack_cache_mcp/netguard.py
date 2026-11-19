@@ -160,7 +160,12 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         if host is not None and not _is_loopback_host(host):
             raise NetworkGuardError(f"socket.getaddrinfo blocked for host: {host!r}")
         return
-    if event in {"socket.gethostbyname", "socket.gethostbyaddr"}:
+    if event in {
+        "socket.gethostbyname",
+        "socket.gethostbyname_ex",
+        "socket.gethostbyaddr",
+        "socket.gethostbyaddr_ex",
+    }:
         host = args[0] if args else None
         if not _is_loopback_host(host):
             raise NetworkGuardError(f"{event} blocked for host: {host!r}")

@@ -21,6 +21,12 @@ def test_guard_blocks_getaddrinfo_for_external() -> None:
         socket.getaddrinfo("example.com", 443)
 
 
+def test_guard_blocks_gethostbyname() -> None:
+    netguard.install()
+    with pytest.raises(netguard.NetworkGuardError):
+        socket.gethostbyname("example.com")
+
+
 def test_guard_allows_loopback_getaddrinfo() -> None:
     netguard.install()
     infos = socket.getaddrinfo("127.0.0.1", 9, type=socket.SOCK_STREAM)

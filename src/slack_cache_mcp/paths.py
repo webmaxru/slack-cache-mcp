@@ -55,12 +55,18 @@ def secure_data_dir(path: Path) -> None:
 
 def _secure_windows(path: Path) -> None:
     """Best-effort owner-only ACL via Win32 APIs (no subprocess / netguard)."""
+    if sys.platform != "win32":
+        return
     with contextlib.suppress(Exception):
         import ctypes
         from ctypes import wintypes
 
-        advapi32 = ctypes.windll.advapi32
-        kernel32 = ctypes.windll.kernel32
+        # getattr keeps mypy happy on non-Windows typecheck hosts (no ctypes.windll).
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return
+        advapi32 = windll.advapi32
+        kernel32 = windll.kernel32
 
         # Convert SDDL: D:P(A;OICI;FA;;;OW) — protect, full access to owner only
         sddl = "D:P(A;OICI;FA;;;OW)"
@@ -74,13 +80,10 @@ def _secure_windows(path: Path) -> None:
             # SECURITY_INFORMATION: DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
             DACL_SECURITY_INFORMATION = 0x00000004
             PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-            ok = advapi32.SetFileSecurityW(
+            advapi32.SetFileSecurityW(
                 str(path),
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 p_sd,
             )
-            if not ok:
-                # Fallback: SetNamedSecurityInfo
-                pass
         finally:
             kernel32.LocalFree(p_sd)

@@ -26,6 +26,13 @@ class ParsedQuery:
 
 
 def parse_query(query: str) -> ParsedQuery:
+    """Parse operators out of `query`.
+
+    Supported operators are applied by SearchService (`has:file|link`,
+    `is:thread|deleted`, `in`, `from`, dates, `workspace`). Unsupported ones
+    (`with:`, `during:`, other has/is values) are rejected via
+    `unsupported_operators()` — never silently dropped.
+    """
     filters: dict[str, Any] = {}
     parts: list[str] = []
     last = 0
