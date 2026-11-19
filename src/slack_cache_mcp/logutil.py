@@ -48,8 +48,21 @@ def setup_daemon_logging(logs_dir: Path, *, level: int = logging.INFO) -> loggin
         encoding="utf-8",
         utc=True,
     )
-    handler.namer = lambda name: name.replace(".log", "") + ".log"  # keep *.log
-    # TimedRotatingFileHandler renames to daemon.log.YYYY-MM-DD; PLAN wants daemon-YYYYMMDD.log
+
+    def _daemon_namer(name: str) -> str:
+        # Default rotated filename is: <dir>/daemon.log.<YYYYMMDD> (because suffix is appended)
+        # Contract/PLAN wants:            <dir>/daemon-<YYYYMMDD>.log
+        p = Path(name)
+        prefix = "daemon.log."
+        if p.name.startswith(prefix):
+            date = p.name[len(prefix) :]
+            return str(p.with_name(f"daemon-{date}.log"))
+        # Fallback: ensure rotated files still end in ".log"
+        s = str(p)
+        return s.replace(".log", "") + ".log"
+
+    handler.namer = _daemon_namer
+    # TimedRotatingFileHandler renames to daemon.log.<suffix>; PLAN wants daemon-YYYYMMDD.log
     handler.suffix = "%Y%m%d"
     handler.setFormatter(JsonLineFormatter())
     logger.addHandler(handler)

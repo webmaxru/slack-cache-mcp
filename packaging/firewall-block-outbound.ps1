@@ -1,4 +1,4 @@
-﻿# Requires admin. Blocks outbound network for the frozen slackcache core binary.
+# Requires admin. Blocks outbound network for the frozen slackcache core binary.
 # PLAN §12.1 — core process must not contact Slack (or any) servers.
 #
 # Usage (elevated PowerShell):
