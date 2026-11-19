@@ -24,3 +24,23 @@ CPython 3.12.11 on the Windows self-hosted worker does not emit a `urllib.Reques
 
 ### import-linter forbidden modules
 `import-linter` rejects external **subpackages** (e.g. `urllib.request`, `http.client`) as `forbidden_modules`. Those stay covered by `tests/test_no_network_imports.py` AST scan. The import-linter contract forbids top-level network client packages (`requests`, `httpx`, …).
+
+## 2026-11-19 — M2 continuous sync
+
+### Archive DB encryption (spike result)
+Probed SQLCipher (`pysqlcipher3` / `sqlcipher3`) and APSW+sqlite3mc on this Windows worker: neither is installed, and PLAN requires sqlite-vec (M4) to load into the same build. **Decision: defer encrypting `archive.db`.** Rely on BitLocker + ACL/EFS on `%LOCALAPPDATA%\slackcache` for the DB; keep sanitized state vault as AES-256-GCM (via `cryptography`) with keyring/DPAPI (file fallback for tests). Revisit SQLCipher/sqlite3mc after M4 embeds sqlite-vec. Command: `slackcache encryption-spike`.
+
+### Vault key storage
+Prefer OS keyring (`keyring` → Windows Credential Manager). Always also write `vault.key` (hex, 0600) under the data dir so tests and recovery work without keyring. Tests use `--data-dir` temp paths and never touch the real `%LOCALAPPDATA%\slackcache`.
+
+### Suspected deletion streak
+PLAN §8.2: absent from a contiguous window in ≥2 consecutive *new* state generations → `deleted_state='suspected'`. Tracked in `suspected_streaks`. Eviction outside the window is ignored. Explicit tombstones still win as `deleted`.
+
+### Daemon cadence defaults
+Watcher (watchdog / ReadDirectoryChangesW) debounce 2 s; poll 60 s; full pass 900 s. Overridable via CLI flags. Single-instance: Windows mutex `Local\slackcache-daemon`; lockfile elsewhere.
+
+### Task Scheduler / netguard
+`schtasks /Create|/Delete|/Query` allowed only for task name `slackcache-daemon`; `/Create` requires `/XML`.
+
+### PyInstaller
+`packaging/slackcache.spec` builds onedir `slackcache.exe`. Firewall snippet: `packaging/firewall-block-outbound.ps1` (admin). Dev firewall on `uv python find` remains documented in README.
