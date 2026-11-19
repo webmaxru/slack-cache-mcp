@@ -31,7 +31,7 @@ CPython 3.12.11 on the Windows self-hosted worker does not emit a `urllib.Reques
 Probed SQLCipher (`pysqlcipher3` / `sqlcipher3`) and APSW+sqlite3mc on this Windows worker: neither is installed, and PLAN requires sqlite-vec (M4) to load into the same build. **Decision: defer encrypting `archive.db`.** Rely on BitLocker + ACL/EFS on `%LOCALAPPDATA%\slackcache` for the DB; keep sanitized state vault as AES-256-GCM (via `cryptography`) with keyring/DPAPI (file fallback for tests). Revisit SQLCipher/sqlite3mc after M4 embeds sqlite-vec. Command: `slackcache encryption-spike`.
 
 ### Vault key storage
-Prefer OS keyring (`keyring` → Windows Credential Manager). Always also write `vault.key` (hex, 0600) under the data dir so tests and recovery work without keyring. Tests use `--data-dir` temp paths and never touch the real `%LOCALAPPDATA%\slackcache`.
+Prefer OS keyring (`keyring` → Windows Credential Manager). Write `vault.key` (hex, 0600) under the data dir only as a fallback (e.g., on first key creation and/or when keyring is unavailable) so tests and recovery can work without keyring. Tests use `--data-dir` temp paths and never touch the real `%LOCALAPPDATA%\slackcache`.
 
 ### Suspected deletion streak
 PLAN §8.2: absent from a contiguous window in ≥2 consecutive *new* state generations → `deleted_state='suspected'`. Tracked in `suspected_streaks`. Eviction outside the window is ignored. Explicit tombstones still win as `deleted`.

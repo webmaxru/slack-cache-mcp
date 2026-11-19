@@ -84,6 +84,10 @@ def extract_channel_windows(state: dict[str, Any]) -> list[ChannelWindow]:
                 # Preserve integer seconds; pad micros for canonical compare
                 whole = int(t)
                 frac = int(round((float(t) - whole) * 1_000_000))
+                # Rounding/float precision can produce frac == 1_000_000; carry to seconds.
+                if frac >= 1_000_000:
+                    whole += 1
+                    frac -= 1_000_000
                 normalized.append(f"{whole}.{frac:06d}")
             elif isinstance(t, str) and t:
                 normalized.append(t)

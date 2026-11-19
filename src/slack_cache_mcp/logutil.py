@@ -38,7 +38,14 @@ def setup_daemon_logging(logs_dir: Path, *, level: int = logging.INFO) -> loggin
     logs_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("slackcache.daemon")
     logger.setLevel(level)
-    logger.handlers.clear()
+    # If setup_daemon_logging() is called multiple times in-process (tests/re-init),
+    # make sure we close old handlers to avoid leaking file descriptors.
+    for old_handler in list(logger.handlers):
+        logger.removeHandler(old_handler)
+        try:
+            old_handler.close()
+        finally:
+            pass
     logger.propagate = False
     path = logs_dir / "daemon.log"
     handler = TimedRotatingFileHandler(

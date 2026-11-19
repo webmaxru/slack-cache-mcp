@@ -1189,7 +1189,10 @@ class SqliteRepository:
             "coverage_ranges": coverage_n,
             "snapshots_by_trigger": by_trigger,
             "last_snapshot": dict(snap) if snap else None,
-            "channel": channel_block or channel,
+            # Keep channel as the caller-provided channel id (stable type: str|None)
+            "channel": channel,
+            # Provide structured per-channel info separately (stable type: dict|None)
+            "channel_status": channel_block,
         }
 
     def search_fts(

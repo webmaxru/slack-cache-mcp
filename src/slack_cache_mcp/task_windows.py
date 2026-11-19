@@ -32,7 +32,8 @@ def generate_task_xml(*, command: list[str] | None = None, data_dir: Path | None
     args = list(cmd[1:]) + ["daemon", "--ensure-single"]
     if data_dir is not None:
         args.extend(["--data-dir", str(data_dir)])
-    args_s = " ".join(f'"{a}"' if " " in a else a for a in args)
+    # Use Windows-aware quoting rules for Task Scheduler argument serialization.
+    args_s = subprocess.list2cmdline(args)
     # Working directory = parent of exe when possible
     work = str(Path(exe).resolve().parent)
     return f"""<?xml version="1.0" encoding="UTF-16"?>
