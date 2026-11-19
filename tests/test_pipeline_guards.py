@@ -36,14 +36,17 @@ def test_capture_dms_false_skips_im(tmp_path: Path) -> None:
 
 def test_local_storage_scrubbed_after_snapshot(tmp_path: Path) -> None:
     profile = build_synthetic_profile(tmp_path / "profile")
+    # Plant an extra token-bearing file under Local Storage to prove whole-tree scrub.
+    planted = profile / "Local Storage" / "extra" / "secret.txt"
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text("xoxc-FAKEPLANTED000000000000000000", encoding="utf-8")
     settings = load_settings(data_dir=tmp_path / "data", source=profile)
     result = run_snapshot_once(settings)
     mirror = settings.mirror_dir / result["source_id"]
-    assert not (mirror / "Local Storage" / "leveldb").exists()
-    assert not (mirror / "Local Storage" / "localConfig_v2.json").exists()
+    # Entire Local Storage tree must be physically removed after the cycle.
+    assert not (mirror / "Local Storage").exists()
     manifest = (mirror / "manifest.json").read_text(encoding="utf-8")
-    assert "localConfig_v2.json" not in manifest
-    assert "Local Storage/leveldb" not in manifest
+    assert "Local Storage" not in manifest
 
 
 def test_known_generation_short_circuit(tmp_path: Path) -> None:

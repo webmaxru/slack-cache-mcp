@@ -12,6 +12,14 @@ def _utc_stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
 
 
+def _connect_readonly(path: Path) -> sqlite3.Connection:
+    """Open SQLite read-only with a URI-safe path (spaces/special chars on Windows)."""
+    # Path.as_uri() percent-encodes; append mode=ro for the sqlite URI query.
+    uri = path.resolve().as_uri()
+    uri = f"{uri}&mode=ro" if "?" in uri else f"{uri}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
 def backup_archive(archive_db: Path, backups_dir: Path) -> dict[str, Any]:
     """Copy archive.db via sqlite3 backup API + integrity_check + atomic replace."""
     archive_db = Path(archive_db)
@@ -23,7 +31,7 @@ def backup_archive(archive_db: Path, backups_dir: Path) -> dict[str, Any]:
     dest = backups_dir / f"archive-{_utc_stamp()}.db"
     tmp = dest.with_suffix(".db.tmp")
 
-    src = sqlite3.connect(f"file:{archive_db.as_posix()}?mode=ro", uri=True)
+    src = _connect_readonly(archive_db)
     try:
         dst = sqlite3.connect(str(tmp))
         try:

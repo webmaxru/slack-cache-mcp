@@ -18,7 +18,7 @@ from slack_cache_mcp.desktop.sanitize import sanitize
 from slack_cache_mcp.desktop.slack import localstate, redux, rootstate
 from slack_cache_mcp.desktop.snapshot import snapshot_profile
 from slack_cache_mcp.domain.models import Channel, MessageObservation, Workspace
-from slack_cache_mcp.ingest.coverage import extract_channel_windows, suspected_missing
+from slack_cache_mcp.ingest.coverage import extract_channel_windows, suspected_missing, ts_key
 from slack_cache_mcp.ingest.hlc import HLC
 from slack_cache_mcp.paths import assert_data_dir_outside_sources, secure_data_dir
 from slack_cache_mcp.store.sqlite.repo import SqliteRepository
@@ -51,16 +51,15 @@ def _state_sha(state: Any) -> str:
 
 
 def _scrub_credential_scratch(mirror: Path) -> None:
-    """Remove Local Storage copies that may contain tokens; drop manifest entries."""
-    targets = [
-        mirror / "Local Storage" / "leveldb",
-        mirror / "Local Storage" / "localConfig_v2.json",
-    ]
-    for t in targets:
-        if t.is_file():
-            t.unlink(missing_ok=True)
-        elif t.is_dir():
-            shutil.rmtree(t, ignore_errors=True)
+    """Physically delete Local Storage copies (may contain tokens) and drop manifest entries.
+
+    PLAN §5.2: parse allowlisted fields, then securely remove the ephemeral mirror copy.
+    """
+    local_storage = mirror / "Local Storage"
+    if local_storage.is_dir():
+        shutil.rmtree(local_storage, ignore_errors=True)
+    elif local_storage.is_file():
+        local_storage.unlink(missing_ok=True)
     manifest_path = mirror / "manifest.json"
     if not manifest_path.is_file():
         return
@@ -72,7 +71,7 @@ def _scrub_credential_scratch(mirror: Path) -> None:
     if not isinstance(files, dict):
         return
     for key in list(files):
-        if key == "Local Storage/localConfig_v2.json" or key.startswith("Local Storage/"):
+        if key == "Local Storage" or key.startswith("Local Storage/"):
             files.pop(key, None)
     data["files"] = files
     manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -111,9 +110,11 @@ def _apply_coverage_and_suspected(
             contiguous_to_latest=win.contiguous_to_latest,
             seen_at=seen_at,
         )
-        known = repo.list_known_message_ts(win.channel_id)
-        # Status from captured set
-        ordered = sorted(win.message_ts, key=lambda t: float(t) if t.replace(".", "", 1).isdigit() else 0)
+        # Only load archive ts that fall inside this window (avoid O(N) full-channel scans).
+        known_in_window = repo.list_known_message_ts(
+            win.channel_id, start_ts=win.start_ts, end_ts=win.end_ts
+        )
+        ordered = sorted(win.message_ts, key=ts_key)
         latest_reported = None
         if isinstance(latests, dict):
             raw = latests.get(win.channel_id)
@@ -132,13 +133,13 @@ def _apply_coverage_and_suspected(
             win.channel_id,
             newest_ts=ordered[-1] if ordered else None,
             oldest_ts=ordered[0] if ordered else None,
-            captured_count=len(known),
+            captured_count=repo.count_messages(win.channel_id),
             latest_ts_reported=latest_reported,
             unread_count=unread,
             seen_at=seen_at,
         )
         if win.contiguous_to_latest:
-            missing = suspected_missing(previously_seen=known, window=win)
+            missing = suspected_missing(previously_seen=known_in_window, window=win)
             marked = repo.apply_suspected_deletions(
                 win.channel_id,
                 missing,

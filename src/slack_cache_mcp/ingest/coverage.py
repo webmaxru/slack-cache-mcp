@@ -15,11 +15,19 @@ class ChannelWindow:
     message_ts: frozenset[str]
 
 
-def _ts_key(ts: str) -> float:
+def ts_key(ts: str) -> tuple[int, int]:
+    """Deterministic Slack ts ordering key: (seconds, microseconds).
+
+    Avoids float precision issues on large epoch seconds with 6 decimal digits.
+    """
     try:
-        return float(ts)
+        if "." in ts:
+            sec_s, frac_s = ts.split(".", 1)
+            micros_s = (frac_s + "000000")[:6]
+            return (int(sec_s), int(micros_s))
+        return (int(ts), 0)
     except ValueError:
-        return 0.0
+        return (0, 0)
 
 
 def contiguous_ranges(timestamps: list[str]) -> list[tuple[str, str]]:
@@ -30,7 +38,7 @@ def contiguous_ranges(timestamps: list[str]) -> list[tuple[str, str]]:
     """
     if not timestamps:
         return []
-    ordered = sorted(timestamps, key=_ts_key)
+    ordered = sorted(timestamps, key=ts_key)
     return [(ordered[0], ordered[-1])]
 
 
@@ -73,7 +81,10 @@ def extract_channel_windows(state: dict[str, Any]) -> list[ChannelWindow]:
         normalized: list[str] = []
         for t in bucket:
             if isinstance(t, (int, float)):
-                normalized.append(f"{float(t):.6f}")
+                # Preserve integer seconds; pad micros for canonical compare
+                whole = int(t)
+                frac = int(round((float(t) - whole) * 1_000_000))
+                normalized.append(f"{whole}.{frac:06d}")
             elif isinstance(t, str) and t:
                 normalized.append(t)
         has_more = False
@@ -99,25 +110,25 @@ def merge_coverage_interval(
     start_ts: str,
     end_ts: str,
 ) -> list[tuple[str, str]]:
-    """Union intervals for a channel (lexicographic/numeric by float ts)."""
+    """Union intervals for a channel using deterministic ts ordering."""
     intervals = [*existing, (start_ts, end_ts)]
-    intervals.sort(key=lambda p: (_ts_key(p[0]), _ts_key(p[1])))
+    intervals.sort(key=lambda p: (ts_key(p[0]), ts_key(p[1])))
     merged: list[tuple[str, str]] = []
     for s, e in intervals:
         if not merged:
             merged.append((s, e))
             continue
         ps, pe = merged[-1]
-        if _ts_key(s) <= _ts_key(pe):
+        if ts_key(s) <= ts_key(pe):
             # overlap or touch
-            merged[-1] = (ps, e if _ts_key(e) > _ts_key(pe) else pe)
+            merged[-1] = (ps, e if ts_key(e) > ts_key(pe) else pe)
         else:
             merged.append((s, e))
     return merged
 
 
 def ts_in_window(ts: str, start_ts: str, end_ts: str) -> bool:
-    return _ts_key(start_ts) <= _ts_key(ts) <= _ts_key(end_ts)
+    return ts_key(start_ts) <= ts_key(ts) <= ts_key(end_ts)
 
 
 def suspected_missing(

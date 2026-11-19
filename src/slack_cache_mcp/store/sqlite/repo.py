@@ -103,14 +103,38 @@ class SqliteRepository:
     def ensure_schema(self) -> None:
         sql = _SCHEMA_PATH.read_text(encoding="utf-8")
         self._conn.executescript(sql)
-        cur = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'")
-        row = cur.fetchone()
-        if row is None:
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-                (SCHEMA_VERSION,),
-            )
+        self._migrate_schema()
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (SCHEMA_VERSION,),
+        )
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Bring older on-disk DBs up to SCHEMA_VERSION (additive only)."""
+        # state_generations.vault_path existed in M1 schema.sql; still guard partial DBs.
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(state_generations)").fetchall()
+        }
+        if cols and "vault_path" not in cols:
+            self._conn.execute("ALTER TABLE state_generations ADD COLUMN vault_path TEXT")
+        # suspected_streaks is CREATE IF NOT EXISTS in schema.sql; no-op if present.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS suspected_streaks (
+              channel_id TEXT NOT NULL,
+              ts TEXT NOT NULL,
+              streak INTEGER NOT NULL,
+              last_state_sha256 TEXT,
+              last_seen TEXT NOT NULL,
+              PRIMARY KEY (channel_id, ts)
+            ) STRICT
+            """
+        )
 
     def upsert_device(self, device_id: str, label: str) -> None:
         now = _utc_now()
@@ -304,11 +328,30 @@ class SqliteRepository:
         )
         self._conn.commit()
 
-    def list_known_message_ts(self, channel_id: str) -> set[str]:
-        rows = self._conn.execute(
-            "SELECT ts FROM messages WHERE channel_id=?",
+    def count_messages(self, channel_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE channel_id=?",
             (channel_id,),
-        ).fetchall()
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def list_known_message_ts(
+        self,
+        channel_id: str,
+        *,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+    ) -> set[str]:
+        """Return known message ts for a channel, optionally constrained to a window."""
+        sql = "SELECT ts FROM messages WHERE channel_id=?"
+        params: list[Any] = [channel_id]
+        if start_ts is not None:
+            sql += " AND ts_num >= ?"
+            params.append(_ts_num(start_ts))
+        if end_ts is not None:
+            sql += " AND ts_num <= ?"
+            params.append(_ts_num(end_ts))
+        rows = self._conn.execute(sql, params).fetchall()
         return {r["ts"] for r in rows}
 
     def apply_suspected_deletions(

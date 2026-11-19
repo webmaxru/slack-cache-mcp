@@ -117,21 +117,21 @@ def _check_subprocess(args: Any) -> None:
         if not rest_lower:
             raise NetworkGuardError("schtasks requires an operation")
         op = rest_lower[0]
-        if op == "/query":
-            return
-        if op in {"/create", "/delete"}:
-            # Require /TN slackcache-daemon (exact task name).
-            tn = None
-            for i, tok in enumerate(rest_lower[:-1]):
-                if tok == "/tn":
-                    tn = rest_lower[i + 1]
-                    break
-            if tn != "slackcache-daemon":
-                raise NetworkGuardError("schtasks only allowed for task slackcache-daemon")
-            if op == "/create" and "/xml" not in rest_lower:
-                raise NetworkGuardError("schtasks /Create requires /XML")
-            return
-        raise NetworkGuardError("schtasks only /Query,/Create,/Delete allowed under netguard")
+        if op not in {"/query", "/create", "/delete"}:
+            raise NetworkGuardError(
+                "schtasks only /Query,/Create,/Delete allowed under netguard"
+            )
+        # Require /TN slackcache-daemon for every allowed op (including /Query).
+        tn = None
+        for i, tok in enumerate(rest_lower[:-1]):
+            if tok == "/tn":
+                tn = rest_lower[i + 1]
+                break
+        if tn != "slackcache-daemon":
+            raise NetworkGuardError("schtasks only allowed for task slackcache-daemon")
+        if op == "/create" and "/xml" not in rest_lower:
+            raise NetworkGuardError("schtasks /Create requires /XML")
+        return
 
     if exe in {"powershell", "pwsh"}:
         # Require -NoProfile and only Get-AppxPackage (read-only Slack Store version lookup).
