@@ -118,9 +118,9 @@ def snapshot_profile(
     origin = idb_origin_dir_name()
     allow_trees = [
         source / "IndexedDB",
-        # NOTE: `Local Storage/leveldb` holds localConfig_v2 (xoxc/xoxd tokens). M1 does not
-        # parse it, so do not persist a raw copy in the mirror until the allowlist parser and
-        # end-of-cycle cleanup (PLAN §5.2) exist.
+        # Local Storage may contain tokens; pipeline scrub removes the copy end-of-cycle
+        # after allowlist parsing (PLAN §5.2).
+        source / "Local Storage",
         source / "Session Storage",
     ]
     allow_files = [

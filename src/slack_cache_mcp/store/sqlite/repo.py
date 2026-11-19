@@ -17,7 +17,7 @@ from slack_cache_mcp.ingest.projection import (
     max_merge_thread_meta,
 )
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 _XOX_RE = re.compile(rb"xox[a-z]-", re.I)
@@ -205,17 +205,178 @@ class SqliteRepository:
         blob_ref: str | None,
         snapshot_id: str,
         seen_at: str,
+        *,
+        vault_path: str | None = None,
     ) -> None:
         self._conn.execute(
             """
             INSERT INTO state_generations(
               state_sha256, workspace_key, self_user_id, blob_ref,
-              first_seen, last_seen, first_snapshot_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+              first_seen, last_seen, first_snapshot_id, vault_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (state_sha256, workspace_key, self_user_id, blob_ref, seen_at, seen_at, snapshot_id),
+            (
+                state_sha256,
+                workspace_key,
+                self_user_id,
+                blob_ref,
+                seen_at,
+                seen_at,
+                snapshot_id,
+                vault_path,
+            ),
         )
         self._conn.commit()
+
+    def set_state_vault_path(self, state_sha256: str, vault_path: str) -> None:
+        self._conn.execute(
+            "UPDATE state_generations SET vault_path=? WHERE state_sha256=?",
+            (vault_path, state_sha256),
+        )
+        self._conn.commit()
+
+    def upsert_coverage_range(
+        self,
+        channel_id: str,
+        start_ts: str,
+        end_ts: str,
+        *,
+        contiguous_to_latest: bool,
+        seen_at: str,
+    ) -> None:
+        existing = self._conn.execute(
+            "SELECT start_ts, end_ts FROM coverage_ranges WHERE channel_id=?",
+            (channel_id,),
+        ).fetchall()
+        intervals = [(r["start_ts"], r["end_ts"]) for r in existing]
+        from slack_cache_mcp.ingest.coverage import merge_coverage_interval
+
+        merged = merge_coverage_interval(intervals, start_ts, end_ts)
+        self._conn.execute("DELETE FROM coverage_ranges WHERE channel_id=?", (channel_id,))
+        for s, e in merged:
+            cont = 1 if contiguous_to_latest and s == merged[-1][0] and e == merged[-1][1] else 0
+            self._conn.execute(
+                """
+                INSERT INTO coverage_ranges(
+                  channel_id, start_ts, end_ts, contiguous_to_latest, first_seen, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (channel_id, s, e, cont, seen_at, seen_at),
+            )
+        self._conn.commit()
+
+    def update_channel_status(
+        self,
+        channel_id: str,
+        *,
+        newest_ts: str | None,
+        oldest_ts: str | None,
+        captured_count: int,
+        latest_ts_reported: str | None = None,
+        unread_count: int | None = None,
+        seen_at: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO channel_status(
+              channel_id, latest_ts_reported, newest_captured_ts, oldest_captured_ts,
+              captured_count, unread_count, last_window_seen, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+              latest_ts_reported=COALESCE(excluded.latest_ts_reported, channel_status.latest_ts_reported),
+              newest_captured_ts=excluded.newest_captured_ts,
+              oldest_captured_ts=excluded.oldest_captured_ts,
+              captured_count=excluded.captured_count,
+              unread_count=COALESCE(excluded.unread_count, channel_status.unread_count),
+              last_window_seen=excluded.last_window_seen,
+              updated_at=excluded.updated_at
+            """,
+            (
+                channel_id,
+                latest_ts_reported,
+                newest_ts,
+                oldest_ts,
+                captured_count,
+                unread_count,
+                seen_at,
+                seen_at,
+            ),
+        )
+        self._conn.commit()
+
+    def list_known_message_ts(self, channel_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT ts FROM messages WHERE channel_id=?",
+            (channel_id,),
+        ).fetchall()
+        return {r["ts"] for r in rows}
+
+    def apply_suspected_deletions(
+        self,
+        channel_id: str,
+        missing_ts: set[str],
+        *,
+        state_sha256: str,
+        seen_at: str,
+        threshold: int = 2,
+    ) -> list[str]:
+        """Increment streaks for missing ts; mark suspected when streak >= threshold.
+
+        Returns list of ts newly marked suspected. Messages already ``deleted`` stay deleted.
+        """
+        marked: list[str] = []
+        # Clear streaks for messages present again (handled by caller passing only missing)
+        # Reset streaks for ts not in missing: done below via delete of others for this channel
+        # that were not missing this generation.
+        existing = self._conn.execute(
+            "SELECT ts, streak FROM suspected_streaks WHERE channel_id=?",
+            (channel_id,),
+        ).fetchall()
+        existing_map = {r["ts"]: r["streak"] for r in existing}
+
+        # Drop streaks for ts that reappeared
+        for ts in list(existing_map):
+            if ts not in missing_ts:
+                self._conn.execute(
+                    "DELETE FROM suspected_streaks WHERE channel_id=? AND ts=?",
+                    (channel_id, ts),
+                )
+                row = self._conn.execute(
+                    "SELECT deleted_state FROM messages WHERE channel_id=? AND ts=?",
+                    (channel_id, ts),
+                ).fetchone()
+                if row and row["deleted_state"] == "suspected":
+                    self._conn.execute(
+                        "UPDATE messages SET deleted_state='none' WHERE channel_id=? AND ts=?",
+                        (channel_id, ts),
+                    )
+
+        for ts in missing_ts:
+            streak = int(existing_map.get(ts, 0)) + 1
+            self._conn.execute(
+                """
+                INSERT INTO suspected_streaks(channel_id, ts, streak, last_state_sha256, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, ts) DO UPDATE SET
+                  streak=excluded.streak,
+                  last_state_sha256=excluded.last_state_sha256,
+                  last_seen=excluded.last_seen
+                """,
+                (channel_id, ts, streak, state_sha256, seen_at),
+            )
+            if streak >= threshold:
+                row = self._conn.execute(
+                    "SELECT deleted_state FROM messages WHERE channel_id=? AND ts=?",
+                    (channel_id, ts),
+                ).fetchone()
+                if row and row["deleted_state"] == "none":
+                    self._conn.execute(
+                        "UPDATE messages SET deleted_state='suspected' WHERE channel_id=? AND ts=?",
+                        (channel_id, ts),
+                    )
+                    marked.append(ts)
+        self._conn.commit()
+        return marked
 
     def upsert_workspace(self, ws: Workspace, hlc: str, seen_at: str) -> None:
         raw = json.dumps(ws.raw, ensure_ascii=False)
@@ -937,11 +1098,55 @@ class SqliteRepository:
             msg_sql += " WHERE workspace_key=?"
             params.append(workspace)
         count = self._conn.execute(msg_sql, params).fetchone()["c"]
+        gens = self._conn.execute("SELECT COUNT(*) AS c FROM state_generations").fetchone()["c"]
+        suspected = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE deleted_state='suspected'"
+        ).fetchone()["c"]
+        deleted = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE deleted_state='deleted'"
+        ).fetchone()["c"]
+        coverage_n = self._conn.execute("SELECT COUNT(*) AS c FROM coverage_ranges").fetchone()["c"]
+        # Change metrics: recent snapshot stats
+        recent = self._conn.execute(
+            """
+            SELECT trigger, COUNT(*) AS c,
+                   SUM(states_decoded) AS states,
+                   SUM(COALESCE(json_extract(stats_json, '$.generations_new'), 0)) AS gens_new
+            FROM snapshots
+            WHERE finished_at IS NOT NULL
+            GROUP BY trigger
+            """
+        ).fetchall()
+        by_trigger = {
+            r["trigger"]: {
+                "snapshots": r["c"],
+                "states_decoded": r["states"],
+            }
+            for r in recent
+        }
+        channel_block: dict[str, Any] | None = None
+        if channel:
+            st = self._conn.execute(
+                "SELECT * FROM channel_status WHERE channel_id=?", (channel,)
+            ).fetchone()
+            ranges = self._conn.execute(
+                "SELECT start_ts, end_ts, contiguous_to_latest FROM coverage_ranges WHERE channel_id=?",
+                (channel,),
+            ).fetchall()
+            channel_block = {
+                "status": dict(st) if st else None,
+                "coverage_ranges": [dict(r) for r in ranges],
+            }
         return {
             "messages": count,
             "workspaces": len(self.list_workspaces()),
+            "state_generations": gens,
+            "deleted": deleted,
+            "suspected": suspected,
+            "coverage_ranges": coverage_n,
+            "snapshots_by_trigger": by_trigger,
             "last_snapshot": dict(snap) if snap else None,
-            "channel": channel,
+            "channel": channel_block or channel,
         }
 
     def search_fts(

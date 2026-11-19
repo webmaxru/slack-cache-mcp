@@ -14,6 +14,7 @@ source_modules =
     slack_cache_mcp.mcp_server
     slack_cache_mcp.export
     slack_cache_mcp.domain
+    slack_cache_mcp.vault
 forbidden_modules =
     requests
     httpx

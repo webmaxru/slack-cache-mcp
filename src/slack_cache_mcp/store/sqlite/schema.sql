@@ -212,6 +212,16 @@ CREATE TABLE IF NOT EXISTS channel_status (
   updated_at TEXT NOT NULL
 ) STRICT;
 
+-- Consecutive-generation counters for suspected deletion (PLAN §8.2)
+CREATE TABLE IF NOT EXISTS suspected_streaks (
+  channel_id TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  streak INTEGER NOT NULL,
+  last_state_sha256 TEXT,
+  last_seen TEXT NOT NULL,
+  PRIMARY KEY (channel_id, ts)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS change_log (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   hlc TEXT NOT NULL,

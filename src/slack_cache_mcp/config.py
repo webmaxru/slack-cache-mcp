@@ -123,6 +123,11 @@ class Settings:
     source_overrides: list[Path] = field(default_factory=list)
     capture_drafts: bool = False
     capture_dms: bool = True
+    vault_keep: bool = True
+    vault_keep_days: int = 30
+    poll_interval_s: float = 60.0
+    full_pass_interval_s: float = 900.0
+    watch_debounce_s: float = 2.0
 
     @property
     def archive_db(self) -> Path:
@@ -139,6 +144,10 @@ class Settings:
     @property
     def vault_dir(self) -> Path:
         return self.data_dir / "vault"
+
+    @property
+    def backups_dir(self) -> Path:
+        return self.data_dir / "backups"
 
 
 def load_settings(
