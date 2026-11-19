@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -17,6 +18,9 @@ from slack_cache_mcp.vault.keys import load_or_create_vault_key
 
 _MAGIC = b"SCV1"  # slackcache vault v1
 _NONCE_LEN = 12
+# Bound decompressed plaintext to blunt crafted vault decompression bombs.
+# Real Redux states are multi-MB; 256 MiB leaves headroom without unbounded RAM.
+_MAX_PLAINTEXT_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,37 @@ def _utc_now() -> datetime:
 def vault_object_relpath(state_sha256: str) -> str:
     """Two-level fan-out: ab/abcdef....zst.enc"""
     return f"{state_sha256[:2]}/{state_sha256}.zst.enc"
+
+
+def _decompress_bounded(compressed: bytes, *, max_bytes: int) -> bytes:
+    """Decompress zstd with an explicit plaintext size cap (anti bomb)."""
+    try:
+        params = zstd.get_frame_parameters(compressed)
+        declared = int(params.content_size)
+
+    except zstd.ZstdError as exc:
+        raise ValueError("invalid vault zstd frame") from exc
+    # CONTENTSIZE_UNKNOWN is -1 in zstandard bindings.
+    if declared >= 0 and declared > max_bytes:
+        raise ValueError(f"vault decompress failed or exceeded {max_bytes} byte cap")
+    if declared >= 0:
+        try:
+            return zstd.ZstdDecompressor().decompress(compressed)
+        except zstd.ZstdError as exc:
+            raise ValueError("vault decompress failed") from exc
+    # Unknown content size: stream and enforce the cap incrementally.
+    reader = zstd.ZstdDecompressor().stream_reader(io.BytesIO(compressed))
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = reader.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"vault decompress failed or exceeded {max_bytes} byte cap")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def canonical_sanitized_json(state: Any) -> tuple[bytes, str]:
@@ -115,7 +150,7 @@ class VaultStore:
         nonce, ct = body[:_NONCE_LEN], body[_NONCE_LEN:]
         aead = AESGCM(self._key)
         compressed = aead.decrypt(nonce, ct, state_sha256.encode("ascii"))
-        raw = zstd.ZstdDecompressor().decompress(compressed)
+        raw = _decompress_bounded(compressed, max_bytes=_MAX_PLAINTEXT_BYTES)
         return json.loads(raw.decode("utf-8"))
 
     def purge_expired(self) -> int:

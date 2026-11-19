@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from slack_cache_mcp.vault import store as vault_store
 from slack_cache_mcp.vault.store import VaultStore
 
 
@@ -30,3 +33,14 @@ def test_vault_roundtrip_and_no_xox(tmp_path: Path) -> None:
 def test_vault_disabled(tmp_path: Path) -> None:
     vault = VaultStore(tmp_path / "vault", key=b"\x02" * 32, keep=False)
     assert vault.write_state({"a": 1}) is None
+
+
+def test_vault_decompress_respects_max_output_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(vault_store, "_MAX_PLAINTEXT_BYTES", 64)
+    vault = VaultStore(tmp_path / "vault", key=b"\x03" * 32, keep=True)
+    res = vault.write_state({"pad": "x" * 200})
+    assert res is not None
+    with pytest.raises(ValueError, match="decompress"):
+        vault.read_state(res.state_sha256)

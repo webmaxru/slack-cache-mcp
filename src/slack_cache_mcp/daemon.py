@@ -87,7 +87,6 @@ def run_daemon(
         "errors": 0,
     }
     last_full = 0.0
-    pending_trigger = "poll"
 
     def _run(trigger: str) -> None:
         nonlocal last_full
@@ -139,8 +138,6 @@ def run_daemon(
                 )
 
     def _request_watch() -> None:
-        nonlocal pending_trigger
-        pending_trigger = "watch"
         _run("watch")
 
     debouncer = _DebouncedTrigger(WATCH_DEBOUNCE_S, _request_watch)

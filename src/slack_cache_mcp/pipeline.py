@@ -50,16 +50,45 @@ def _state_sha(state: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+class CredentialScratchError(RuntimeError):
+    """Raised when Local Storage credential scratch cannot be removed from the mirror."""
+
+
+def _rmtree_credential_scratch(path: Path) -> None:
+    """Delete a path tree, clearing read-only bits; raise if anything remains."""
+    import os
+    import stat
+
+    def _onexc(func: Any, p: str, exc: BaseException) -> None:
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception as retry_exc:
+            raise CredentialScratchError(
+                f"cannot remove credential scratch path {p}: {retry_exc}"
+            ) from retry_exc
+
+    if path.is_dir():
+        shutil.rmtree(path, onexc=_onexc)
+    elif path.is_file() or path.is_symlink():
+        try:
+            path.unlink()
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink()
+    if path.exists():
+        raise CredentialScratchError(f"credential scratch still present after delete: {path}")
+
+
 def _scrub_credential_scratch(mirror: Path) -> None:
     """Physically delete Local Storage copies (may contain tokens) and drop manifest entries.
 
     PLAN §5.2: parse allowlisted fields, then securely remove the ephemeral mirror copy.
+    Deletion failures are fatal — silent leftover token files are not acceptable.
     """
     local_storage = mirror / "Local Storage"
-    if local_storage.is_dir():
-        shutil.rmtree(local_storage, ignore_errors=True)
-    elif local_storage.is_file():
-        local_storage.unlink(missing_ok=True)
+    if local_storage.exists():
+        _rmtree_credential_scratch(local_storage)
     manifest_path = mirror / "manifest.json"
     if not manifest_path.is_file():
         return
