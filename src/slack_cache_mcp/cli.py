@@ -17,6 +17,9 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+task_app = typer.Typer(help="Windows Task Scheduler integration", no_args_is_help=True)
+app.add_typer(task_app, name="task")
+
 
 def _boot() -> None:
     netguard.install()
@@ -82,7 +85,7 @@ def snapshot_cmd(
     """Copy allowlisted cache files, decode, and ingest into the archive."""
     _boot()
     if not once:
-        typer.echo("Use --once in M1 (daemon arrives in M2).", err=True)
+        typer.echo("Use --once, or run `slackcache daemon` for continuous sync.", err=True)
         raise typer.Exit(2)
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.pipeline import run_snapshot_once
@@ -90,6 +93,62 @@ def snapshot_cmd(
     settings = load_settings(data_dir=data_dir, source=source)
     result = run_snapshot_once(settings)
     typer.echo(json.dumps(result, indent=2, default=str))
+
+
+@app.command("daemon")
+def daemon_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    source: Path | None = typer.Option(None, "--source"),
+    ensure_single: bool = typer.Option(True, "--ensure-single/--no-ensure-single"),
+    max_cycles: int | None = typer.Option(
+        None, "--max-cycles", help="Stop after N cycles (tests)"
+    ),
+    poll_interval: float | None = typer.Option(None, "--poll-interval"),
+    full_interval: float | None = typer.Option(None, "--full-interval"),
+) -> None:
+    """Long-running watcher + poll + full-pass continuous sync engine."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.daemon import run_daemon
+
+    settings = load_settings(data_dir=data_dir, source=source)
+    result = run_daemon(
+        settings,
+        ensure_single=ensure_single,
+        max_cycles=max_cycles,
+        poll_interval_s=poll_interval if poll_interval is not None else settings.poll_interval_s,
+        full_pass_interval_s=(
+            full_interval if full_interval is not None else settings.full_pass_interval_s
+        ),
+    )
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
+@app.command("backup")
+def backup_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """Backup archive.db via SQLite backup API into backups/."""
+    _boot()
+    from slack_cache_mcp.backup import backup_archive
+    from slack_cache_mcp.config import load_settings
+
+    settings = load_settings(data_dir=data_dir)
+    result = backup_archive(settings.archive_db, settings.backups_dir)
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
+@app.command("encryption-spike")
+def encryption_spike_cmd() -> None:
+    """Probe SQLCipher/sqlite3mc availability; print M2 decision (no network)."""
+    _boot()
+    from slack_cache_mcp.crypto_spike import run_encryption_spike
+
+    typer.echo(json.dumps(run_encryption_spike(), indent=2, default=str))
 
 
 @app.command("search")
@@ -135,13 +194,49 @@ def mcp_cmd(
     """Run the MCP server (stdio)."""
     _boot()
     if transport != "stdio":
-        typer.echo("M1 only supports --transport stdio", err=True)
+        typer.echo("Only --transport stdio is supported in stage 1", err=True)
         raise typer.Exit(2)
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.mcp_server.server import run_stdio
 
     settings = load_settings(data_dir=data_dir)
     run_stdio(settings)
+
+
+@task_app.command("install")
+def task_install_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """Register per-user scheduled task (Windows)."""
+    _boot()
+    from slack_cache_mcp.task_windows import install_task
+
+    result = install_task(data_dir=data_dir)
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
+@task_app.command("uninstall")
+def task_uninstall_cmd() -> None:
+    """Remove the slackcache-daemon scheduled task."""
+    _boot()
+    from slack_cache_mcp.task_windows import uninstall_task
+
+    result = uninstall_task()
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
+@task_app.command("status")
+def task_status_cmd() -> None:
+    """Show whether the scheduled task is installed."""
+    _boot()
+    from slack_cache_mcp.task_windows import task_status
+
+    result = task_status()
+    typer.echo(json.dumps(result, indent=2, default=str))
 
 
 def main() -> None:
