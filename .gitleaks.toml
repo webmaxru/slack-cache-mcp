@@ -1,0 +1,10 @@
+# Synthetic FAKE tokens in fixtures/tests are intentional sanitizer inputs.
+title = "slack-cache-mcp"
+
+[allowlist]
+description = "Allow listed paths for synthetic fixture secrets"
+paths = [
+  '''tests/fixture_gen/.*''',
+  '''tests/test_sanitize\.py''',
+  '''docs/.*''',
+]

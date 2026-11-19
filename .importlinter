@@ -1,0 +1,36 @@
+[importlinter]
+root_packages =
+    slack_cache_mcp
+include_external_packages = True
+
+[importlinter:contract:offline-no-network]
+name = Offline packages may not import network clients
+type = forbidden
+source_modules =
+    slack_cache_mcp.desktop
+    slack_cache_mcp.ingest
+    slack_cache_mcp.store
+    slack_cache_mcp.search
+    slack_cache_mcp.mcp_server
+    slack_cache_mcp.export
+    slack_cache_mcp.domain
+forbidden_modules =
+    requests
+    httpx
+    httpx2
+    aiohttp
+    urllib3
+    websockets
+    grpc
+    slack_sdk
+    slack_bolt
+    boto3
+    paramiko
+    ftplib
+    smtplib
+    webbrowser
+    selenium
+    playwright
+    pychrome
+    pywinauto
+    pyautogui
