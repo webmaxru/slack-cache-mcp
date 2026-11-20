@@ -123,6 +123,11 @@ class Settings:
     source_overrides: list[Path] = field(default_factory=list)
     capture_drafts: bool = False
     capture_dms: bool = True
+    capture_downloads: bool = False
+    capture_http_cache: bool = False
+    capture_notifications: bool = False
+    capture_ocr: bool = False
+    http_cache_max_bytes: int = 50_000_000
     vault_keep: bool = True
     vault_keep_days: int = 30
     poll_interval_s: float = 60.0

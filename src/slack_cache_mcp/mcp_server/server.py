@@ -146,8 +146,55 @@ def build_server(settings: Settings) -> MCPServer:
         workspace: str | None = None,
         channel: str | None = None,
     ) -> dict[str, Any]:
-        """Basic archive/cache status."""
-        return repo.cache_status(workspace=workspace, channel=channel)
+        """Basic archive/cache status including per-source yield."""
+        status = repo.cache_status(workspace=workspace, channel=channel)
+        status["source_yield"] = repo.source_yield_report()
+        return status
+
+    @mcp.tool(annotations=_ANNOT)
+    def list_files(
+        workspace: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List file metadata captured from the cache (no network)."""
+        return {
+            "files": repo.list_files(
+                workspace=workspace, query=query, limit=min(limit, 200)
+            )
+        }
+
+    @mcp.tool(annotations=_ANNOT)
+    def list_saved(
+        workspace: str | None = None,
+        state: str = "any",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List saved/Later/star/pin items from Redux slices."""
+        return {
+            "items": repo.list_saved(
+                workspace=workspace, state=state, limit=min(limit, 200)
+            )
+        }
+
+    @mcp.tool(annotations=_ANNOT)
+    def search_canvases(
+        query: str | None = None,
+        workspace: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Search canvases reconstructed from local canvas IndexedDB."""
+        return {
+            "canvases": repo.list_canvases(
+                workspace=workspace, query=query, limit=min(limit, 100)
+            )
+        }
+
+    @mcp.tool(annotations=_ANNOT)
+    def get_canvas(canvas_id: str) -> dict[str, Any]:
+        """Get one canvas document by id."""
+        doc = repo.get_canvas(canvas_id)
+        return {"canvas": doc} if doc else {"error": "not_found"}
 
     return mcp
 

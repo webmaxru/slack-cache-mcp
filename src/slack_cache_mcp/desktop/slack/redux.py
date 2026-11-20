@@ -10,13 +10,73 @@ from collections.abc import Mapping
 from typing import Any
 
 from slack_cache_mcp.desktop.sanitize import sanitize
-from slack_cache_mcp.domain.models import Channel, FileMeta, MessageObservation, User, Workspace
+from slack_cache_mcp.domain.models import (
+    Channel,
+    FileMeta,
+    MessageObservation,
+    ReactionSet,
+    SavedItem,
+    User,
+    Workspace,
+)
 from slack_cache_mcp.ingest.hashing import content_sha256, normalize_ts, search_text_from_message
 
+# PLAN §8.3 source ranks
 SOURCE_RANK = {
     "redux.messages": 100,
     "redux.threads": 90,
+    "redux.allThreads": 90,
+    "redux.threadSub": 90,
+    "redux.threadMetadata": 90,
+    "idb.leveldb.historical": 80,
+    "idb.leveldb": 80,
+    "idb.sidecar": 75,
+    "redux.searchResults": 70,
+    "redux.pins": 65,
+    "redux.saved": 60,
+    "redux.stars": 60,
+    "redux.lists": 55,
+    "redux.summaryDetail": 50,
+    "redux.codeChannelAiSummary": 50,
+    "session.storage": 40,
+    "notif.win": 30,
+    "redux.channelLatests": 20,
 }
+
+KNOWN_SLICES = frozenset(
+    {
+        "channels",
+        "members",
+        "messages",
+        "threads",
+        "allThreads",
+        "threadSub",
+        "threadMetadata",
+        "channelHistory",
+        "channelCursors",
+        "channelLatests",
+        "messagesMeta",
+        "files",
+        "saved",
+        "stars",
+        "pins",
+        "reactions",
+        "lists",
+        "searchResults",
+        "summaryDetail",
+        "codeChannelAiSummary",
+        "bots",
+        "userGroups",
+        "teams",
+        "bootData",
+        "selfTeamIds",
+        "channelSections",
+        "unreadCounts",
+        "workObjects",
+        "userAlerts",
+        "externalTeamIds",
+    }
+)
 
 
 def as_dict(v: Any) -> dict[str, Any]:
@@ -219,7 +279,7 @@ def extract_files(state: Mapping[str, Any], workspace_key: str) -> list[FileMeta
     return out
 
 
-def _obs_from_msg(
+def observation_from_message(
     msg: Mapping[str, Any],
     *,
     channel_id: str,
@@ -276,41 +336,271 @@ def _obs_from_msg(
     )
 
 
+def _extract_slice_messages(
+    node: Any,
+    workspace_key: str,
+    source: str,
+    *,
+    default_channel: str | None = None,
+    is_partial: bool = False,
+) -> list[MessageObservation]:
+    found: dict[tuple[str | None, str], dict[str, Any]] = {}
+    walk_messages(node, default_channel, found)
+    out: list[MessageObservation] = []
+    for (c, _ts), msg in found.items():
+        if not c and not default_channel:
+            continue
+        obs = observation_from_message(
+            msg,
+            channel_id=str(c or default_channel),
+            workspace_key=workspace_key,
+            source=source,
+        )
+        if obs:
+            if is_partial:
+                obs.is_partial = True
+                obs.source_rank = SOURCE_RANK.get(source, obs.source_rank)
+            out.append(obs)
+    return out
+
+
 def extract_messages(state: Mapping[str, Any], workspace_key: str) -> list[MessageObservation]:
     clean = sanitize(dict(state))
     assert isinstance(clean, dict)
     out: list[MessageObservation] = []
     msgs = as_dict(clean.get("messages"))
     for cid, bucket in msgs.items():
-        found: dict[tuple[str | None, str], dict[str, Any]] = {}
-        walk_messages(bucket, str(cid), found)
-        for (c, _ts), msg in found.items():
-            channel_id = str(c or cid)
-            obs = _obs_from_msg(
-                msg,
-                channel_id=channel_id,
-                workspace_key=workspace_key,
-                source="redux.messages",
+        out.extend(
+            _extract_slice_messages(
+                bucket, workspace_key, "redux.messages", default_channel=str(cid)
             )
-            if obs:
-                out.append(obs)
+        )
 
-    threads = clean.get("threads")
-    if threads is not None:
-        found_t: dict[tuple[str | None, str], dict[str, Any]] = {}
-        walk_messages(threads, None, found_t)
-        for (c, _ts), msg in found_t.items():
-            if not c:
-                continue
-            obs = _obs_from_msg(
-                msg,
-                channel_id=str(c),
+    for slice_name in ("threads", "allThreads", "threadSub", "threadMetadata"):
+        node = clean.get(slice_name)
+        if node is not None:
+            out.extend(
+                _extract_slice_messages(
+                    node, workspace_key, f"redux.{slice_name}"
+                )
+            )
+
+    # searchResults: messages from in-app searches (may be outside cache window)
+    sr = clean.get("searchResults")
+    if sr is not None:
+        out.extend(
+            _extract_slice_messages(sr, workspace_key, "redux.searchResults")
+        )
+
+    # pins / saved / stars may embed message objects
+    for slice_name in ("pins", "saved", "stars"):
+        node = clean.get(slice_name)
+        if node is not None:
+            out.extend(
+                _extract_slice_messages(node, workspace_key, f"redux.{slice_name}")
+            )
+
+    # lists items
+    lists = clean.get("lists")
+    if lists is not None:
+        out.extend(_extract_slice_messages(lists, workspace_key, "redux.lists"))
+
+    # AI summaries — treat summary text as partial message-like when shaped
+    for slice_name in ("summaryDetail", "codeChannelAiSummary"):
+        node = clean.get(slice_name)
+        if node is not None:
+            out.extend(
+                _extract_slice_messages(
+                    node, workspace_key, f"redux.{slice_name}", is_partial=True
+                )
+            )
+
+    # channelLatests previews (lowest rank, partial)
+    latests = as_dict(clean.get("channelLatests"))
+    for cid, raw in latests.items():
+        if isinstance(raw, dict) and is_message(raw):
+            obs = observation_from_message(
+                raw,
+                channel_id=str(cid),
                 workspace_key=workspace_key,
-                source="redux.threads",
+                source="redux.channelLatests",
             )
             if obs:
+                obs.is_partial = True
+                out.append(obs)
+        elif isinstance(raw, dict) and raw.get("ts") and raw.get("text"):
+            preview = {
+                "type": "message",
+                "ts": raw.get("ts"),
+                "text": raw.get("text"),
+                "user": raw.get("user"),
+                "channel": cid,
+            }
+            obs = observation_from_message(
+                preview,
+                channel_id=str(cid),
+                workspace_key=workspace_key,
+                source="redux.channelLatests",
+            )
+            if obs:
+                obs.is_partial = True
                 out.append(obs)
     return out
+
+
+def extract_reactions(state: Mapping[str, Any]) -> list[ReactionSet]:
+    clean = sanitize(dict(state))
+    assert isinstance(clean, dict)
+    out: list[ReactionSet] = []
+    # reactions slice: often {channel: {ts: [{name, count, users}]}}
+    rx = as_dict(clean.get("reactions"))
+    for cid, bucket in rx.items():
+        if not isinstance(bucket, dict):
+            continue
+        for ts, entries in bucket.items():
+            items = entries if isinstance(entries, list) else [entries]
+            for ent in items:
+                if not isinstance(ent, dict):
+                    continue
+                emoji = ent.get("name") or ent.get("emoji")
+                if not emoji:
+                    continue
+                users_raw = ent.get("users") or []
+                users = [str(u) for u in users_raw] if isinstance(users_raw, list) else []
+                count = int(ent["count"]) if isinstance(ent.get("count"), (int, float)) else len(users)
+                out.append(
+                    ReactionSet(
+                        channel_id=str(cid),
+                        ts=normalize_ts(ts) or str(ts),
+                        emoji=str(emoji),
+                        count=count,
+                        users=users,
+                    )
+                )
+    # Also pull reactions embedded on messages
+    for obs_msg in _iter_message_dicts(clean.get("messages")):
+        cid = str(obs_msg.get("channel") or "")
+        ts = normalize_ts(obs_msg.get("ts"))
+        if not cid or not ts:
+            continue
+        for ent in obs_msg.get("reactions") or []:
+            if not isinstance(ent, dict):
+                continue
+            emoji = ent.get("name") or ent.get("emoji")
+            if not emoji:
+                continue
+            users_raw = ent.get("users") or []
+            users = [str(u) for u in users_raw] if isinstance(users_raw, list) else []
+            count = int(ent["count"]) if isinstance(ent.get("count"), (int, float)) else len(users)
+            out.append(
+                ReactionSet(
+                    channel_id=cid,
+                    ts=ts,
+                    emoji=str(emoji),
+                    count=count,
+                    users=users,
+                )
+            )
+    return out
+
+
+def _iter_message_dicts(node: Any, *, depth: int = 0) -> list[dict[str, Any]]:
+    found: dict[tuple[str | None, str], dict[str, Any]] = {}
+    walk_messages(node, None, found, depth=depth)
+    return list(found.values())
+
+
+def extract_saved_items(state: Mapping[str, Any], workspace_key: str) -> list[SavedItem]:
+    clean = sanitize(dict(state))
+    assert isinstance(clean, dict)
+    out: list[SavedItem] = []
+    for slice_name, item_type in (("saved", "saved"), ("stars", "star"), ("pins", "pin")):
+        node = clean.get(slice_name)
+        if node is None:
+            continue
+        items: list[tuple[str, Any]]
+        if isinstance(node, dict):
+            items = list(node.items())
+        elif isinstance(node, list):
+            items = [(str(i), x) for i, x in enumerate(node)]
+        else:
+            continue
+        for iid, raw in items:
+            if not isinstance(raw, dict):
+                continue
+            c = sanitize(raw)
+            assert isinstance(c, dict)
+            channel_id = c.get("channel") or c.get("channel_id")
+            ts = c.get("ts") or c.get("message_ts")
+            # nested message
+            msg = c.get("message") if isinstance(c.get("message"), dict) else None
+            if msg:
+                channel_id = channel_id or msg.get("channel")
+                ts = ts or msg.get("ts")
+            out.append(
+                SavedItem(
+                    workspace_key=workspace_key,
+                    item_type=item_type,
+                    item_id=str(c.get("id") or iid),
+                    channel_id=str(channel_id) if channel_id else None,
+                    ts=normalize_ts(ts) if ts else None,
+                    state=str(c["state"]) if c.get("state") else None,
+                    date_created=float(c["date_created"])
+                    if isinstance(c.get("date_created"), (int, float))
+                    else None,
+                    date_due=float(c["date_due"])
+                    if isinstance(c.get("date_due"), (int, float))
+                    else None,
+                    raw=c,
+                )
+            )
+    return out
+
+
+def extract_bots_as_users(state: Mapping[str, Any], workspace_key: str) -> list[User]:
+    clean = sanitize(dict(state))
+    assert isinstance(clean, dict)
+    out: list[User] = []
+    for bid, b in as_dict(clean.get("bots")).items():
+        if not isinstance(b, dict):
+            continue
+        out.append(
+            User(
+                user_id=str(b.get("id") or bid),
+                team_id=str(b["team_id"]) if b.get("team_id") else None,
+                name=b.get("name"),
+                real_name=b.get("name"),
+                display_name=b.get("name"),
+                title=None,
+                email=None,
+                is_bot=True,
+                is_deleted=bool(b.get("deleted")),
+                is_restricted=False,
+                is_ultra_restricted=False,
+                is_external=False,
+                tz=None,
+                raw=sanitize(b) if isinstance(b, dict) else {},
+                workspace_key=workspace_key,
+            )
+        )
+    return out
+
+
+def extract_user_groups(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    clean = sanitize(dict(state))
+    assert isinstance(clean, dict)
+    out: list[dict[str, Any]] = []
+    for gid, g in as_dict(clean.get("userGroups")).items():
+        if isinstance(g, dict):
+            c = sanitize(g)
+            if isinstance(c, dict):
+                c.setdefault("id", str(gid))
+                out.append(c)
+    return out
+
+
+def unknown_slices(state: Mapping[str, Any]) -> list[str]:
+    return [str(k) for k in state if str(k) not in KNOWN_SLICES and not str(k).startswith("_")]
 
 
 _PERSIST_KEY_RE = re.compile(
@@ -329,15 +619,27 @@ def extract_all(
     state: Mapping[str, Any],
     *,
     persist_key: str | None = None,
-) -> tuple[Workspace, list[Channel], list[User], list[FileMeta], list[MessageObservation]]:
+) -> tuple[
+    Workspace,
+    list[Channel],
+    list[User],
+    list[FileMeta],
+    list[MessageObservation],
+    list[ReactionSet],
+    list[SavedItem],
+]:
     persist_id, persist_user = parse_persist_key(persist_key) if persist_key else (None, None)
     ws = extract_workspace(state, persist_id=persist_id)
     if persist_user and not ws.self_user_id:
         ws.self_user_id = persist_user
+    users = extract_users(state, ws.workspace_key)
+    users.extend(extract_bots_as_users(state, ws.workspace_key))
     return (
         ws,
         extract_channels(state, ws.workspace_key),
-        extract_users(state, ws.workspace_key),
+        users,
         extract_files(state, ws.workspace_key),
         extract_messages(state, ws.workspace_key),
+        extract_reactions(state),
+        extract_saved_items(state, ws.workspace_key),
     )

@@ -81,6 +81,10 @@ def snapshot_cmd(
     once: bool = typer.Option(False, "--once", help="One copy+decode+ingest cycle"),
     data_dir: Path | None = typer.Option(None, "--data-dir"),
     source: Path | None = typer.Option(None, "--source"),
+    capture_drafts: bool = typer.Option(False, "--capture-drafts"),
+    capture_downloads: bool = typer.Option(False, "--capture-downloads"),
+    capture_http_cache: bool = typer.Option(False, "--capture-http-cache"),
+    capture_notifications: bool = typer.Option(False, "--capture-notifications"),
 ) -> None:
     """Copy allowlisted cache files, decode, and ingest into the archive."""
     _boot()
@@ -91,6 +95,10 @@ def snapshot_cmd(
     from slack_cache_mcp.pipeline import run_snapshot_once
 
     settings = load_settings(data_dir=data_dir, source=source)
+    settings.capture_drafts = capture_drafts
+    settings.capture_downloads = capture_downloads
+    settings.capture_http_cache = capture_http_cache
+    settings.capture_notifications = capture_notifications
     result = run_snapshot_once(settings)
     typer.echo(json.dumps(result, indent=2, default=str))
 
@@ -184,6 +192,34 @@ def status_cmd(
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db, read_only=True)
     typer.echo(json.dumps(repo.cache_status(workspace=workspace), indent=2, default=str))
+
+
+@app.command("export")
+def export_cmd(
+    out: Path = typer.Option(..., "--out", help="Output directory"),
+    fmt: str = typer.Option("slack-export", "--format", help="slack-export|jsonl"),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    workspace: str | None = typer.Option(None, "--workspace"),
+) -> None:
+    """Export archive to Slack-export layout or JSONL."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.export import write_jsonl_export, write_slack_export
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+    settings = load_settings(data_dir=data_dir)
+    repo = SqliteRepository(settings.archive_db, read_only=True)
+    if fmt == "slack-export":
+        result = write_slack_export(repo, out, workspace=workspace)
+    elif fmt == "jsonl":
+        result = write_jsonl_export(repo, out, workspace=workspace)
+    else:
+        typer.echo("Unknown --format (use slack-export|jsonl)", err=True)
+        raise typer.Exit(2)
+    repo.close()
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
 
 
 @app.command("mcp")

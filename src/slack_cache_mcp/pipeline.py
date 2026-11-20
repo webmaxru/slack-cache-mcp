@@ -12,10 +12,20 @@ from typing import Any
 import ulid
 
 from slack_cache_mcp.config import Settings
+from slack_cache_mcp.desktop.chromium import httpcache
+from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend, open_idb_backend
 from slack_cache_mcp.desktop.chromium.idb_values import decode_blob_file, idb_origin_dir_name
 from slack_cache_mcp.desktop.locate import SlackProfile, discover_profiles, redact_path
 from slack_cache_mcp.desktop.sanitize import sanitize
-from slack_cache_mcp.desktop.slack import localstate, redux, rootstate
+from slack_cache_mcp.desktop.slack import (
+    canvas,
+    downloads,
+    localstate,
+    notifications_win,
+    redux,
+    rootstate,
+    session_scan,
+)
 from slack_cache_mcp.desktop.snapshot import snapshot_profile
 from slack_cache_mcp.domain.models import Channel, MessageObservation, Workspace
 from slack_cache_mcp.ingest.coverage import extract_channel_windows, suspected_missing, ts_key
@@ -195,7 +205,13 @@ def _ingest_profile(
     assert_data_dir_outside_sources(settings.data_dir, [profile.path])
     assert_data_dir_outside_sources(mirror, [profile.path])
 
-    stats = snapshot_profile(profile.path, mirror)
+    stats = snapshot_profile(
+        profile.path,
+        mirror,
+        include_http_cache=settings.capture_http_cache,
+        include_notifications=settings.capture_notifications,
+        http_cache_max_bytes=settings.http_cache_max_bytes,
+    )
     repo.upsert_source(
         source_id,
         device_id,
@@ -213,10 +229,30 @@ def _ingest_profile(
     generations_new = 0
     vault_writes = 0
     suspected_marked = 0
+    yield_counts: dict[str, dict[str, int]] = {}
+    idb_backend_kind = "unknown"
+
+    def _bump(source: str, **kw: int) -> None:
+        bucket = yield_counts.setdefault(
+            source,
+            {
+                "messages": 0,
+                "files": 0,
+                "canvases": 0,
+                "reactions": 0,
+                "saved_items": 0,
+                "drafts": 0,
+                "cache_entries": 0,
+                "errors": 0,
+            },
+        )
+        for k, v in kw.items():
+            bucket[k] = bucket.get(k, 0) + v
 
     try:
         teams = localstate.load_local_config_teams(mirror)
         root_ws = rootstate.load_root_workspaces(mirror)
+        idb_backend_kind = detect_idb_backend(mirror)
 
         blob_root = mirror / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
         if blob_root.is_dir():
@@ -226,6 +262,7 @@ def _ingest_profile(
                 info, val = decode_blob_file(bf)
                 if info.error or not isinstance(val, dict):
                     decode_errors += 1
+                    _bump("redux.blob", errors=1)
                     continue
                 states_decoded += 1
                 clean = sanitize(val)
@@ -242,7 +279,9 @@ def _ingest_profile(
                 if vres and vres.created:
                     vault_writes += 1
 
-                ws, channels, users, _files, messages = redux.extract_all(clean)
+                ws, channels, users, files, messages, reactions, saved = redux.extract_all(
+                    clean
+                )
                 if ws.workspace_key in teams:
                     t = teams[ws.workspace_key]
                     ws.name = ws.name or t.get("name")
@@ -271,20 +310,172 @@ def _ingest_profile(
                     repo.upsert_channel(ch, hlc.now(), seen_at)
                 for u in users:
                     repo.upsert_user(u, hlc.now(), seen_at)
+                for f in files:
+                    repo.upsert_file(f, hlc.now(), seen_at)
+                    _bump("redux.files", files=1)
+                for rx in reactions:
+                    repo.upsert_reaction(rx, hlc.now())
+                    _bump("redux.reactions", reactions=1)
+                for item in saved:
+                    repo.upsert_saved_item(item, seen_at)
+                    _bump("redux.saved", saved_items=1)
                 for obs in messages:
-                    repo.ingest_observation(
+                    if repo.ingest_observation(
                         obs,
                         device_id=device_id,
                         snapshot_id=snapshot_id,
                         state_sha256=sha,
                         seen_at=seen_at,
                         hlc=hlc.now(),
-                    )
-                    messages_ingested += 1
+                    ):
+                        messages_ingested += 1
+                        _bump(obs.source, messages=1)
 
                 suspected_marked += _apply_coverage_and_suspected(
                     repo, clean, state_sha256=sha, seen_at=seen_at
                 )
+
+        # Historical / inline IDB records (LevelDB + side-cars)
+        try:
+            backend = open_idb_backend(mirror)
+            hist_err = 0
+            canvas_rows: list[Any] = []
+            for rec in backend.iter_records(include_deleted=True):
+                if rec.error:
+                    hist_err += 1
+                if rec.database.startswith("canvas") or (
+                    isinstance(rec.key, str) and rec.key.startswith("syncer.")
+                ):
+                    canvas_rows.append(rec)
+                if isinstance(rec.value, dict) and (
+                    "messages" in rec.value or "bootData" in rec.value
+                ):
+                    # Full Redux state found inline/historical — extract if new
+                    clean = sanitize(rec.value)
+                    assert isinstance(clean, dict)
+                    sha = _state_sha(clean)
+                    if not repo.has_state_generation(sha):
+                        ws, channels, users, files, messages, reactions, saved = (
+                            redux.extract_all(clean)
+                        )
+                        channels, messages = _filter_dms(
+                            channels, messages, capture_dms=settings.capture_dms
+                        )
+                        for obs in messages:
+                            obs.source = (
+                                "idb.leveldb.historical"
+                                if rec.state == "deleted"
+                                else (rec.source or "idb.leveldb")
+                            )
+                            obs.source_rank = redux.SOURCE_RANK.get(
+                                obs.source, obs.source_rank
+                            )
+                            if repo.ingest_observation(
+                                obs,
+                                device_id=device_id,
+                                snapshot_id=snapshot_id,
+                                state_sha256=sha,
+                                seen_at=seen_at,
+                                hlc=hlc.now(),
+                            ):
+                                messages_ingested += 1
+                                _bump(obs.source, messages=1)
+                        repo.insert_state_generation(
+                            sha,
+                            ws.workspace_key,
+                            ws.self_user_id,
+                            None,
+                            snapshot_id,
+                            seen_at,
+                            vault_path=None,
+                        )
+                        repo.upsert_workspace(ws, hlc.now(), seen_at)
+                # Message-shaped single values from historical records
+                if isinstance(rec.value, dict) and redux.is_message(rec.value):
+                    cid = rec.value.get("channel")
+                    if cid:
+                        hist_obs = redux.observation_from_message(
+                            rec.value,
+                            channel_id=str(cid),
+                            workspace_key="unknown",
+                            source="idb.leveldb.historical",
+                        )
+                        if hist_obs is not None and repo.ingest_observation(
+                            hist_obs,
+                            device_id=device_id,
+                            snapshot_id=snapshot_id,
+                            state_sha256="idb-historical",
+                            seen_at=seen_at,
+                            hlc=hlc.now(),
+                        ):
+                            messages_ingested += 1
+                            _bump("idb.leveldb.historical", messages=1)
+
+            # Group canvas records by database
+            by_db: dict[str, list[Any]] = {}
+            for rec in canvas_rows:
+                by_db.setdefault(rec.database, []).append(rec)
+            for db_name, rows in by_db.items():
+                for doc in canvas.extract_from_idb_records(rows, database=db_name):
+                    repo.upsert_canvas(doc, seen_at)
+                    _bump("canvas", canvases=1)
+
+            # Note: message yields are already counted per-message under the concrete source
+            # bucket (e.g., "idb.leveldb.historical"). Keep the umbrella bucket for non-message
+            # aggregates like errors to avoid double-counting in yield reports.
+            _bump("idb.historical", errors=hist_err)
+        except Exception:  # noqa: BLE001 — never fail the cycle on optional harvest
+            _bump("idb.historical", errors=1)
+
+        # Session Storage scan
+        for obs in session_scan.scan_session_messages(mirror):
+            if repo.ingest_observation(
+                obs,
+                device_id=device_id,
+                snapshot_id=snapshot_id,
+                state_sha256="session",
+                seen_at=seen_at,
+                hlc=hlc.now(),
+            ):
+                messages_ingested += 1
+                _bump("session.storage", messages=1)
+
+        # Opt-in drafts
+        if settings.capture_drafts:
+            for draft in localstate.load_drafts(mirror):
+                repo.upsert_draft(draft, seen_at)
+                _bump("local.drafts", drafts=1)
+
+        # Opt-in downloads
+        if settings.capture_downloads:
+            dl_rows = downloads.load_downloads(mirror)
+            for f in downloads.index_local_downloads(dl_rows, extract_text=True):
+                repo.upsert_file(f, hlc.now(), seen_at)
+                _bump("root.downloads", files=1)
+
+        # Opt-in HTTP cache
+        if settings.capture_http_cache:
+            entries = httpcache.extract_cache_entries(
+                mirror, max_bytes_total=settings.http_cache_max_bytes
+            )
+            for ent in entries:
+                _bump("http.cache", cache_entries=1)
+                if settings.capture_ocr and ent.ocr_text is None:
+                    pass  # OCR stub; no-op without platform OCR deps
+
+        # Opt-in Windows notifications (side-car under mirror only in automated runs)
+        if settings.capture_notifications:
+            for obs in notifications_win.extract_notifications(mirror):
+                if repo.ingest_observation(
+                    obs,
+                    device_id=device_id,
+                    snapshot_id=snapshot_id,
+                    state_sha256="notif",
+                    seen_at=seen_at,
+                    hlc=hlc.now(),
+                ):
+                    messages_ingested += 1
+                    _bump("notif.win", messages=1)
 
         known_keys = {w["key"] for w in repo.list_workspaces()}
         for key, meta in root_ws.items():
@@ -309,6 +500,20 @@ def _ingest_profile(
     finally:
         _scrub_credential_scratch(mirror)
 
+    for src_name, counts in yield_counts.items():
+        repo.record_source_yield(
+            snapshot_id,
+            src_name,
+            messages=int(counts.get("messages", 0)),
+            files=int(counts.get("files", 0)),
+            canvases=int(counts.get("canvases", 0)),
+            reactions=int(counts.get("reactions", 0)),
+            saved_items=int(counts.get("saved_items", 0)),
+            drafts=int(counts.get("drafts", 0)),
+            cache_entries=int(counts.get("cache_entries", 0)),
+            errors=int(counts.get("errors", 0)),
+        )
+
     repo.finish_snapshot(
         snapshot_id,
         files_copied=stats.copied,
@@ -327,6 +532,8 @@ def _ingest_profile(
                 "messages_ingested": messages_ingested,
                 "primary": profile.primary,
                 "trigger": trigger,
+                "idb_backend": idb_backend_kind,
+                "source_yield": yield_counts,
             }
         ),
     )
@@ -343,6 +550,7 @@ def _ingest_profile(
         "generations_new": generations_new,
         "vault_writes": vault_writes,
         "suspected_marked": suspected_marked,
+        "source_yield": yield_counts,
         "primary": profile.primary,
     }
 

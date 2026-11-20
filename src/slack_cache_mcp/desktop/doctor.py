@@ -2,33 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from slack_cache_mcp import netguard
 from slack_cache_mcp.config import Settings
+from slack_cache_mcp.desktop.chromium.httpcache import inventory_http_cache
+from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend
 from slack_cache_mcp.desktop.chromium.idb_values import decode_blob_file, idb_origin_dir_name
 from slack_cache_mcp.desktop.locate import discover_profiles, redact_path
-
-
-def _detect_idb_backend(profile: Path) -> str:
-    origin = idb_origin_dir_name()
-    idb = profile / "IndexedDB"
-    if not idb.is_dir():
-        return "missing"
-    for p in idb.rglob("*"):
-        if not p.is_file():
-            continue
-        try:
-            with open(p, "rb") as fh:
-                head = fh.read(16)
-            if head.startswith(b"SQLite format 3"):
-                return "sqlite"
-        except OSError:
-            continue
-    if (idb / f"{origin}.leveldb").is_dir():
-        return "leveldb"
-    return "unknown"
+from slack_cache_mcp.desktop.slack import localstate, redux, session_scan
 
 
 def run_doctor(settings: Settings) -> dict[str, Any]:
@@ -39,10 +21,13 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
     decode_err = 0
     unknown_slices: list[str] = []
     backend = None
+    session_inv: dict[str, Any] = {"present": False}
+    local_keys: list[str] = []
+    http_inv: dict[str, Any] = {"present": False}
     for p in profiles:
         if not p.valid:
             continue
-        backend = _detect_idb_backend(p.path)
+        backend = detect_idb_backend(p.path)
         blob_root = p.path / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
         if blob_root.is_dir():
             for bf in blob_root.rglob("*"):
@@ -56,27 +41,30 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
                 else:
                     decode_ok += 1
                     if isinstance(val, dict):
-                        # record a few unexpected top-level keys vs known core set
-                        known = {
-                            "channels",
-                            "members",
-                            "messages",
-                            "threads",
-                            "teams",
-                            "bootData",
-                            "selfTeamIds",
-                            "files",
-                        }
-                        for k in val:
-                            if k not in known and k not in unknown_slices:
-                                unknown_slices.append(str(k))
-        break  # primary-ish first valid
+                        for k in redux.unknown_slices(val):
+                            if k not in unknown_slices:
+                                unknown_slices.append(k)
+        session_inv = session_scan.inventory_session_storage(p.path)
+        local_keys = localstate.inventory_local_storage_keys(p.path)
+        http_inv = inventory_http_cache(p.path)
+        break
 
     vault_objects = 0
     if settings.vault_dir.is_dir():
         vault_objects = sum(1 for _ in settings.vault_dir.rglob("*.zst.enc"))
 
     archive_exists = settings.archive_db.is_file()
+    source_yield: list[dict[str, Any]] = []
+    if archive_exists:
+        try:
+            from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+            repo = SqliteRepository(settings.archive_db, read_only=True)
+            source_yield = repo.source_yield_report()
+            repo.close()
+        except Exception:  # noqa: BLE001
+            source_yield = []
+
     return {
         "profiles": [
             {
@@ -92,6 +80,17 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
         "decode_ok": decode_ok,
         "decode_errors": decode_err,
         "unknown_slices_sample": unknown_slices[:30],
+        "session_storage": session_inv,
+        "local_storage_key_patterns": local_keys,
+        "http_cache": http_inv,
+        "source_yield": source_yield,
+        "opt_in": {
+            "drafts": settings.capture_drafts,
+            "downloads": settings.capture_downloads,
+            "http_cache": settings.capture_http_cache,
+            "notifications": settings.capture_notifications,
+            "ocr": settings.capture_ocr,
+        },
         "netguard_installed": netguard.is_installed(),
         "data_dir": redact_path(settings.data_dir),
         "archive_db_present": archive_exists,

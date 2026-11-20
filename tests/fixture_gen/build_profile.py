@@ -255,8 +255,79 @@ def _workspace_state(
                 "mimetype": "text/plain",
                 "size": 12,
                 "user": user_id,
+                "preview": "hello file",
             }
         },
+        "allThreads": threads_slice,
+        "threadSub": {c_pub: {root_ts: {"subscribed": True}}},
+        "searchResults": {
+            "messages": [
+                _msg(
+                    "1763400200.000100",
+                    "U0OTHER01",
+                    "search hit about widgets from elsewhere",
+                    channel=c_pub,
+                )
+            ]
+        },
+        "channelLatests": {
+            c_pub: {
+                "ts": root_ts,
+                "text": "preview of latest",
+                "user": user_id,
+            }
+        },
+        "channelHistory": {
+            c_pub: {
+                "oldest": root_ts,
+                "latest": file_ts,
+                "has_more": False,
+            }
+        },
+        "pins": {
+            "P0SYNTHPIN1": {
+                "id": "P0SYNTHPIN1",
+                "channel": c_pub,
+                "ts": root_ts,
+                "message": messages_bucket[root_ts],
+            }
+        },
+        "saved": {
+            "S0SYNTHSAV1": {
+                "id": "S0SYNTHSAV1",
+                "channel": c_priv,
+                "ts": edited_ts,
+                "state": "open",
+                "date_created": 1763400000.0,
+            }
+        },
+        "stars": {},
+        "reactions": {
+            c_pub: {
+                root_ts: [{"name": "thumbsup", "count": 1, "users": ["U0OTHER01"]}],
+            }
+        },
+        "lists": {},
+        "bots": {
+            "B0SYNTHBOT1": {
+                "id": "B0SYNTHBOT1",
+                "name": "synthbot",
+                "deleted": False,
+                "team_id": team_id,
+            }
+        },
+        "userGroups": {
+            "S0GROUP001": {
+                "id": "S0GROUP001",
+                "name": "eng",
+                "handle": "eng",
+            }
+        },
+        "summaryDetail": {},
+        "channelSections": {
+            "sec1": {"name": "Starred", "channel_ids": [c_pub]},
+        },
+        "unreadCounts": {c_pub: {"count": 0}},
     }
     # Stash workspace_key for tests (not a Slack field; used only before sanitize in generator)
     state["_fixture_workspace_key"] = workspace_key
@@ -376,13 +447,169 @@ def build_synthetic_profile(dest: Path, *, wipe: bool = True) -> Path:
                 "teamId": "T0GRIDTEAM",
             },
         },
-        "downloads": {},
+        "downloads": {
+            "dl1": {
+                "id": "F0DOWNLOAD1",
+                "fileName": "memo.txt",
+                "downloadPath": str(dest / "downloaded_memo.txt"),
+                "mimetype": "text/plain",
+                "size": 20,
+                "preview_text": "downloaded memo body",
+            }
+        },
         "settings": {},
     }
     storage = dest / "storage"
     storage.mkdir(parents=True)
     (storage / "root-state.json").write_text(json.dumps(root_state), encoding="utf-8")
     (dest / "local-settings.json").write_text("{}", encoding="utf-8")
+    (dest / "downloaded_memo.txt").write_text("downloaded memo body", encoding="utf-8")
+
+    # Canvas IDB side-car
+    canvas_db = dest / "IndexedDB" / "canvas-U0SELF0001-T0SYNTHAAA"
+    canvas_db.mkdir(parents=True)
+    (canvas_db / "records.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "syncer.Document/Fc0SYNTHCAN1",
+                    "store": "canvas",
+                    "value": {
+                        "_type": "Document",
+                        "id": "Fc0SYNTHCAN1",
+                        "title": "Synth Canvas",
+                        "channel_id": "C0SYNTHPUB1",
+                    },
+                },
+                {
+                    "key": "syncer.Section/secA",
+                    "store": "canvas",
+                    "value": {
+                        "_type": "Section",
+                        "id": "secA",
+                        "document_id": "Fc0SYNTHCAN1",
+                        "text": "Canvas section one about widgets",
+                    },
+                },
+                {
+                    "key": "syncer.LoadData.Response.Index/Section/Fc0SYNTHCAN1",
+                    "store": "canvas",
+                    "value": {
+                        "_type": "SectionIndex",
+                        "document_id": "Fc0SYNTHCAN1",
+                        "section_ids": ["secA"],
+                    },
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Historical IDB side-car message
+    hist = dest / "IndexedDB" / "historical-sidecar"
+    hist.mkdir(parents=True)
+    (hist / "records.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "msg-hist-1",
+                    "store": "default",
+                    "state": "deleted",
+                    "seq": 42,
+                    "value": {
+                        "type": "message",
+                        "ts": "1763400300.000100",
+                        "channel": "C0SYNTHPUB1",
+                        "user": "U0OTHER01",
+                        "text": "historical leveldb message about widgets",
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Session Storage side-car
+    ss = dest / "Session Storage"
+    ss.mkdir(parents=True)
+    (ss / "CURRENT").write_text("MANIFEST-000001\n", encoding="utf-8")
+    (ss / "session_entries.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "transient-msg",
+                    "value": {
+                        "type": "message",
+                        "ts": "1763400400.000100",
+                        "channel": "C0SYNTHPUB1",
+                        "user": "U0SELF0001",
+                        "text": "session storage transient note",
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Drafts opt-in side-car
+    (dest / "Local Storage" / "local_entries.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "persist-v1::T0SYNTHAAA::U0SELF0001::drafts",
+                    "value": {
+                        "drafts": {
+                            "d1": {
+                                "id": "d1",
+                                "channel_id": "C0SYNTHPUB1",
+                                "text": "unsent draft about widgets",
+                            }
+                        }
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # HTTP cache side-car
+    cache = dest / "Cache"
+    cache.mkdir(parents=True)
+    (cache / "cache_entries.json").write_text(
+        json.dumps(
+            [
+                {
+                    "url": "https://files.example.test/files-tmb/abc/thumb.png",
+                    "content_type": "image/png",
+                    "size": 128,
+                    "sha256": "a" * 64,
+                    "path": "Cache/Cache_Data/f_000001",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Notifications side-car
+    notif = dest / "Notifications"
+    notif.mkdir(parents=True)
+    (notif / "notifications_win.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": 1,
+                    "aumid": "91750D7E.Slack_8she8kybcnzg4",
+                    "channel_id": "C0SYNTHPUB1",
+                    "user_id": "U0OTHER01",
+                    "ts": "1763400500.000100",
+                    "text": "notif preview about widgets",
+                    "xml": "<toast><text>general</text><text>alice</text>"
+                    "<text>notif preview about widgets</text></toast>",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     (dest / "fixture_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return dest

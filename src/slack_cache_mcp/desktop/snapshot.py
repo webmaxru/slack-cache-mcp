@@ -103,6 +103,9 @@ def snapshot_profile(
     *,
     open_func: OpenHook = open,
     require_stable_blobs: bool = True,
+    include_http_cache: bool = False,
+    include_notifications: bool = False,
+    http_cache_max_bytes: int = 50_000_000,
 ) -> SnapshotStats:
     """Copy allowlisted paths from source -> mirror. Never deletes source files."""
     source = Path(source).resolve()
@@ -123,12 +126,23 @@ def snapshot_profile(
         source / "Local Storage",
         source / "Session Storage",
     ]
+    if include_http_cache:
+        allow_trees.append(source / "Cache")
     allow_files = [
         source / "storage" / "root-state.json",
         source / "local-settings.json",
         # M1 fixture side-car for localConfig (not present on real Slack)
         source / "Local Storage" / "localConfig_v2.json",
+        # Always-on M3 synthetic side-cars (session scan; drafts gated at ingest)
+        source / "Session Storage" / "session_entries.json",
+        source / "Local Storage" / "local_entries.json",
     ]
+    # Opt-in side-cars only — avoid copying/missing-noise when flags are off.
+    if include_http_cache:
+        allow_files.append(source / "Cache" / "cache_entries.json")
+    if include_notifications:
+        allow_files.append(source / "Notifications" / "notifications_win.json")
+        allow_files.append(source / "notifications_win.json")
 
     def handle_file(src_file: Path, rel: Path, *, is_blob: bool) -> None:
         nonlocal stats
@@ -170,6 +184,7 @@ def snapshot_profile(
         else:
             stats.errors.append(f"{rel_s}: {err}")
 
+    cache_bytes = 0
     for tree in allow_trees:
         if not tree.exists():
             stats.missing.append(tree.name)
@@ -179,6 +194,16 @@ def snapshot_profile(
                 continue
             rel = p.relative_to(source)
             is_blob = ".indexeddb.blob" in p.as_posix().replace("\\", "/")
+            # Cap HTTP cache copy size (PLAN §4 #8)
+            if include_http_cache and "Cache" in rel.parts:
+                try:
+                    sz = p.stat().st_size
+                except OSError:
+                    continue
+                if cache_bytes + sz > http_cache_max_bytes:
+                    stats.errors.append(f"{rel.as_posix()}: http cache size cap")
+                    continue
+                cache_bytes += sz
             handle_file(p, rel, is_blob=is_blob)
 
     for f in allow_files:

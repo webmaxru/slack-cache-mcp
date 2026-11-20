@@ -9,7 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from slack_cache_mcp.domain.models import Channel, MessageObservation, User, Workspace
+from slack_cache_mcp.domain.models import (
+    CanvasDoc,
+    Channel,
+    Draft,
+    FileMeta,
+    MessageObservation,
+    ReactionSet,
+    SavedItem,
+    User,
+    Workspace,
+)
 from slack_cache_mcp.ingest.projection import (
     VersionCandidate,
     choose_current,
@@ -17,7 +27,7 @@ from slack_cache_mcp.ingest.projection import (
     max_merge_thread_meta,
 )
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 _XOX_RE = re.compile(rb"xox[a-z]-", re.I)
@@ -135,6 +145,72 @@ class SqliteRepository:
             ) STRICT
             """
         )
+        # M3 tables (additive; schema.sql CREATE IF NOT EXISTS also covers fresh DBs)
+        for ddl in (
+            """
+            CREATE TABLE IF NOT EXISTS reactions (
+              channel_id TEXT NOT NULL, ts TEXT NOT NULL, emoji TEXT NOT NULL,
+              count INTEGER NOT NULL, users_json TEXT, observed_hlc TEXT NOT NULL,
+              PRIMARY KEY (channel_id, ts, emoji)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS files (
+              file_id TEXT PRIMARY KEY, workspace_key TEXT, user_id TEXT,
+              name TEXT, title TEXT, mimetype TEXT, filetype TEXT, size INTEGER,
+              created REAL, preview_text TEXT, local_path TEXT, local_sha256 TEXT,
+              thumb_vault_path TEXT, ocr_text TEXT, raw_json TEXT NOT NULL,
+              first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, updated_hlc TEXT NOT NULL
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS message_files (
+              channel_id TEXT NOT NULL, ts TEXT NOT NULL, file_id TEXT NOT NULL,
+              PRIMARY KEY (channel_id, ts, file_id)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS saved_items (
+              workspace_key TEXT NOT NULL, item_type TEXT NOT NULL, item_id TEXT NOT NULL,
+              channel_id TEXT, ts TEXT, state TEXT, date_created REAL, date_due REAL,
+              raw_json TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+              PRIMARY KEY (workspace_key, item_type, item_id)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS canvases (
+              canvas_id TEXT PRIMARY KEY, workspace_key TEXT, channel_id TEXT, title TEXT,
+              text TEXT NOT NULL, raw_json TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+              first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS canvas_versions (
+              canvas_id TEXT NOT NULL, content_sha256 TEXT NOT NULL, text TEXT NOT NULL,
+              first_seen TEXT NOT NULL, PRIMARY KEY (canvas_id, content_sha256)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS drafts (
+              workspace_key TEXT NOT NULL, draft_id TEXT NOT NULL, channel_id TEXT,
+              thread_ts TEXT, text TEXT NOT NULL, last_updated REAL, raw_json TEXT NOT NULL,
+              first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+              PRIMARY KEY (workspace_key, draft_id)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS source_yield (
+              snapshot_id TEXT NOT NULL, source_name TEXT NOT NULL,
+              messages INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0,
+              canvases INTEGER NOT NULL DEFAULT 0, reactions INTEGER NOT NULL DEFAULT 0,
+              saved_items INTEGER NOT NULL DEFAULT 0, drafts INTEGER NOT NULL DEFAULT 0,
+              cache_entries INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+              extras_json TEXT NOT NULL DEFAULT '{}',
+              PRIMARY KEY (snapshot_id, source_name)
+            ) STRICT
+            """,
+        ):
+            self._conn.execute(ddl)
 
     def upsert_device(self, device_id: str, label: str) -> None:
         now = _utc_now()
@@ -574,7 +650,15 @@ class SqliteRepository:
         state_sha256: str,
         seen_at: str,
         hlc: str,
-    ) -> None:
+    ) -> bool:
+        """Upsert version+sighting. Returns True if a new message_versions row was inserted."""
+        existed = self._conn.execute(
+            """
+            SELECT 1 FROM message_versions
+            WHERE channel_id=? AND ts=? AND content_sha256=?
+            """,
+            (obs.channel_id, obs.ts, obs.content_sha256),
+        ).fetchone()
         raw = json.dumps(obs.raw, ensure_ascii=False)
         self._conn.execute(
             """
@@ -674,6 +758,7 @@ class SqliteRepository:
             )
         self._conn.commit()
         self.reproject_message(obs.channel_id, obs.ts)
+        return existed is None
 
     def reproject_message(self, channel_id: str, ts: str) -> None:
         rows = self._conn.execute(
@@ -1270,10 +1355,306 @@ class SqliteRepository:
         rows = self._conn.execute(sql, [*fparams, limit]).fetchall()
         return [self._msg_dict(r) for r in rows]
 
+    def upsert_file(self, f: FileMeta, hlc: str, seen_at: str) -> None:
+        raw = json.dumps(f.raw, ensure_ascii=False)
+        self._conn.execute(
+            """
+            INSERT INTO files(
+              file_id, workspace_key, user_id, name, title, mimetype, filetype, size,
+              created, preview_text, local_path, local_sha256, ocr_text, raw_json,
+              first_seen, last_seen, updated_hlc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+              name=COALESCE(excluded.name, files.name),
+              title=COALESCE(excluded.title, files.title),
+              preview_text=COALESCE(excluded.preview_text, files.preview_text),
+              local_path=COALESCE(excluded.local_path, files.local_path),
+              local_sha256=COALESCE(excluded.local_sha256, files.local_sha256),
+              ocr_text=COALESCE(excluded.ocr_text, files.ocr_text),
+              raw_json=excluded.raw_json,
+              last_seen=excluded.last_seen,
+              updated_hlc=excluded.updated_hlc
+            """,
+            (
+                f.file_id,
+                f.workspace_key,
+                f.user_id,
+                f.name,
+                f.title,
+                f.mimetype,
+                f.filetype,
+                f.size,
+                f.created,
+                f.preview_text,
+                f.local_path,
+                f.local_sha256,
+                f.ocr_text,
+                raw,
+                seen_at,
+                seen_at,
+                hlc,
+            ),
+        )
+        self._conn.commit()
+
+    def upsert_reaction(self, rx: ReactionSet, hlc: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO reactions(channel_id, ts, emoji, count, users_json, observed_hlc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id, ts, emoji) DO UPDATE SET
+              count=excluded.count,
+              users_json=excluded.users_json,
+              observed_hlc=excluded.observed_hlc
+            """,
+            (rx.channel_id, rx.ts, rx.emoji, rx.count, json.dumps(rx.users), hlc),
+        )
+        self._conn.commit()
+
+    def upsert_saved_item(self, item: SavedItem, seen_at: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO saved_items(
+              workspace_key, item_type, item_id, channel_id, ts, state,
+              date_created, date_due, raw_json, first_seen, last_seen
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_key, item_type, item_id) DO UPDATE SET
+              channel_id=COALESCE(excluded.channel_id, saved_items.channel_id),
+              ts=COALESCE(excluded.ts, saved_items.ts),
+              state=COALESCE(excluded.state, saved_items.state),
+              raw_json=excluded.raw_json,
+              last_seen=excluded.last_seen
+            """,
+            (
+                item.workspace_key,
+                item.item_type,
+                item.item_id,
+                item.channel_id,
+                item.ts,
+                item.state,
+                item.date_created,
+                item.date_due,
+                json.dumps(item.raw, ensure_ascii=False),
+                seen_at,
+                seen_at,
+            ),
+        )
+        self._conn.commit()
+
+    def upsert_canvas(self, doc: CanvasDoc, seen_at: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO canvases(
+              canvas_id, workspace_key, channel_id, title, text, raw_json,
+              content_sha256, first_seen, last_seen
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(canvas_id) DO UPDATE SET
+              title=COALESCE(excluded.title, canvases.title),
+              text=excluded.text,
+              raw_json=excluded.raw_json,
+              content_sha256=excluded.content_sha256,
+              last_seen=excluded.last_seen
+            """,
+            (
+                doc.canvas_id,
+                doc.workspace_key,
+                doc.channel_id,
+                doc.title,
+                doc.text,
+                json.dumps(doc.raw, ensure_ascii=False),
+                doc.content_sha256,
+                seen_at,
+                seen_at,
+            ),
+        )
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO canvas_versions(canvas_id, content_sha256, text, first_seen)
+            VALUES (?, ?, ?, ?)
+            """,
+            (doc.canvas_id, doc.content_sha256, doc.text, seen_at),
+        )
+        self._conn.commit()
+
+    def upsert_draft(self, draft: Draft, seen_at: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO drafts(
+              workspace_key, draft_id, channel_id, thread_ts, text, last_updated,
+              raw_json, first_seen, last_seen
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_key, draft_id) DO UPDATE SET
+              text=excluded.text,
+              raw_json=excluded.raw_json,
+              last_seen=excluded.last_seen
+            """,
+            (
+                draft.workspace_key,
+                draft.draft_id,
+                draft.channel_id,
+                draft.thread_ts,
+                draft.text,
+                draft.last_updated,
+                json.dumps(draft.raw, ensure_ascii=False),
+                seen_at,
+                seen_at,
+            ),
+        )
+        self._conn.commit()
+
+    def record_source_yield(
+        self,
+        snapshot_id: str,
+        source_name: str,
+        *,
+        messages: int = 0,
+        files: int = 0,
+        canvases: int = 0,
+        reactions: int = 0,
+        saved_items: int = 0,
+        drafts: int = 0,
+        cache_entries: int = 0,
+        errors: int = 0,
+        extras: dict[str, Any] | None = None,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO source_yield(
+              snapshot_id, source_name, messages, files, canvases, reactions,
+              saved_items, drafts, cache_entries, errors, extras_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_id, source_name) DO UPDATE SET
+              messages=excluded.messages,
+              files=excluded.files,
+              canvases=excluded.canvases,
+              reactions=excluded.reactions,
+              saved_items=excluded.saved_items,
+              drafts=excluded.drafts,
+              cache_entries=excluded.cache_entries,
+              errors=excluded.errors,
+              extras_json=excluded.extras_json
+            """,
+            (
+                snapshot_id,
+                source_name,
+                messages,
+                files,
+                canvases,
+                reactions,
+                saved_items,
+                drafts,
+                cache_entries,
+                errors,
+                json.dumps(extras or {}),
+            ),
+        )
+        self._conn.commit()
+
+    def source_yield_report(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT source_name,
+                   SUM(messages) AS messages,
+                   SUM(files) AS files,
+                   SUM(canvases) AS canvases,
+                   SUM(reactions) AS reactions,
+                   SUM(saved_items) AS saved_items,
+                   SUM(drafts) AS drafts,
+                   SUM(cache_entries) AS cache_entries,
+                   SUM(errors) AS errors
+            FROM source_yield
+            GROUP BY source_name
+            ORDER BY messages DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_files(
+        self,
+        *,
+        workspace: str | None = None,
+        query: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM files WHERE 1=1"
+        params: list[Any] = []
+        if workspace:
+            sql += " AND workspace_key=?"
+            params.append(workspace)
+        if query:
+            sql += " AND (name LIKE ? OR title LIKE ? OR preview_text LIKE ?)"
+            q = f"%{query}%"
+            params.extend([q, q, q])
+        sql += " ORDER BY last_seen DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def list_saved(
+        self,
+        *,
+        workspace: str | None = None,
+        state: str = "any",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM saved_items WHERE 1=1"
+        params: list[Any] = []
+        if workspace:
+            sql += " AND workspace_key=?"
+            params.append(workspace)
+        if state != "any":
+            sql += " AND state=?"
+            params.append(state)
+        sql += " ORDER BY last_seen DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def list_canvases(
+        self,
+        *,
+        workspace: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT canvas_id, workspace_key, channel_id, title, content_sha256, first_seen, last_seen, length(text) AS text_len FROM canvases WHERE 1=1"
+        params: list[Any] = []
+        if workspace:
+            sql += " AND workspace_key=?"
+            params.append(workspace)
+        if query:
+            sql += " AND (title LIKE ? OR text LIKE ?)"
+            q = f"%{query}%"
+            params.extend([q, q])
+        sql += " ORDER BY last_seen DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def get_canvas(self, canvas_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM canvases WHERE canvas_id=?", (canvas_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_messages_for_export(
+        self,
+        *,
+        workspace: str | None = None,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM messages WHERE 1=1"
+        params: list[Any] = []
+        if workspace:
+            sql += " AND workspace_key=?"
+            params.append(workspace)
+        if not include_deleted:
+            sql += " AND deleted_state='none'"
+        sql += " ORDER BY channel_id, ts_num"
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
     def scan_for_token_leak(self) -> list[str]:
         """Return table names where xox* bytes appear (should be empty)."""
         offenders: list[str] = []
-        # Dump text columns via SQL and scan
         for table in (
             "message_versions",
             "messages",
@@ -1281,6 +1662,10 @@ class SqliteRepository:
             "channels",
             "users",
             "change_log",
+            "files",
+            "saved_items",
+            "canvases",
+            "drafts",
         ):
             try:
                 rows = self._conn.execute(f"SELECT * FROM {table}").fetchall()
