@@ -44,3 +44,27 @@ Watcher (watchdog / ReadDirectoryChangesW) debounce 2 s; poll 60 s; full pass 90
 
 ### PyInstaller
 `packaging/slackcache.spec` builds onedir `slackcache.exe`. Firewall snippet: `packaging/firewall-block-outbound.ps1` (admin). Dev firewall on `uv python find` remains documented in README.
+
+## 2026-11-20 — M3 maximum capture
+
+### Synthetic side-cars for non-blob sources
+Real Chromium LevelDB/Session Storage/HTTP cache encodings are exercised via ccl when present. For CI and unit tests we also accept JSON side-cars under the mirror (same pattern as M1 `localConfig_v2.json`):
+- `IndexedDB/<db>/records.json` — canvas + historical IDB records
+- `Session Storage/session_entries.json`
+- `Local Storage/local_entries.json` — drafts (opt-in)
+- `Cache/cache_entries.json` — HTTP cache metadata (opt-in)
+- `Notifications/notifications_win.json` — Windows toast previews (opt-in)
+
+Product still never reads the live Slack profile; tests use temp `--data-dir` / `--source` only.
+
+### Opt-in defaults
+`capture_drafts`, `capture_downloads`, `capture_http_cache`, `capture_notifications`, `capture_ocr` default **false**. CLI: `--capture-drafts` etc. on `snapshot --once`. OCR remains a no-op stub (no Tesseract/WinRT dependency); enable later without schema change (`files.ocr_text`).
+
+### IdbBackend
+`detect_idb_backend` / `open_idb_backend` select LevelDB (default) or SQLite when a `SQLite format 3` header appears under `IndexedDB/`. SQLite path always copy+WAL-replay on the copy, then `mode=ro&immutable=1`.
+
+### Slack-export
+Implemented from the public export directory layout (channels/groups/dms/mpims/users + per-channel day JSON). No slackdump/AGPL code. `slackcache export --format slack-export|jsonl`.
+
+### Schema
+`SCHEMA_VERSION=3` adds reactions, files, message_files, saved_items, canvases, canvas_versions, drafts, source_yield (additive migrations).

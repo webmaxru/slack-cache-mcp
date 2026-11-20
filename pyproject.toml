@@ -156,4 +156,5 @@ forbidden_modules = [
 
 [tool.ruff.lint.per-file-ignores]
 "src/slack_cache_mcp/desktop/chromium/idb_values.py" = ["E402", "I001"]
+"src/slack_cache_mcp/desktop/chromium/leveldb_records.py" = ["E402", "I001"]
 
