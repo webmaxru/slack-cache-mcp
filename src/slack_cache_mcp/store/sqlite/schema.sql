@@ -191,6 +191,107 @@ CREATE TABLE IF NOT EXISTS threads (
   PRIMARY KEY (channel_id, thread_ts)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS reactions (
+  channel_id TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  count INTEGER NOT NULL,
+  users_json TEXT,
+  observed_hlc TEXT NOT NULL,
+  PRIMARY KEY (channel_id, ts, emoji)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS files (
+  file_id TEXT PRIMARY KEY,
+  workspace_key TEXT,
+  user_id TEXT,
+  name TEXT,
+  title TEXT,
+  mimetype TEXT,
+  filetype TEXT,
+  size INTEGER,
+  created REAL,
+  preview_text TEXT,
+  local_path TEXT,
+  local_sha256 TEXT,
+  thumb_vault_path TEXT,
+  ocr_text TEXT,
+  raw_json TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  updated_hlc TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS message_files (
+  channel_id TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  PRIMARY KEY (channel_id, ts, file_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS saved_items (
+  workspace_key TEXT NOT NULL,
+  item_type TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  channel_id TEXT,
+  ts TEXT,
+  state TEXT,
+  date_created REAL,
+  date_due REAL,
+  raw_json TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  PRIMARY KEY (workspace_key, item_type, item_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS canvases (
+  canvas_id TEXT PRIMARY KEY,
+  workspace_key TEXT,
+  channel_id TEXT,
+  title TEXT,
+  text TEXT NOT NULL,
+  raw_json TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS canvas_versions (
+  canvas_id TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  text TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  PRIMARY KEY (canvas_id, content_sha256)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS drafts (
+  workspace_key TEXT NOT NULL,
+  draft_id TEXT NOT NULL,
+  channel_id TEXT,
+  thread_ts TEXT,
+  text TEXT NOT NULL,
+  last_updated REAL,
+  raw_json TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  PRIMARY KEY (workspace_key, draft_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS source_yield (
+  snapshot_id TEXT NOT NULL,
+  source_name TEXT NOT NULL,
+  messages INTEGER NOT NULL DEFAULT 0,
+  files INTEGER NOT NULL DEFAULT 0,
+  canvases INTEGER NOT NULL DEFAULT 0,
+  reactions INTEGER NOT NULL DEFAULT 0,
+  saved_items INTEGER NOT NULL DEFAULT 0,
+  drafts INTEGER NOT NULL DEFAULT 0,
+  cache_entries INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  extras_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (snapshot_id, source_name)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS coverage_ranges (
   channel_id TEXT NOT NULL,
   start_ts TEXT NOT NULL,

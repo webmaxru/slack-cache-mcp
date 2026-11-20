@@ -65,6 +65,54 @@ class FileMeta:
     size: int | None
     preview_text: str | None
     raw: dict[str, Any] = field(default_factory=dict)
+    local_path: str | None = None
+    local_sha256: str | None = None
+    ocr_text: str | None = None
+    created: float | None = None
+
+
+@dataclass
+class ReactionSet:
+    channel_id: str
+    ts: str
+    emoji: str
+    count: int
+    users: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SavedItem:
+    workspace_key: str
+    item_type: str
+    item_id: str
+    channel_id: str | None = None
+    ts: str | None = None
+    state: str | None = None
+    date_created: float | None = None
+    date_due: float | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CanvasDoc:
+    canvas_id: str
+    workspace_key: str | None
+    channel_id: str | None
+    title: str | None
+    text: str
+    content_sha256: str
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Draft:
+    workspace_key: str
+    draft_id: str
+    channel_id: str | None
+    thread_ts: str | None
+    text: str
+    last_updated: float | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
