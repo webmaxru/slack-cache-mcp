@@ -1,4 +1,4 @@
-"""One-shot snapshot -> decode -> ingest pipeline (M1)."""
+"""Snapshot -> decode -> vault -> ingest pipeline (M1 one-shot + M2 cycles)."""
 
 from __future__ import annotations
 
@@ -18,9 +18,11 @@ from slack_cache_mcp.desktop.sanitize import sanitize
 from slack_cache_mcp.desktop.slack import localstate, redux, rootstate
 from slack_cache_mcp.desktop.snapshot import snapshot_profile
 from slack_cache_mcp.domain.models import Channel, MessageObservation, Workspace
+from slack_cache_mcp.ingest.coverage import extract_channel_windows, suspected_missing, ts_key
 from slack_cache_mcp.ingest.hlc import HLC
 from slack_cache_mcp.paths import assert_data_dir_outside_sources, secure_data_dir
 from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+from slack_cache_mcp.vault.store import VaultStore
 
 
 def _utc_now() -> str:
@@ -48,17 +50,45 @@ def _state_sha(state: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+class CredentialScratchError(RuntimeError):
+    """Raised when Local Storage credential scratch cannot be removed from the mirror."""
+
+
+def _rmtree_credential_scratch(path: Path) -> None:
+    """Delete a path tree, clearing read-only bits; raise if anything remains."""
+    import os
+    import stat
+
+    def _onexc(func: Any, p: str, exc: BaseException) -> None:
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception as retry_exc:
+            raise CredentialScratchError(
+                f"cannot remove credential scratch path {p}: {retry_exc}"
+            ) from retry_exc
+
+    if path.is_dir():
+        shutil.rmtree(path, onexc=_onexc)
+    elif path.is_file() or path.is_symlink():
+        try:
+            path.unlink()
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink()
+    if path.exists():
+        raise CredentialScratchError(f"credential scratch still present after delete: {path}")
+
+
 def _scrub_credential_scratch(mirror: Path) -> None:
-    """Remove Local Storage copies that may contain tokens; drop manifest entries."""
-    targets = [
-        mirror / "Local Storage" / "leveldb",
-        mirror / "Local Storage" / "localConfig_v2.json",
-    ]
-    for t in targets:
-        if t.is_file():
-            t.unlink(missing_ok=True)
-        elif t.is_dir():
-            shutil.rmtree(t, ignore_errors=True)
+    """Physically delete Local Storage copies (may contain tokens) and drop manifest entries.
+
+    PLAN §5.2: parse allowlisted fields, then securely remove the ephemeral mirror copy.
+    Deletion failures are fatal — silent leftover token files are not acceptable.
+    """
+    local_storage = mirror / "Local Storage"
+    if local_storage.exists():
+        _rmtree_credential_scratch(local_storage)
     manifest_path = mirror / "manifest.json"
     if not manifest_path.is_file():
         return
@@ -69,12 +99,9 @@ def _scrub_credential_scratch(mirror: Path) -> None:
     files = data.get("files") if isinstance(data, dict) else None
     if not isinstance(files, dict):
         return
-    drop_prefixes = ("Local Storage/leveldb/", "Local Storage/localConfig_v2.json")
     for key in list(files):
-        if key == "Local Storage/localConfig_v2.json" or key.startswith("Local Storage/leveldb/"):
+        if key == "Local Storage" or key.startswith("Local Storage/"):
             files.pop(key, None)
-    for pref in drop_prefixes:
-        files.pop(pref, None)
     data["files"] = files
     manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -93,14 +120,75 @@ def _filter_dms(
     return channels, messages
 
 
+def _apply_coverage_and_suspected(
+    repo: SqliteRepository,
+    clean: dict[str, Any],
+    *,
+    state_sha256: str,
+    seen_at: str,
+) -> int:
+    """Update coverage ranges / channel_status and mark suspected deletions. Returns count marked."""
+    marked_total = 0
+    latests = clean.get("channelLatests") if isinstance(clean.get("channelLatests"), dict) else {}
+    unreads = clean.get("unreadCounts") if isinstance(clean.get("unreadCounts"), dict) else {}
+    for win in extract_channel_windows(clean):
+        repo.upsert_coverage_range(
+            win.channel_id,
+            win.start_ts,
+            win.end_ts,
+            contiguous_to_latest=win.contiguous_to_latest,
+            seen_at=seen_at,
+        )
+        # Only load archive ts that fall inside this window (avoid O(N) full-channel scans).
+        known_in_window = repo.list_known_message_ts(
+            win.channel_id, start_ts=win.start_ts, end_ts=win.end_ts
+        )
+        ordered = sorted(win.message_ts, key=ts_key)
+        latest_reported = None
+        if isinstance(latests, dict):
+            raw = latests.get(win.channel_id)
+            if isinstance(raw, dict) and raw.get("ts"):
+                latest_reported = str(raw["ts"])
+            elif isinstance(raw, str):
+                latest_reported = raw
+        unread = None
+        if isinstance(unreads, dict) and win.channel_id in unreads:
+            u = unreads[win.channel_id]
+            if isinstance(u, (int, float)):
+                unread = int(u)
+            elif isinstance(u, dict) and isinstance(u.get("count"), (int, float)):
+                unread = int(u["count"])
+        repo.update_channel_status(
+            win.channel_id,
+            newest_ts=ordered[-1] if ordered else None,
+            oldest_ts=ordered[0] if ordered else None,
+            captured_count=repo.count_messages(win.channel_id),
+            latest_ts_reported=latest_reported,
+            unread_count=unread,
+            seen_at=seen_at,
+        )
+        if win.contiguous_to_latest:
+            missing = suspected_missing(previously_seen=known_in_window, window=win)
+            marked = repo.apply_suspected_deletions(
+                win.channel_id,
+                missing,
+                state_sha256=state_sha256,
+                seen_at=seen_at,
+            )
+            marked_total += len(marked)
+    return marked_total
+
+
 def _ingest_profile(
     *,
     profile: SlackProfile,
     settings: Settings,
     device_id: str,
     repo: SqliteRepository,
+    vault: VaultStore,
     hlc: HLC,
     seen_at: str,
+    trigger: str,
 ) -> dict[str, Any]:
     source_id = _source_id(device_id, profile.path)
     mirror = settings.mirror_dir / source_id
@@ -116,12 +204,15 @@ def _ingest_profile(
         None,
     )
     snapshot_id = str(ulid.new())
-    repo.begin_snapshot(snapshot_id, source_id, "manual")
+    repo.begin_snapshot(snapshot_id, source_id, trigger)
 
     states_decoded = 0
     decode_errors = 0
     messages_ingested = 0
     skipped_known = 0
+    generations_new = 0
+    vault_writes = 0
+    suspected_marked = 0
 
     try:
         teams = localstate.load_local_config_teams(mirror)
@@ -145,6 +236,12 @@ def _ingest_profile(
                     skipped_known += 1
                     continue
 
+                generations_new += 1
+                vres = vault.write_state(clean, state_sha256=sha)
+                vault_path = vres.relative_path if vres else None
+                if vres and vres.created:
+                    vault_writes += 1
+
                 ws, channels, users, _files, messages = redux.extract_all(clean)
                 if ws.workspace_key in teams:
                     t = teams[ws.workspace_key]
@@ -167,6 +264,7 @@ def _ingest_profile(
                     blob_ref,
                     snapshot_id,
                     seen_at,
+                    vault_path=vault_path,
                 )
                 repo.upsert_workspace(ws, hlc.now(), seen_at)
                 for ch in channels:
@@ -183,6 +281,10 @@ def _ingest_profile(
                         hlc=hlc.now(),
                     )
                     messages_ingested += 1
+
+                suspected_marked += _apply_coverage_and_suspected(
+                    repo, clean, state_sha256=sha, seen_at=seen_at
+                )
 
         known_keys = {w["key"] for w in repo.list_workspaces()}
         for key, meta in root_ws.items():
@@ -218,9 +320,13 @@ def _ingest_profile(
                 "skipped_lock": stats.skipped_lock,
                 "skipped_unchanged": stats.skipped_unchanged,
                 "skipped_known_generations": skipped_known,
+                "generations_new": generations_new,
+                "vault_writes": vault_writes,
+                "suspected_marked": suspected_marked,
                 "errors": stats.errors[:20],
                 "messages_ingested": messages_ingested,
                 "primary": profile.primary,
+                "trigger": trigger,
             }
         ),
     )
@@ -234,11 +340,15 @@ def _ingest_profile(
         "decode_errors": decode_errors,
         "messages_ingested": messages_ingested,
         "skipped_known_generations": skipped_known,
+        "generations_new": generations_new,
+        "vault_writes": vault_writes,
+        "suspected_marked": suspected_marked,
         "primary": profile.primary,
     }
 
 
-def run_snapshot_once(settings: Settings) -> dict[str, Any]:
+def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[str, Any]:
+    """One copy+decode+ingest cycle (used by snapshot --once and the daemon)."""
     profiles = discover_profiles(overrides=settings.source_overrides or None)
     valid = [p for p in profiles if p.valid]
     if not valid and settings.source_overrides:
@@ -248,19 +358,23 @@ def run_snapshot_once(settings: Settings) -> dict[str, Any]:
             if Path(p).exists()
         ]
     if not valid:
-        return {"error": "no_valid_profiles", "profiles": []}
+        return {"error": "no_valid_profiles", "profiles": [], "trigger": trigger}
 
-    # Reject overlap before creating any files under data_dir.
     assert_data_dir_outside_sources(settings.data_dir, [p.path for p in valid])
     secure_data_dir(settings.data_dir)
     device_id = _device_id(settings.data_dir)
 
     repo = SqliteRepository(settings.archive_db)
     repo.upsert_device(device_id, "local")
+    vault = VaultStore(
+        settings.vault_dir,
+        data_dir=settings.data_dir,
+        keep=settings.vault_keep,
+        keep_days=settings.vault_keep_days,
+    )
     hlc = HLC(device_id=device_id)
     seen_at = _utc_now()
 
-    # PLAN §5.1: ingest every valid profile under its own source_id
     per_source: list[dict[str, Any]] = []
     for profile in valid:
         per_source.append(
@@ -269,12 +383,15 @@ def run_snapshot_once(settings: Settings) -> dict[str, Any]:
                 settings=settings,
                 device_id=device_id,
                 repo=repo,
+                vault=vault,
                 hlc=hlc,
                 seen_at=seen_at,
+                trigger=trigger,
             )
         )
 
     leaks = repo.scan_for_token_leak()
+    vault_leaks = vault.scan_for_token_leak() if settings.vault_keep else []
     primary = next((p for p in valid if p.primary), valid[0])
     totals = {
         "files_copied": sum(s["files_copied"] for s in per_source),
@@ -285,13 +402,22 @@ def run_snapshot_once(settings: Settings) -> dict[str, Any]:
         "skipped_known_generations": sum(
             s["skipped_known_generations"] for s in per_source
         ),
+        "generations_new": sum(s["generations_new"] for s in per_source),
+        "vault_writes": sum(s["vault_writes"] for s in per_source),
+        "suspected_marked": sum(s["suspected_marked"] for s in per_source),
     }
     return {
+        "trigger": trigger,
         "source": redact_path(primary.path),
         "sources": per_source,
         "source_id": per_source[0]["source_id"] if per_source else None,
         "snapshot_id": per_source[0]["snapshot_id"] if per_source else None,
         **totals,
         "token_leaks": leaks,
+        "vault_token_leaks": vault_leaks,
         "workspaces": repo.list_workspaces(),
     }
+
+
+def run_snapshot_once(settings: Settings) -> dict[str, Any]:
+    return run_snapshot_cycle(settings, trigger="manual")

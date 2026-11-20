@@ -72,6 +72,11 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
                                 unknown_slices.append(str(k))
         break  # primary-ish first valid
 
+    vault_objects = 0
+    if settings.vault_dir.is_dir():
+        vault_objects = sum(1 for _ in settings.vault_dir.rglob("*.zst.enc"))
+
+    archive_exists = settings.archive_db.is_file()
     return {
         "profiles": [
             {
@@ -89,4 +94,8 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
         "unknown_slices_sample": unknown_slices[:30],
         "netguard_installed": netguard.is_installed(),
         "data_dir": redact_path(settings.data_dir),
+        "archive_db_present": archive_exists,
+        "vault_objects": vault_objects,
+        "vault_keep": settings.vault_keep,
+        "vault_keep_days": settings.vault_keep_days,
     }

@@ -36,19 +36,35 @@ uv run slackcache mcp --data-dir $env:TEMP\slackcache-dev
 }
 ```
 
+## Continuous sync (M2)
+
+```powershell
+uv run slackcache daemon --source tests\fixtures\synthetic\profile --data-dir $env:TEMP\slackcache-dev --max-cycles 1 --no-ensure-single
+uv run slackcache backup --data-dir $env:TEMP\slackcache-dev
+uv run slackcache task status
+uv run slackcache encryption-spike
+```
+
+See `docs/PACKAGING.md` for PyInstaller onedir + firewall + Task Scheduler install.
+
 ## Firewall (optional, admin PowerShell)
 
 ```powershell
+# Dev interpreter
 $py = (uv python find 3.12)
 New-NetFirewallRule -DisplayName "slackcache core: block outbound (dev)" `
   -Direction Outbound -Action Block -Program $py
+
+# Frozen exe (preferred): packaging/firewall-block-outbound.ps1
 ```
 
-## What is captured (M1)
+## What is captured (M1–M2)
 
 - Redux persisted states from IndexedDB blobs (channels, members, messages/threads)
 - Workspace names from `localConfig_v2` (tokens dropped) and `storage/root-state.json`
 - Append-only message versions + sightings; FTS5/trigram lexical search
+- Encrypted vault of sanitized state generations; coverage ranges; edit + suspected deletion
+- Daemon: file watcher + 60s poll + 15min full pass; backups; Task Scheduler helpers
 - MCP tools: list/search/read/get/resolve/cache_status
 
 ## What is NOT captured

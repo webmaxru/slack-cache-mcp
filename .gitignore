@@ -22,3 +22,6 @@ uv.toml
 
 .import_linter_cache/
 
+
+unresolved-raw.json
+*.json.bak

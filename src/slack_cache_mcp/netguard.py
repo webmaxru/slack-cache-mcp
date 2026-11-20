@@ -113,11 +113,25 @@ def _check_subprocess(args: Any) -> None:
     rest_lower = [a.lower() for a in argv[1:]]
 
     if exe == "schtasks":
-        # Read-only query only (task install uses XML generation + /Create later in M2
-        # and will need an explicit allow once implemented).
-        if rest_lower and rest_lower[0] == "/query":
-            return
-        raise NetworkGuardError("schtasks only /Query is allowed under netguard")
+        # Allow Task Scheduler management for slackcache-daemon only (PLAN §5.4).
+        if not rest_lower:
+            raise NetworkGuardError("schtasks requires an operation")
+        op = rest_lower[0]
+        if op not in {"/query", "/create", "/delete"}:
+            raise NetworkGuardError(
+                "schtasks only /Query,/Create,/Delete allowed under netguard"
+            )
+        # Require /TN slackcache-daemon for every allowed op (including /Query).
+        tn = None
+        for i, tok in enumerate(rest_lower[:-1]):
+            if tok == "/tn":
+                tn = rest_lower[i + 1]
+                break
+        if tn != "slackcache-daemon":
+            raise NetworkGuardError("schtasks only allowed for task slackcache-daemon")
+        if op == "/create" and "/xml" not in rest_lower:
+            raise NetworkGuardError("schtasks /Create requires /XML")
+        return
 
     if exe in {"powershell", "pwsh"}:
         # Require -NoProfile and only Get-AppxPackage (read-only Slack Store version lookup).
