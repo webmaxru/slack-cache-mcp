@@ -380,7 +380,6 @@ def _ingest_profile(
                             ):
                                 messages_ingested += 1
                                 hist_msgs += 1
-                                _bump(obs.source, messages=1)
                         repo.insert_state_generation(
                             sha,
                             ws.workspace_key,
@@ -421,7 +420,11 @@ def _ingest_profile(
                 for doc in canvas.extract_from_idb_records(rows, database=db_name):
                     repo.upsert_canvas(doc, seen_at)
                     _bump("canvas", canvases=1)
-            _bump("idb.historical", messages=hist_msgs, errors=hist_err)
+
+            # Note: message yields are already counted per-message under the concrete source
+            # bucket (e.g., "idb.leveldb.historical"). Keep the umbrella bucket for non-message
+            # aggregates like errors to avoid double-counting in yield reports.
+            _bump("idb.historical", errors=hist_err)
         except Exception:  # noqa: BLE001 — never fail the cycle on optional harvest
             _bump("idb.historical", errors=1)
 

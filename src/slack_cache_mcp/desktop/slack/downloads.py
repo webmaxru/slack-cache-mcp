@@ -62,9 +62,14 @@ def index_local_downloads(
             if p.is_file():
                 local_path = str(p)
                 try:
-                    data = p.read_bytes()
-                    local_sha = hashlib.sha256(data).hexdigest()
-                    size_i = len(data)
+                    h = hashlib.sha256()
+                    total = 0
+                    with p.open("rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            total += len(chunk)
+                            h.update(chunk)
+                    local_sha = h.hexdigest()
+                    size_i = total
                     if extract_text:
                         preview = _extract_text(p)
                 except OSError:

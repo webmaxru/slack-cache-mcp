@@ -27,12 +27,19 @@ def _as_dict(v: Any) -> dict[str, Any]:
     return v if isinstance(v, dict) else {}
 
 
+def _channel_id(ch: dict[str, Any]) -> Any:
+    # SqliteRepository.list_channels() provides per-channel dictionaries keyed with "id".
+    # Fall back to "channel_id" for compatibility with any older/alternate schemas.
+    return ch.get("id") or ch.get("channel_id")
+
+
 def _channel_export_row(ch: dict[str, Any]) -> dict[str, Any]:
+    cid = _channel_id(ch)
     return _as_dict(
         sanitize(
             {
-                "id": ch.get("channel_id"),
-                "name": ch.get("name") or ch.get("channel_id"),
+                "id": cid,
+                "name": ch.get("name") or cid,
                 "created": 0,
                 "creator": "",
                 "is_archived": bool(ch.get("is_archived")),
