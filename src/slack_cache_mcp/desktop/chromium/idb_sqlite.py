@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -12,6 +13,29 @@ from typing import Any
 from slack_cache_mcp.desktop.chromium.idb_backend import IdbRecord
 from slack_cache_mcp.desktop.chromium.idb_values import unwrap
 from slack_cache_mcp.desktop.sanitize import sanitize
+
+# Cap heuristic harvest so a large IndexedDB SQLite store cannot OOM the daemon.
+_MAX_ROWS_PER_TABLE = 5_000
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_ident(name: str) -> str:
+    """Quote a SQLite identifier; reject NUL / empty names."""
+    if not name or "\x00" in name:
+        raise ValueError("invalid SQL identifier")
+    # Always quote; escape embedded double quotes per SQLite rules.
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _safe_column(name: str, allowed: set[str]) -> str | None:
+    """Return quoted column only if it appears in PRAGMA table_info output."""
+    if name not in allowed:
+        return None
+    if not _IDENT_RE.match(name) and '"' in name:
+        # Still quote non-plain names that PRAGMA reported.
+        pass
+    return _quote_ident(name)
 
 
 def _copy_sqlite_bundle(src_db: Path, dest_dir: Path) -> Path:
@@ -121,27 +145,47 @@ class SqliteIdbBackend:
             ).fetchall()
         ]
         for table in tables:
+            if not isinstance(table, str) or not table:
+                continue
             if store is not None and store != table:
                 continue
             try:
-                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-            except sqlite3.Error:
+                qtable = _quote_ident(table)
+                cols = [
+                    str(r[1])
+                    for r in conn.execute(f"PRAGMA table_info({qtable})").fetchall()
+                    if r[1] is not None
+                ]
+            except (sqlite3.Error, ValueError):
                 continue
+            allowed = set(cols)
             blob_cols = [c for c in cols if c.lower() in {"value", "value_data", "data", "blob"}]
             key_cols = [c for c in cols if c.lower() in {"key", "key_data", "object_store_id"}]
             if not blob_cols:
                 continue
             key_col = key_cols[0] if key_cols else None
             blob_col = blob_cols[0]
+            q_blob = _safe_column(blob_col, allowed)
+            if q_blob is None:
+                continue
+            select_cols = [q_blob]
+            key_idx: int | None = None
+            if key_col is not None:
+                q_key = _safe_column(key_col, allowed)
+                if q_key is not None:
+                    select_cols.insert(0, q_key)
+                    key_idx = 0
+            blob_idx = len(select_cols) - 1
+            sql = (
+                f"SELECT {', '.join(select_cols)} FROM {qtable} LIMIT {_MAX_ROWS_PER_TABLE}"
+            )
             try:
-                rows = conn.execute(f"SELECT * FROM {table}").fetchall()
-                col_names = [d[0] for d in conn.execute(f"SELECT * FROM {table} LIMIT 0").description]
+                cur = conn.execute(sql)
             except sqlite3.Error:
                 continue
-            for row in rows:
-                mapping = dict(zip(col_names, row, strict=False))
-                raw_val = mapping.get(blob_col)
-                key_s = str(mapping.get(key_col, "")) if key_col else ""
+            for row in cur:
+                raw_val = row[blob_idx]
+                key_s = str(row[key_idx]) if key_idx is not None else ""
                 decoded: Any | None = None
                 err: str | None = None
                 if isinstance(raw_val, (bytes, memoryview)):

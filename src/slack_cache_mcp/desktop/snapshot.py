@@ -104,6 +104,7 @@ def snapshot_profile(
     open_func: OpenHook = open,
     require_stable_blobs: bool = True,
     include_http_cache: bool = False,
+    include_notifications: bool = False,
     http_cache_max_bytes: int = 50_000_000,
 ) -> SnapshotStats:
     """Copy allowlisted paths from source -> mirror. Never deletes source files."""
@@ -132,13 +133,16 @@ def snapshot_profile(
         source / "local-settings.json",
         # M1 fixture side-car for localConfig (not present on real Slack)
         source / "Local Storage" / "localConfig_v2.json",
-        # M3 synthetic side-cars
+        # Always-on M3 synthetic side-cars (session scan; drafts gated at ingest)
         source / "Session Storage" / "session_entries.json",
         source / "Local Storage" / "local_entries.json",
-        source / "Cache" / "cache_entries.json",
-        source / "Notifications" / "notifications_win.json",
-        source / "notifications_win.json",
     ]
+    # Opt-in side-cars only — avoid copying/missing-noise when flags are off.
+    if include_http_cache:
+        allow_files.append(source / "Cache" / "cache_entries.json")
+    if include_notifications:
+        allow_files.append(source / "Notifications" / "notifications_win.json")
+        allow_files.append(source / "notifications_win.json")
 
     def handle_file(src_file: Path, rel: Path, *, is_blob: bool) -> None:
         nonlocal stats

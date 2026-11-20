@@ -127,7 +127,7 @@ def write_slack_export(
             dms.append(
                 sanitize(
                     {
-                        "id": ch.get("channel_id"),
+                        "id": _channel_id(ch),
                         "created": 0,
                         "members": [ch.get("im_user_id")] if ch.get("im_user_id") else [],
                     }

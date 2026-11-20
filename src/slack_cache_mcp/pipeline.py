@@ -209,6 +209,7 @@ def _ingest_profile(
         profile.path,
         mirror,
         include_http_cache=settings.capture_http_cache,
+        include_notifications=settings.capture_notifications,
         http_cache_max_bytes=settings.http_cache_max_bytes,
     )
     repo.upsert_source(
@@ -337,7 +338,6 @@ def _ingest_profile(
         # Historical / inline IDB records (LevelDB + side-cars)
         try:
             backend = open_idb_backend(mirror)
-            hist_msgs = 0
             hist_err = 0
             canvas_rows: list[Any] = []
             for rec in backend.iter_records(include_deleted=True):
@@ -379,7 +379,7 @@ def _ingest_profile(
                                 hlc=hlc.now(),
                             ):
                                 messages_ingested += 1
-                                hist_msgs += 1
+                                _bump(obs.source, messages=1)
                         repo.insert_state_generation(
                             sha,
                             ws.workspace_key,
@@ -394,14 +394,14 @@ def _ingest_profile(
                 if isinstance(rec.value, dict) and redux.is_message(rec.value):
                     cid = rec.value.get("channel")
                     if cid:
-                        obs = redux.observation_from_message(
+                        hist_obs = redux.observation_from_message(
                             rec.value,
                             channel_id=str(cid),
                             workspace_key="unknown",
                             source="idb.leveldb.historical",
                         )
-                        if obs and repo.ingest_observation(
-                            obs,
+                        if hist_obs is not None and repo.ingest_observation(
+                            hist_obs,
                             device_id=device_id,
                             snapshot_id=snapshot_id,
                             state_sha256="idb-historical",
@@ -409,7 +409,6 @@ def _ingest_profile(
                             hlc=hlc.now(),
                         ):
                             messages_ingested += 1
-                            hist_msgs += 1
                             _bump("idb.leveldb.historical", messages=1)
 
             # Group canvas records by database
@@ -502,7 +501,18 @@ def _ingest_profile(
         _scrub_credential_scratch(mirror)
 
     for src_name, counts in yield_counts.items():
-        repo.record_source_yield(snapshot_id, src_name, **counts)
+        repo.record_source_yield(
+            snapshot_id,
+            src_name,
+            messages=int(counts.get("messages", 0)),
+            files=int(counts.get("files", 0)),
+            canvases=int(counts.get("canvases", 0)),
+            reactions=int(counts.get("reactions", 0)),
+            saved_items=int(counts.get("saved_items", 0)),
+            drafts=int(counts.get("drafts", 0)),
+            cache_entries=int(counts.get("cache_entries", 0)),
+            errors=int(counts.get("errors", 0)),
+        )
 
     repo.finish_snapshot(
         snapshot_id,
