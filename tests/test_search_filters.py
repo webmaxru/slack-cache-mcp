@@ -72,7 +72,7 @@ def test_exact_mode_honors_workspace_filter(repo: SqliteRepository) -> None:
 def test_unsupported_operator_rejected(repo: SqliteRepository) -> None:
     svc = SearchService(repo)
     with pytest.raises(ValueError, match="Unsupported"):
-        svc.search_messages(query="widgets with:@alice", mode="lexical")
+        svc.search_messages(query="widgets has:emoji", mode="lexical")
 
 
 def test_is_deleted_returns_tombstones(repo: SqliteRepository) -> None:
