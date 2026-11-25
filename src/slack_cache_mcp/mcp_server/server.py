@@ -7,6 +7,7 @@ from typing import Any
 from mcp.server import MCPServer
 
 from slack_cache_mcp.config import Settings, load_settings
+from slack_cache_mcp.search.embedder import HashingEmbedder
 from slack_cache_mcp.search.service import SearchService
 from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
@@ -21,9 +22,13 @@ def _permalink(domain: str | None, channel_id: str, ts: str) -> str:
     return f"https://{d}.{host_suffix}/archives/{channel_id}/p{ts_nodot}"
 
 
-def build_server(settings: Settings) -> MCPServer:
+def build_server(
+    settings: Settings,
+    *,
+    embedder: Any | None = None,
+) -> MCPServer:
     repo = SqliteRepository(settings.archive_db, read_only=settings.archive_db.exists())
-    search = SearchService(repo)
+    search = SearchService(repo, embedder=embedder or HashingEmbedder())
     mcp = MCPServer("slack-cache")
 
     @mcp.tool(annotations=_ANNOT)
@@ -111,8 +116,9 @@ def build_server(settings: Settings) -> MCPServer:
         limit: int = 10,
         context: str = "thread",
         context_size: int = 3,
+        sort: str = "relevance",
     ) -> dict[str, Any]:
-        """Search archived messages (lexical/exact/phrase; hybrid==lexical until M4)."""
+        """Hybrid/lexical/semantic/exact search over the local archive."""
         return search.search_messages(
             query=query,
             mode=mode,
@@ -125,6 +131,7 @@ def build_server(settings: Settings) -> MCPServer:
             before=before,
             context=context,
             context_size=context_size,
+            sort=sort,
         )
 
     @mcp.tool(annotations=_ANNOT)
@@ -178,6 +185,34 @@ def build_server(settings: Settings) -> MCPServer:
         }
 
     @mcp.tool(annotations=_ANNOT)
+    def list_threads(
+        workspace: str | None = None,
+        channel: str | None = None,
+        subscribed_only: bool = False,
+        active_after: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List known threads with capture completeness."""
+        return {
+            "threads": repo.list_threads(
+                workspace=workspace,
+                channel=channel,
+                subscribed_only=subscribed_only,
+                active_after=active_after,
+                limit=min(limit, 200),
+            )
+        }
+
+    @mcp.tool(annotations=_ANNOT)
+    def whats_new(
+        since: str | None = None,
+        workspace: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Messages first seen since a watermark (default: last call)."""
+        return repo.whats_new(since=since, workspace=workspace, limit=min(limit, 200))
+
+    @mcp.tool(annotations=_ANNOT)
     def search_canvases(
         query: str | None = None,
         workspace: str | None = None,
@@ -196,11 +231,57 @@ def build_server(settings: Settings) -> MCPServer:
         doc = repo.get_canvas(canvas_id)
         return {"canvas": doc} if doc else {"error": "not_found"}
 
+    @mcp.resource("slk://workspace/{key}")
+    def workspace_resource(key: str) -> str:
+        rows = [w for w in repo.list_workspaces() if w.get("key") == key or w.get("workspace_key") == key]
+        return str(rows[0] if rows else {"error": "not_found"})
+
+    @mcp.resource("slk://channel/{id}")
+    def channel_resource(id: str) -> str:
+        status = repo.cache_status(channel=id)
+        return str(status)
+
+    @mcp.resource("slk://message/{channel}/{ts}")
+    def message_resource(channel: str, ts: str) -> str:
+        msg = repo.get_message(channel=channel, ts=ts)
+        return str(msg or {"error": "not_found"})
+
+    @mcp.prompt()
+    def catch_up(workspace: str | None = None, since: str | None = None) -> str:
+        return (
+            "Summarize what is new in the local Slack cache. "
+            "Call whats_new"
+            + (f" with workspace={workspace}" if workspace else "")
+            + (f" and since={since}" if since else "")
+            + ". Cite every claim with a slk:// ref. State coverage gaps explicitly."
+        )
+
+    @mcp.prompt()
+    def summarize_channel(channel: str, after: str | None = None, before: str | None = None) -> str:
+        return (
+            f"Summarize channel {channel} from the local archive"
+            + (f" after {after}" if after else "")
+            + (f" before {before}" if before else "")
+            + ". Use read_channel / get_thread. Cite slk:// refs; note incomplete threads."
+        )
+
+    @mcp.prompt()
+    def find_decisions(query: str) -> str:
+        return (
+            f"Find decisions related to: {query}. Use search_messages (hybrid). "
+            "Cite refs; do not invent messages not returned by tools."
+        )
+
+    # Silence unused helper warning in some linters while keeping permalink for future.
+    _ = _permalink
     return mcp
 
 
-def run_stdio(settings: Settings | None = None) -> None:
+def run_stdio(
+    settings: Settings | None = None,
+    *,
+    embedder: Any | None = None,
+) -> None:
     settings = settings or load_settings()
-    server = build_server(settings)
-    # MCPServer.run() defaults / stdio transport per SDK v2
+    server = build_server(settings, embedder=embedder)
     server.run(transport="stdio")

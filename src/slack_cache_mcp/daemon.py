@@ -118,6 +118,26 @@ def run_daemon(
                     )
                     purged = vault.purge_expired()
                     log_event(logger, "vault_purge", purged=purged)
+                    # Embed pending search_docs (offline HashingEmbedder / local ONNX)
+                    try:
+                        from slack_cache_mcp.embeddings.factory import load_embedder
+                        from slack_cache_mcp.search.docs import SearchDocsBuilder
+                        from slack_cache_mcp.search.worker import embed_pending
+                        from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+                        repo = SqliteRepository(settings.archive_db, read_only=False)
+                        SearchDocsBuilder(repo).rebuild_message_docs()
+                        emb = load_embedder(models_dir=settings.models_dir)
+                        emb_result = embed_pending(repo, emb, limit=512)
+                        repo.close()
+                        log_event(
+                            logger,
+                            "embed_batch",
+                            embedded=emb_result.get("embedded"),
+                            model=emb_result.get("model_id"),
+                        )
+                    except Exception:
+                        log_event(logger, "embed_batch_error")
                 log_event(
                     logger,
                     "cycle_ok",
