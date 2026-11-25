@@ -1973,82 +1973,109 @@ class SqliteRepository:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
         ).fetchone()
         use_vec = bool(has_vec and try_load_sqlite_vec(self._conn))
-        vec_n = blob_n = 0
+        blob_n = 0
         with contextlib.suppress(sqlite3.OperationalError):
-            if use_vec:
-                vec_n = int(
-                    self._conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[
-                        "c"
-                    ]
-                )
             blob_n = int(
                 self._conn.execute(
                     "SELECT COUNT(*) AS c FROM doc_embeddings"
                 ).fetchone()["c"]
             )
 
-        merged: dict[int, float] = {}
+        def _consume(
+            pairs: list[tuple[int, float]], *, out: list[dict[str, Any]], seen: set[int]
+        ) -> None:
+            for doc_id, distance in pairs:
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                # Prefer authoritative blob distance when present.
+                if blob_n > 0:
+                    brow = self._conn.execute(
+                        "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()
+                    if brow is not None:
+                        import numpy as np
+
+                        from slack_cache_mcp.search.embedder import cosine_similarity
+
+                        emb = np.frombuffer(brow["embedding"], dtype=np.float32)
+                        distance = 1.0 - float(
+                            cosine_similarity(
+                                np.asarray(query_vec, dtype=np.float32), emb
+                            )
+                        )
+                doc = self._conn.execute(
+                    "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+                ).fetchone()
+                if not doc:
+                    continue
+                if model_id and doc["embedded_model"] != model_id:
+                    continue
+                hit = self._doc_to_search_hit(dict(doc), distance=distance)
+                if hit is None:
+                    continue
+                if not self._hit_passes_filters(
+                    hit, filt, kinds=kinds, doc_kind=doc["kind"]
+                ):
+                    continue
+                out.append(hit)
+                if len(out) >= limit:
+                    return
+
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
         vec_k_max = 4096
-        # Fast path: healthy sqlite-vec covering all blobs — no full Python scan.
-        # When blobs outnumber vec rows, prefer authoritative numpy over blobs.
-        # When counts match, still prefer blob distances for overlapping IDs by
-        # only adding vec hits for doc_ids absent from blobs (vec-only leftovers).
-        if use_vec and vec_n > 0 and blob_n <= vec_n:
+        if use_vec:
             k_pool = min(max(limit * 20, 200), vec_k_max)
             while True:
                 pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
-                for doc_id, distance in pairs:
-                    merged[doc_id] = distance
+                # Re-rank this pool by blob distance when available.
+                rescored = list(pairs)
+                if blob_n > 0:
+                    import numpy as np
+
+                    from slack_cache_mcp.search.embedder import cosine_similarity
+
+                    q = np.asarray(query_vec, dtype=np.float32)
+                    tmp: list[tuple[int, float]] = []
+                    for doc_id, distance in pairs:
+                        brow = self._conn.execute(
+                            "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
+                            (doc_id,),
+                        ).fetchone()
+                        if brow is not None:
+                            emb = np.frombuffer(brow["embedding"], dtype=np.float32)
+                            distance = 1.0 - float(cosine_similarity(q, emb))
+                        tmp.append((doc_id, distance))
+                    rescored = sorted(tmp, key=lambda x: x[1])
+                _consume(rescored, out=out, seen=seen)
+                if len(out) >= limit:
+                    return out
                 if k_pool >= vec_k_max or len(pairs) < k_pool:
                     break
                 k_pool = min(k_pool * 2, vec_k_max)
+            # Filters may have exhausted the 4096 cap with no fill — complete search.
+            if len(out) < limit and blob_n > 0:
+                pairs = knn_docs_numpy(
+                    self._conn,
+                    query_vec,
+                    k=None,
+                    filters=filt,
+                    kinds=kinds,
+                    model_id=model_id,
+                )
+                _consume(pairs, out=out, seen=seen)
         elif blob_n > 0:
-            for doc_id, distance in knn_docs_numpy(
+            pairs = knn_docs_numpy(
                 self._conn,
                 query_vec,
                 k=None,
                 filters=filt,
                 kinds=kinds,
                 model_id=model_id,
-            ):
-                merged[doc_id] = distance
-            # Vec-only leftovers (no blob) — rare; pull a bounded KNN.
-            if use_vec and vec_n > blob_n:
-                for doc_id, distance in knn_docs(
-                    self._conn, query_vec, k=min(max(limit * 20, 200), vec_k_max), filters=filt
-                ):
-                    if doc_id not in merged:
-                        merged[doc_id] = distance
-        elif use_vec:
-            k_pool = min(max(limit * 20, 200), vec_k_max)
-            while True:
-                pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
-                for doc_id, distance in pairs:
-                    merged[doc_id] = distance
-                if k_pool >= vec_k_max or len(pairs) < k_pool:
-                    break
-                k_pool = min(k_pool * 2, vec_k_max)
-
-        ranked = sorted(merged.items(), key=lambda x: x[1])
-        out: list[dict[str, Any]] = []
-        for doc_id, distance in ranked:
-            doc = self._conn.execute(
-                "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
-            ).fetchone()
-            if not doc:
-                continue
-            if model_id and doc["embedded_model"] != model_id:
-                continue
-            hit = self._doc_to_search_hit(dict(doc), distance=distance)
-            if hit is None:
-                continue
-            if not self._hit_passes_filters(
-                hit, filt, kinds=kinds, doc_kind=doc["kind"]
-            ):
-                continue
-            out.append(hit)
-            if len(out) >= limit:
-                break
+            )
+            _consume(pairs, out=out, seen=seen)
         return out
 
     def _doc_to_search_hit(
@@ -2155,19 +2182,47 @@ class SqliteRepository:
         if not since:
             since = self._read_whats_new_cursor(meta_key, watermark_store)
         lim = min(limit, 200)
-        # Always paginate by rowid. Legacy ISO / fs|ch|ts cursors convert once:
-        # seed after_rowid from max rowid with first_seen < bound, then continue
-        # insertion-ordered (no multi-page legacy order, no concurrent skips).
-        after_rowid, converted = self._whats_new_seed_rowid(since)
-        sql = """
-            SELECT * FROM messages
-            WHERE deleted_state='none' AND rowid > ?
-        """
-        params: list[Any] = [after_rowid]
+        use_rowid = since.startswith("rowid:") or since.isdigit()
+        if use_rowid:
+            after_rowid = 0
+            if since.startswith("rowid:"):
+                with contextlib.suppress(ValueError):
+                    after_rowid = int(since.split(":", 1)[1])
+            else:
+                after_rowid = int(since)
+            sql = """
+                SELECT * FROM messages
+                WHERE deleted_state='none' AND rowid > ?
+            """
+            params: list[Any] = [after_rowid]
+            order = " ORDER BY rowid ASC LIMIT ?"
+        else:
+            # Finish legacy first_seen order (with ch/ts tie-break) before rowid.
+            body = since[7:] if since.startswith("legacy:") else since
+            chunks = body.split("|")
+            cur_fs = chunks[0]
+            if len(chunks) >= 3:
+                sql = """
+                    SELECT * FROM messages
+                    WHERE deleted_state='none'
+                      AND (
+                        first_seen > ?
+                        OR (first_seen = ? AND channel_id > ?)
+                        OR (first_seen = ? AND channel_id = ? AND ts > ?)
+                      )
+                """
+                params = [cur_fs, cur_fs, chunks[1], cur_fs, chunks[1], chunks[2]]
+            else:
+                sql = """
+                    SELECT * FROM messages
+                    WHERE first_seen >= ? AND deleted_state='none'
+                """
+                params = [cur_fs]
+            order = " ORDER BY first_seen ASC, channel_id ASC, ts ASC LIMIT ?"
         if workspace:
             sql += " AND workspace_key=?"
             params.append(workspace)
-        sql += " ORDER BY rowid ASC LIMIT ?"
+        sql += order
         params.append(lim + 1)
         raw = list(self._conn.execute(sql, params).fetchall())
         has_more = len(raw) > lim
@@ -2176,10 +2231,40 @@ class SqliteRepository:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             grouped.setdefault(r["channel_id"], []).append(r)
-        new_mark = (
-            f"rowid:{int(page[-1]['rowid'])}" if page else f"rowid:{after_rowid}"
-        )
-        if rows or converted or not since.startswith("rowid:"):
+        if page:
+            last = page[-1]
+            if use_rowid:
+                new_mark = f"rowid:{int(last['rowid'])}"
+            elif has_more:
+                new_mark = (
+                    f"legacy:{last['first_seen']}|{last['channel_id']}|{last['ts']}"
+                )
+            else:
+                # Legacy drained: pin to max rowid among delivered pages' rows
+                # AND all messages already past the legacy bound (same txn view).
+                max_rid = max(int(r["rowid"]) for r in page)
+                bound = last["first_seen"]
+                older = self._conn.execute(
+                    "SELECT MAX(rowid) AS r FROM messages WHERE first_seen <= ?",
+                    (bound,),
+                ).fetchone()
+                if older and older["r"] is not None:
+                    max_rid = max(max_rid, int(older["r"]))
+                new_mark = f"rowid:{max_rid}"
+        else:
+            if use_rowid:
+                new_mark = since
+            else:
+                # No messages at/after legacy bound — pin to max rowid at-or-before.
+                cur_fs = (since[7:] if since.startswith("legacy:") else since).split(
+                    "|", 1
+                )[0]
+                older = self._conn.execute(
+                    "SELECT MAX(rowid) AS r FROM messages WHERE first_seen < ?",
+                    (cur_fs,),
+                ).fetchone()
+                new_mark = f"rowid:{int(older['r'] or 0)}"
+        if rows or not use_rowid:
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
             "since": since,
@@ -2188,22 +2273,6 @@ class SqliteRepository:
             "messages": rows,
             "by_channel": grouped,
         }
-
-    def _whats_new_seed_rowid(self, since: str) -> tuple[int, bool]:
-        """Return ``(after_rowid, converted_from_legacy)``."""
-        if since.startswith("rowid:"):
-            with contextlib.suppress(ValueError):
-                return int(since.split(":", 1)[1]), False
-            return 0, False
-        if since.isdigit():
-            return int(since), False
-        body = since[7:] if since.startswith("legacy:") else since
-        cur_fs = body.split("|", 1)[0]
-        row = self._conn.execute(
-            "SELECT MAX(rowid) AS r FROM messages WHERE first_seen < ?",
-            (cur_fs,),
-        ).fetchone()
-        return int(row["r"] or 0), True
 
     def _max_message_rowid(self) -> int:
         row = self._conn.execute("SELECT MAX(rowid) AS r FROM messages").fetchone()
@@ -2231,27 +2300,32 @@ class SqliteRepository:
             (key, json.dumps(channels)),
         )
 
-    def take_dirty_window_channels(self) -> list[str]:
-        """Return and clear the deferred window-rebuild channel list."""
+    def peek_dirty_window_channels(self) -> list[str]:
+        """Return dirty channels without clearing (ack after successful rebuild)."""
         key = "window_dirty_channels"
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)
         ).fetchone()
-        channels: list[str] = []
-        if row:
-            with contextlib.suppress(json.JSONDecodeError, TypeError):
-                parsed = json.loads(row["value"])
-                if isinstance(parsed, list):
-                    channels = [str(c) for c in parsed]
+        if not row:
+            return []
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            parsed = json.loads(row["value"])
+            if isinstance(parsed, list):
+                return [str(c) for c in parsed]
+        return []
+
+    def ack_dirty_window_channel(self, channel_id: str) -> None:
+        """Remove one channel from the dirty queue after a successful rebuild."""
+        key = "window_dirty_channels"
+        channels = [c for c in self.peek_dirty_window_channels() if c != channel_id]
         self._conn.execute(
             """
-            INSERT INTO meta(key, value) VALUES (?, '[]')
-            ON CONFLICT(key) DO UPDATE SET value='[]'
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """,
-            (key,),
+            (key, json.dumps(channels)),
         )
         self._conn.commit()
-        return channels
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
         default = "1970-01-01T00:00:00Z"

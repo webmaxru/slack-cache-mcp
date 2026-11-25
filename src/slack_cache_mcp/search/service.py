@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from slack_cache_mcp.search.embedder import HashingEmbedder
@@ -26,9 +27,36 @@ class SearchService:
         self,
         repo: SqliteRepository,
         embedder: Embedder | None = None,
+        *,
+        models_dir: Path | None = None,
     ) -> None:
         self.repo = repo
         self.embedder: Embedder = embedder or HashingEmbedder()
+        self.models_dir = models_dir
+
+    def _sync_embedder_with_archive(self) -> None:
+        """Reload reader embedder when daemon has switched the archive model."""
+        try:
+            row = self.repo._conn.execute(  # noqa: SLF001
+                "SELECT value FROM meta WHERE key='embedding_model'"
+            ).fetchone()
+        except Exception:
+            return
+        archive_model = str(row["value"]) if row else None
+        if not archive_model or archive_model == self.embedder.model_id:
+            return
+        try:
+            from slack_cache_mcp.embeddings.factory import load_embedder
+
+            fresh = load_embedder(models_dir=self.models_dir)
+            # Prefer a model matching the archive index when available.
+            if fresh.model_id == archive_model or (
+                archive_model.startswith("hashing")
+                and fresh.model_id.startswith("hashing")
+            ):
+                self.embedder = fresh
+        except Exception:
+            pass
 
     def _resolve_channel_ids(self, values: list[str]) -> list[str]:
         ids: list[str] = []
@@ -140,14 +168,13 @@ class SearchService:
     def _coverage_note(self, *, mode: str) -> str | None:
         if mode not in {"hybrid", "semantic"}:
             return None
+        self._sync_embedder_with_archive()
         status = self.repo.embedding_coverage()
         if not status.get("vec_available"):
             return "semantic index unavailable; hybrid fell back to lexical-only fusion"
         pending = int(status.get("pending") or 0)
         embedded = int(status.get("embedded") or 0)
         notes: list[str] = []
-        # Coordinate with daemon: archive may have switched models while this
-        # long-lived MCP process kept its startup embedder.
         try:
             row = self.repo._conn.execute(  # noqa: SLF001
                 "SELECT value FROM meta WHERE key='embedding_model'"
@@ -156,7 +183,7 @@ class SearchService:
             if archive_model and archive_model != self.embedder.model_id:
                 notes.append(
                     f"reader embedder {self.embedder.model_id} differs from "
-                    f"archive index {archive_model}; restart MCP to pick up the new model"
+                    f"archive index {archive_model}"
                 )
         except Exception:
             pass
@@ -283,6 +310,7 @@ class SearchService:
         limit: int,
         filters: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        self._sync_embedder_with_archive()
         qvec = self.embedder.embed_query(free)
         return self.repo.search_vector(
             qvec,

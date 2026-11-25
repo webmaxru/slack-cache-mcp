@@ -204,19 +204,21 @@ class SearchDocsBuilder:
         text_changed: bool = True,
         previous_thread_ts: str | None = None,
     ) -> None:
-        """Rebuild affected thread docs; mark windows dirty (deferred rebuild)."""
-        # When a standalone message becomes a reply, drop its old thread doc.
-        if (
-            previous_thread_ts is not None
-            and previous_thread_ts != thread_ts
-            and previous_thread_ts == (message_ts or thread_ts)
-        ):
-            self.invalidate_aggregates(channel_id, previous_thread_ts)
-        if text_changed:
+        """Rebuild affected thread docs; drop stale windows immediately."""
+        focus = message_ts or thread_ts
+        # NULL previous_thread_ts means the message was previously standalone
+        # (its own root). Treat that as old_root == focus.
+        old_root = previous_thread_ts if previous_thread_ts is not None else focus
+        membership_changed = old_root != thread_ts
+        if membership_changed:
+            self.invalidate_aggregates(channel_id, old_root)
+            self.invalidate_aggregates(channel_id, thread_ts)
+            self._upsert_thread_doc(channel_id, old_root)
+            self._upsert_thread_doc(channel_id, thread_ts)
+        elif text_changed:
             self.invalidate_aggregates(channel_id, thread_ts)
             self._upsert_thread_doc(channel_id, thread_ts)
         else:
-            # Ensure thread doc exists without discarding embeddings.
             exists = self.repo._conn.execute(  # noqa: SLF001
                 """
                 SELECT 1 FROM search_docs
@@ -226,22 +228,93 @@ class SearchDocsBuilder:
             ).fetchone()
             if not exists:
                 self._upsert_thread_doc(channel_id, thread_ts)
-        # Defer channel window rebuilds to the daemon (avoids O(n²) ingest scans
-        # and size-split coverage holes from partial rebuilds).
+
         top_level = message_ts is None or message_ts == thread_ts
-        membership_changed = (
-            previous_thread_ts is not None and previous_thread_ts != thread_ts
-        )
         if (top_level and text_changed) or membership_changed:
+            # Drop overlapping windows now so deleted/edited text is not searchable;
+            # then rebuild only those natural buckets (preserve unrelated windows).
+            self._invalidate_and_rebuild_windows_around(channel_id, focus)
             self.repo.mark_windows_dirty(channel_id)
 
     def rebuild_dirty_windows(self) -> dict[str, int]:
-        """Rebuild window docs for channels marked dirty; returns per-channel counts."""
-        channels = self.repo.take_dirty_window_channels()
+        """Rebuild dirty channels one-by-one; ack only after success."""
+        channels = self.repo.peek_dirty_window_channels()
         out: dict[str, int] = {}
         for channel_id in channels:
-            out[channel_id] = self._rebuild_windows_for_channel(channel_id)
+            try:
+                out[channel_id] = self._rebuild_windows_for_channel(channel_id)
+                self.repo.ack_dirty_window_channel(channel_id)
+            except Exception:
+                # Leave channel (and remaining) dirty for the next pass.
+                raise
         return out
+
+    def _invalidate_and_rebuild_windows_around(
+        self, channel_id: str, focus_ts: str
+    ) -> None:
+        """Delete windows overlapping ``focus_ts`` and rebuild those buckets only."""
+        try:
+            focus_num = float(focus_ts)
+        except ValueError:
+            return
+        win_rows = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id, start_ts, end_ts FROM search_docs
+            WHERE channel_id=? AND kind='window'
+              AND CAST(start_ts AS REAL) <= ?
+              AND CAST(end_ts AS REAL) >= ?
+            """,
+            (channel_id, focus_num + WINDOW_GAP_S, focus_num - WINDOW_GAP_S),
+        ).fetchall()
+        self._delete_doc_ids([int(w["doc_id"]) for w in win_rows])
+        # Also drop any window that still covers focus exactly (last-msg delete).
+        leftover = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id FROM search_docs
+            WHERE channel_id=? AND kind='window'
+              AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
+            """,
+            (channel_id, focus_num, focus_num),
+        ).fetchall()
+        self._delete_doc_ids([int(w["doc_id"]) for w in leftover])
+
+        ch = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT workspace_key FROM messages
+            WHERE channel_id=? AND deleted_state='none' LIMIT 1
+            """,
+            (channel_id,),
+        ).fetchone()
+        if not ch:
+            return
+        # Rebuild natural buckets that contain focus (full channel scan once,
+        # but only flush buckets that include focus — other windows stay).
+        msgs = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT * FROM messages
+            WHERE channel_id=? AND deleted_state='none'
+              AND (thread_ts IS NULL OR thread_ts=ts)
+            ORDER BY ts_num ASC
+            """,
+            (channel_id,),
+        ).fetchall()
+        bucket: list[Any] = []
+        for m in msgs:
+            if bucket:
+                prev_ts = float(bucket[-1]["ts_num"])
+                gap = float(m["ts_num"]) - prev_ts
+                size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
+                if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
+                    if float(bucket[0]["ts_num"]) <= focus_num <= float(
+                        bucket[-1]["ts_num"]
+                    ):
+                        self._flush_window(ch["workspace_key"], channel_id, bucket)
+                    bucket = []
+            bucket.append(m)
+        if bucket and float(bucket[0]["ts_num"]) <= focus_num <= float(
+            bucket[-1]["ts_num"]
+        ):
+            self._flush_window(ch["workspace_key"], channel_id, bucket)
 
     def _rebuild_windows_for_channel(self, channel_id: str) -> int:
         """Full window rebuild for one channel (correct size-split coverage)."""

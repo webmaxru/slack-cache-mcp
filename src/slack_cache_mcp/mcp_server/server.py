@@ -28,7 +28,11 @@ def build_server(
     embedder: Any | None = None,
 ) -> MCPServer:
     repo = SqliteRepository(settings.archive_db, read_only=settings.archive_db.exists())
-    search = SearchService(repo, embedder=embedder or HashingEmbedder())
+    search = SearchService(
+        repo,
+        embedder=embedder or HashingEmbedder(),
+        models_dir=settings.models_dir,
+    )
     watermark_store = settings.data_dir / "client_state.json"
     mcp = MCPServer("slack-cache")
 
