@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from datetime import UTC, datetime
 from typing import Any
@@ -122,10 +123,44 @@ class SearchDocsBuilder:
             message_rowid=m.get("rowid"),
         )
 
-    def rebuild_thread_docs(self) -> int:
+    def _delete_kind(self, kind: str) -> None:
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT doc_id FROM search_docs WHERE kind=?", (kind,)
+        ).fetchall()
+        ids = [int(r["doc_id"]) for r in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            with contextlib.suppress(Exception):
+                self.repo._conn.execute(  # noqa: SLF001
+                    f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
+                )
         self.repo._conn.execute(  # noqa: SLF001
-            "DELETE FROM search_docs WHERE kind='thread'"
+            "DELETE FROM search_docs WHERE kind=?", (kind,)
         )
+
+    def invalidate_aggregates(self, channel_id: str, thread_ts: str) -> None:
+        """Drop thread/window docs for a channel/thread so rebuild refreshes them."""
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id FROM search_docs
+            WHERE channel_id=? AND kind IN ('thread', 'window')
+              AND (anchor_ts=? OR kind='window')
+            """,
+            (channel_id, thread_ts),
+        ).fetchall()
+        ids = [int(r["doc_id"]) for r in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            with contextlib.suppress(Exception):
+                self.repo._conn.execute(  # noqa: SLF001
+                    f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
+                )
+            self.repo._conn.execute(  # noqa: SLF001
+                f"DELETE FROM search_docs WHERE doc_id IN ({placeholders})", ids
+            )
+
+    def rebuild_thread_docs(self) -> int:
+        self._delete_kind("thread")
         threads = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT channel_id, thread_ts FROM messages
@@ -169,9 +204,7 @@ class SearchDocsBuilder:
         return n
 
     def rebuild_window_docs(self) -> int:
-        self.repo._conn.execute(  # noqa: SLF001
-            "DELETE FROM search_docs WHERE kind='window'"
-        )
+        self._delete_kind("window")
         channels = self.repo._conn.execute(  # noqa: SLF001
             "SELECT DISTINCT channel_id, workspace_key FROM messages WHERE deleted_state='none'"
         ).fetchall()
@@ -217,7 +250,7 @@ class SearchDocsBuilder:
         return 1
 
     def rebuild_canvas_docs(self) -> int:
-        self.repo._conn.execute("DELETE FROM search_docs WHERE kind='canvas'")  # noqa: SLF001
+        self._delete_kind("canvas")
         rows = self.repo._conn.execute(  # noqa: SLF001
             "SELECT * FROM canvases"
         ).fetchall()
@@ -242,7 +275,7 @@ class SearchDocsBuilder:
         return n
 
     def rebuild_file_docs(self) -> int:
-        self.repo._conn.execute("DELETE FROM search_docs WHERE kind='file'")  # noqa: SLF001
+        self._delete_kind("file")
         rows = self.repo._conn.execute("SELECT * FROM files").fetchall()  # noqa: SLF001
         n = 0
         for r in rows:

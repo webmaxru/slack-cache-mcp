@@ -118,26 +118,35 @@ def run_daemon(
                     )
                     purged = vault.purge_expired()
                     log_event(logger, "vault_purge", purged=purged)
-                    # Embed pending search_docs (offline HashingEmbedder / local ONNX)
+                    # Bounded embedding drain (message docs already upserted on ingest).
+                    repo = None
                     try:
                         from slack_cache_mcp.embeddings.factory import load_embedder
-                        from slack_cache_mcp.search.docs import SearchDocsBuilder
                         from slack_cache_mcp.search.worker import embed_pending
                         from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
+                        if not hasattr(_run, "_embedder"):
+                            _run._embedder = load_embedder(models_dir=settings.models_dir)  # type: ignore[attr-defined]
                         repo = SqliteRepository(settings.archive_db, read_only=False)
-                        SearchDocsBuilder(repo).rebuild_message_docs()
-                        emb = load_embedder(models_dir=settings.models_dir)
-                        emb_result = embed_pending(repo, emb, limit=512)
-                        repo.close()
+                        emb_result = embed_pending(
+                            repo, _run._embedder, limit=2_048  # type: ignore[attr-defined]
+                        )
                         log_event(
                             logger,
                             "embed_batch",
                             embedded=emb_result.get("embedded"),
                             model=emb_result.get("model_id"),
+                            ok=emb_result.get("ok"),
                         )
-                    except Exception:
-                        log_event(logger, "embed_batch_error")
+                    except Exception as emb_exc:
+                        log_event(
+                            logger,
+                            "embed_batch_error",
+                            error=type(emb_exc).__name__,
+                        )
+                    finally:
+                        if repo is not None:
+                            repo.close()
                 log_event(
                     logger,
                     "cycle_ok",

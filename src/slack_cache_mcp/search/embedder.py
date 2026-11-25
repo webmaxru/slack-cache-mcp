@@ -10,9 +10,9 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 DEFAULT_DIM = 384
-DEFAULT_MODEL_ID = "hashing-trigram-v1"
+DEFAULT_MODEL_ID = "hashing-unicode-trigram-v2"
 
-_TOKEN_RE = re.compile(r"[a-z0-9_]+", re.I)
+_WORD_RE = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
 
 
 @runtime_checkable
@@ -38,9 +38,9 @@ def _l2_normalize(vec: np.ndarray) -> np.ndarray:
 class HashingEmbedder:
     """Deterministic bag-of-character-trigrams projected into ``dim`` dims.
 
-    Fully offline. Optional ``synonym_groups`` collapse alternate surface forms
-    onto a shared token so the eval harness can measure hybrid > lexical on
-    paraphrase queries without downloading ONNX weights.
+    Fully offline. Unicode-aware word/trigram features (model id v2).
+    Optional ``synonym_groups`` collapse alternate surface forms onto a shared
+    token so the eval harness can measure hybrid > lexical on paraphrases.
     """
 
     def __init__(
@@ -58,7 +58,6 @@ class HashingEmbedder:
                 forms = {g.lower().strip() for g in group if g.strip()}
                 if not forms:
                     continue
-                # Stable representative: shortest then lexicographic.
                 rep = sorted(forms, key=lambda s: (len(s), s))[0]
                 for f in forms:
                     self._canon[f] = rep
@@ -72,10 +71,9 @@ class HashingEmbedder:
         return self._dim
 
     def _normalize_text(self, text: str) -> str:
-        lowered = text.lower()
+        lowered = text.casefold()
         if not self._canon:
             return lowered
-        # Replace multi-word synonyms first (longest match).
         keys = sorted(self._canon.keys(), key=len, reverse=True)
         out = lowered
         for key in keys:
@@ -86,11 +84,10 @@ class HashingEmbedder:
     def _embed_one(self, text: str) -> np.ndarray:
         text = self._normalize_text(text)
         vec = np.zeros(self._dim, dtype=np.float32)
-        # Word tokens
-        for tok in _TOKEN_RE.findall(text):
+        for tok in _WORD_RE.findall(text):
             self._add_feature(vec, f"w:{tok}", 1.0)
-        # Character trigrams over alphanumeric stream
-        compact = re.sub(r"[^a-z0-9]+", " ", text)
+        # Character trigrams over letters/digits (any script), spaces as separators.
+        compact = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
         padded = f" {compact} "
         for i in range(max(0, len(padded) - 2)):
             tri = padded[i : i + 3]
@@ -127,7 +124,6 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def rrf_score(rank: int, *, k: int = 60, weight: float = 1.0) -> float:
-    """Reciprocal Rank Fusion contribution for a 1-based rank."""
     if rank < 1:
         return 0.0
     return weight / (k + rank)
@@ -140,28 +136,30 @@ def mmr_select(
     limit: int,
     diversity_key: str = "channel_id",
 ) -> list[dict[str, object]]:
-    """Greedy MMR over already-scored candidates (higher score is better).
-
-    Diversity uses exact match on ``diversity_key`` (channel/thread) rather than
-    embedding distance so MCP stays free of optional model deps.
-    """
+    """Greedy MMR; scores are min-max normalized so penalties stay comparable."""
     if limit <= 0 or not candidates:
         return []
-    remaining = list(candidates)
+    raw_scores = [float(c.get("score") or 0.0) for c in candidates]  # type: ignore[arg-type]
+    lo, hi = min(raw_scores), max(raw_scores)
+    span = hi - lo
+    norms = [0.5 if span <= 1e-12 else (s - lo) / span for s in raw_scores]
+
+    remaining = list(range(len(candidates)))
     selected: list[dict[str, object]] = []
     seen_keys: set[str] = set()
     while remaining and len(selected) < limit:
-        best_i = 0
+        best_i = remaining[0]
         best_val = -math.inf
-        for i, c in enumerate(remaining):
-            rel = float(c.get("score") or 0.0)  # type: ignore[arg-type]
-            key = str(c.get(diversity_key) or "")
+        for i in remaining:
+            rel = norms[i]
+            key = str(candidates[i].get(diversity_key) or "")
             penalty = 1.0 if key and key in seen_keys else 0.0
             val = lambda_ * rel - (1.0 - lambda_) * penalty
             if val > best_val:
                 best_val = val
                 best_i = i
-        chosen = remaining.pop(best_i)
+        remaining.remove(best_i)
+        chosen = candidates[best_i]
         selected.append(chosen)
         key = str(chosen.get(diversity_key) or "")
         if key:

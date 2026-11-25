@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -23,17 +25,33 @@ def embed_pending(
     batch_size: int = 64,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Embed search_docs rows with ``embedded_model IS NULL``."""
+    """Embed search_docs rows pending for the active model."""
     if not ensure_docs_vec(repo._conn, dim=embedder.dim):  # noqa: SLF001
         return {"ok": False, "error": "sqlite-vec unavailable", "embedded": 0}
 
+    prev = repo._conn.execute(  # noqa: SLF001
+        "SELECT value FROM meta WHERE key='embedding_model'"
+    ).fetchone()
+    prev_dim = repo._conn.execute(  # noqa: SLF001
+        "SELECT value FROM meta WHERE key='embedding_dim'"
+    ).fetchone()
+    if (prev and prev["value"] != embedder.model_id) or (
+        prev_dim and int(prev_dim["value"]) != int(embedder.dim)
+    ):
+        repo._conn.execute(  # noqa: SLF001
+            "UPDATE search_docs SET embedded_model=NULL, embedded_at=NULL"
+        )
+        with contextlib.suppress(sqlite3.OperationalError):
+            repo._conn.execute("DELETE FROM docs_vec")  # noqa: SLF001
+        repo._conn.commit()  # noqa: SLF001
+
     sql = """
-        SELECT doc_id, kind, workspace_key, channel_id, anchor_ts, text
+        SELECT doc_id, kind, workspace_key, channel_id, anchor_ts, text, text_sha256
         FROM search_docs
-        WHERE embedded_model IS NULL
+        WHERE embedded_model IS NULL OR embedded_model != ?
         ORDER BY doc_id
     """
-    params: list[Any] = []
+    params: list[Any] = [embedder.model_id]
     if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -45,7 +63,13 @@ def embed_pending(
         vectors = embedder.embed_documents(texts)
         now = _utc_now()
         for j, r in enumerate(batch):
-            ts_num = None
+            cur = repo._conn.execute(  # noqa: SLF001
+                "SELECT text_sha256 FROM search_docs WHERE doc_id=?",
+                (int(r["doc_id"]),),
+            ).fetchone()
+            if not cur or cur["text_sha256"] != r["text_sha256"]:
+                continue
+            ts_num = 0.0
             if r["anchor_ts"]:
                 try:
                     ts_num = float(r["anchor_ts"])
@@ -64,9 +88,9 @@ def embed_pending(
                 """
                 UPDATE search_docs
                 SET embedded_model=?, embedded_at=?
-                WHERE doc_id=?
+                WHERE doc_id=? AND text_sha256=?
                 """,
-                (embedder.model_id, now, int(r["doc_id"])),
+                (embedder.model_id, now, int(r["doc_id"]), r["text_sha256"]),
             )
             embedded += 1
         repo._conn.commit()  # noqa: SLF001
@@ -77,6 +101,13 @@ def embed_pending(
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """,
         (embedder.model_id,),
+    )
+    repo._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO meta(key, value) VALUES ('embedding_dim', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (str(embedder.dim),),
     )
     repo._conn.commit()  # noqa: SLF001
     return {"ok": True, "embedded": embedded, "model_id": embedder.model_id}

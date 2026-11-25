@@ -5,7 +5,7 @@ from __future__ import annotations
 import calendar
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -17,7 +17,6 @@ _OP_RE = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
-# All operators in this set are parsed; values validated in unsupported_operators.
 UNSUPPORTED_OPS: frozenset[str] = frozenset()
 
 _LOCAL_TZ = ZoneInfo("Europe/Paris")
@@ -30,10 +29,6 @@ class ParsedQuery:
 
 
 def parse_query(query: str) -> ParsedQuery:
-    """Parse operators out of ``query``.
-
-    Unsupported has/is values are rejected via ``unsupported_operators()``.
-    """
     filters: dict[str, Any] = {}
     parts: list[str] = []
     last = 0
@@ -75,10 +70,37 @@ def unsupported_operators(parsed: ParsedQuery) -> list[str]:
     return found
 
 
-def parse_time_bound(value: str, *, end: bool = False) -> float:
-    """Convert Slack date/datetime/unix-ts / during:YYYY-MM to Unix timestamp.
+def parse_during_bounds(value: str) -> tuple[float, float]:
+    """Return (start, end_exclusive) for during:YYYY | YYYY-MM | YYYY-MM-DD..YYYY-MM-DD."""
+    value = value.strip()
+    # YYYY-MM-DD..YYYY-MM-DD
+    if ".." in value:
+        left, right = value.split("..", 1)
+        return parse_time_bound(left.strip(), end=False), parse_time_bound(right.strip(), end=True)
+    # YYYY
+    if re.fullmatch(r"\d{4}", value):
+        year = int(value)
+        start = datetime(year, 1, 1, tzinfo=_LOCAL_TZ)
+        end = datetime(year + 1, 1, 1, tzinfo=_LOCAL_TZ)
+        return start.timestamp(), end.timestamp()
+    # YYYY-MM
+    if re.fullmatch(r"\d{4}-\d{2}", value):
+        year, month = int(value[:4]), int(value[5:7])
+        start = datetime(year, month, 1, tzinfo=_LOCAL_TZ)
+        if month == 12:
+            end = datetime(year + 1, 1, 1, tzinfo=_LOCAL_TZ)
+        else:
+            end = datetime(year, month + 1, 1, tzinfo=_LOCAL_TZ)
+        return start.timestamp(), end.timestamp()
+    raise ValueError(
+        f"Unsupported during period: {value!r} (use YYYY, YYYY-MM, or YYYY-MM-DD..YYYY-MM-DD)"
+    )
 
-    Calendar dates are interpreted in Europe/Paris (PLAN §10.5) then stored as UTC.
+
+def parse_time_bound(value: str, *, end: bool = False) -> float:
+    """Convert Slack date/datetime/unix-ts to Unix timestamp.
+
+    Calendar dates without timezone → Europe/Paris. Explicit Z/offsets preserved.
     """
     value = value.strip()
     try:
@@ -86,19 +108,31 @@ def parse_time_bound(value: str, *, end: bool = False) -> float:
     except ValueError:
         pass
 
-    # during:YYYY-MM
+    # during helpers also call this for single days
     m = re.fullmatch(r"(\d{4})-(\d{2})", value)
     if m:
         year, month = int(m.group(1)), int(m.group(2))
         if end:
             last = calendar.monthrange(year, month)[1]
-            dt = datetime(year, month, last, 23, 59, 59, tzinfo=_LOCAL_TZ) + timedelta(seconds=1)
+            dt = datetime(year, month, last, tzinfo=_LOCAL_TZ) + timedelta(days=1)
         else:
             dt = datetime(year, month, 1, tzinfo=_LOCAL_TZ)
         return dt.timestamp()
 
     date_only = False
     parsed: datetime | None = None
+
+    # Explicit UTC / offset ISO first (preserve Z)
+    if value.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", value):
+        try:
+            iso = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(iso)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+
     for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
             parsed = datetime.strptime(value, fmt).replace(tzinfo=_LOCAL_TZ)
@@ -109,7 +143,7 @@ def parse_time_bound(value: str, *, end: bool = False) -> float:
     if parsed is None:
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
-                parsed = datetime.strptime(value.rstrip("Z"), fmt).replace(tzinfo=_LOCAL_TZ)
+                parsed = datetime.strptime(value, fmt).replace(tzinfo=_LOCAL_TZ)
                 break
             except ValueError:
                 continue
@@ -128,7 +162,6 @@ def parse_time_bound(value: str, *, end: bool = False) -> float:
 
 
 def fts_match_from_terms(terms: str, mode: str) -> str:
-    """Build an FTS5 MATCH expression."""
     terms = terms.strip()
     if not terms:
         return '""'
@@ -137,5 +170,4 @@ def fts_match_from_terms(terms: str, mode: str) -> str:
     tokens = ['"' + t.replace('"', '""') + '"' for t in re.split(r"\s+", terms) if t]
     if mode == "any":
         return " OR ".join(tokens)
-    # all / auto / lexical default: AND
     return " AND ".join(tokens)

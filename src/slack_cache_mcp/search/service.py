@@ -8,6 +8,7 @@ from slack_cache_mcp.search.embedder import HashingEmbedder
 from slack_cache_mcp.search.hybrid import collapse_threads, diversify_mmr, fuse_rrf
 from slack_cache_mcp.search.query import (
     fts_match_from_terms,
+    parse_during_bounds,
     parse_query,
     parse_time_bound,
     unsupported_operators,
@@ -95,9 +96,9 @@ class SearchService:
             filters["after"] = parse_time_bound(on_v, end=False)
             filters["before"] = parse_time_bound(on_v, end=True)
         elif during_v:
-            # during:YYYY-MM or during:YYYY-MM-DD..YYYY-MM-DD
-            filters["after"] = parse_time_bound(str(during_v), end=False)
-            filters["before"] = parse_time_bound(str(during_v), end=True)
+            start, end = parse_during_bounds(str(during_v))
+            filters["after"] = start
+            filters["before"] = end
         else:
             if after_v:
                 filters["after"] = parse_time_bound(str(after_v), end=False)
@@ -116,13 +117,9 @@ class SearchService:
         if user_vals:
             filters["user_ids"] = self._resolve_user_ids(user_vals)
 
+        # with: is an independent participant filter (thread contains user), not OR with from:
         if parsed.filters.get("with"):
-            # Participant filter: treat as user_id presence in thread — approx via from.
-            with_ids = self._resolve_user_ids([str(parsed.filters["with"])])
-            filters.setdefault("user_ids", [])
-            for uid in with_ids:
-                if uid not in filters["user_ids"]:
-                    filters["user_ids"].append(uid)
+            filters["with_user_ids"] = self._resolve_user_ids([str(parsed.filters["with"])])
 
         for h in parsed.filters.get("has") or []:
             if h == "file":
@@ -139,6 +136,20 @@ class SearchService:
         if "edited" in is_vals:
             filters["is_edited"] = True
         return filters
+
+    def _coverage_note(self, *, mode: str) -> str | None:
+        if mode not in {"hybrid", "semantic"}:
+            return None
+        status = self.repo.embedding_coverage()
+        if not status.get("vec_available"):
+            return "semantic index unavailable; hybrid fell back to lexical-only fusion"
+        pending = int(status.get("pending") or 0)
+        embedded = int(status.get("embedded") or 0)
+        if embedded == 0:
+            return "no documents embedded yet; semantic leg empty"
+        if pending > 0:
+            return f"partial semantic coverage: {embedded} embedded, {pending} pending"
+        return None
 
     def search_messages(
         self,
@@ -178,11 +189,13 @@ class SearchService:
 
         free = parsed.free_text.strip()
         candidate_limit = max(limit * 10, 100)
+        order = "ASC" if sort == "oldest" else "DESC"
 
         if not free:
-            hits = self.repo.search_filtered(limit=candidate_limit, filters=filters)
+            fused = self.repo.search_filtered(
+                limit=candidate_limit, filters=filters, order=order
+            )
             effective_mode = "filter"
-            fused = hits
         elif mode == "exact":
             fused = self.repo.search_trigram(free, limit=candidate_limit, filters=filters)
             effective_mode = "exact"
@@ -193,19 +206,22 @@ class SearchService:
             fused = self._lexical(free, mode=mode, limit=candidate_limit, filters=filters)
             effective_mode = mode if mode != "all" else "lexical"
         else:
-            # hybrid (default)
             lex = self._lexical(free, mode="all", limit=candidate_limit, filters=filters)
             vec = self._semantic(free, limit=candidate_limit, filters=filters)
             fused = fuse_rrf(lex, vec)
             effective_mode = "hybrid"
 
-        if sort == "newest":
-            fused = sorted(fused, key=lambda h: float(h.get("ts") or 0), reverse=True)
-        elif sort == "oldest":
-            fused = sorted(fused, key=lambda h: float(h.get("ts") or 0))
-
         collapsed = collapse_threads(fused)
-        diversified = diversify_mmr(collapsed, limit=limit)
+
+        if sort in {"newest", "oldest"}:
+            reverse = sort == "newest"
+            diversified = sorted(
+                collapsed,
+                key=lambda h: float(h.get("ts") or 0),
+                reverse=reverse,
+            )[:limit]
+        else:
+            diversified = diversify_mmr(collapsed, limit=limit)
 
         results: list[dict[str, Any]] = []
         for h in diversified:
@@ -224,7 +240,7 @@ class SearchService:
         return {
             "results": results,
             "mode": effective_mode,
-            "coverage_note": None,
+            "coverage_note": self._coverage_note(mode=effective_mode),
             "next_cursor": None,
             "embedder": self.embedder.model_id,
         }

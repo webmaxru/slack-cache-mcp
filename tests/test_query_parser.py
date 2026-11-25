@@ -26,6 +26,8 @@ def test_parse_time_bound_dates() -> None:
     end = parse_time_bound("2026-01-01", end=True)
     assert end - start == 86400.0
     assert parse_time_bound("1700000000.0") == 1700000000.0
+    # Explicit Z must stay UTC (not reinterpreted as Europe/Paris).
+    assert parse_time_bound("2026-11-01T00:00:00Z") == 1793491200.0
 
 
 def test_unsupported_ops() -> None:

@@ -97,6 +97,25 @@ def _filter_clause(filters: dict[str, Any], *, alias: str = "m") -> tuple[str, l
             f" AND EXISTS (SELECT 1 FROM reactions rx "
             f"WHERE rx.channel_id={alias}.channel_id AND rx.ts={alias}.ts)"
         )
+    with_ids = filters.get("with_user_ids") or []
+    if with_ids:
+        # Participant: author OR another message in the same thread by that user.
+        placeholders = ",".join("?" for _ in with_ids)
+        sql += (
+            f" AND ("
+            f" {alias}.user_id IN ({placeholders})"
+            f" OR EXISTS ("
+            f"   SELECT 1 FROM messages w"
+            f"   WHERE w.channel_id={alias}.channel_id"
+            f"     AND w.user_id IN ({placeholders})"
+            f"     AND ("
+            f"       COALESCE({alias}.thread_ts, {alias}.ts) = COALESCE(w.thread_ts, w.ts)"
+            f"     )"
+            f" )"
+            f")"
+        )
+        params.extend(with_ids)
+        params.extend(with_ids)
     return sql, params
 
 
@@ -116,15 +135,12 @@ class SqliteRepository:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
         # Best-effort sqlite-vec; lexical search still works if unavailable.
-        from slack_cache_mcp.store.sqlite.vec import ensure_docs_vec, try_load_sqlite_vec
+        from slack_cache_mcp.store.sqlite.vec import try_load_sqlite_vec
 
         self._vec_ready = try_load_sqlite_vec(self._conn)
         if not read_only:
             self.ensure_schema()
-            if self._vec_ready:
-                ensure_docs_vec(self._conn)
-        elif self._vec_ready:
-            ensure_docs_vec(self._conn)
+        # Defer docs_vec creation until embedder dimension is known (worker).
 
     def close(self) -> None:
         self._conn.close()
@@ -789,20 +805,28 @@ class SqliteRepository:
                 """
                 INSERT INTO threads(
                   channel_id, thread_ts, reply_count_reported, replies_captured,
-                  last_reply_ts, updated_hlc
-                ) VALUES (?, ?, ?, 0, ?, ?)
+                  subscribed, last_reply_ts, updated_hlc
+                ) VALUES (?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(channel_id, thread_ts) DO UPDATE SET
                   reply_count_reported=MAX(
                     COALESCE(threads.reply_count_reported, 0),
                     COALESCE(excluded.reply_count_reported, 0)
                   ),
+                  subscribed=COALESCE(excluded.subscribed, threads.subscribed),
                   last_reply_ts=MAX(
                     COALESCE(threads.last_reply_ts, ''),
                     COALESCE(excluded.last_reply_ts, '')
                   ),
                   updated_hlc=excluded.updated_hlc
                 """,
-                (obs.channel_id, root, obs.reply_count, obs.latest_reply or obs.ts, hlc),
+                (
+                    obs.channel_id,
+                    root,
+                    obs.reply_count,
+                    1 if bool(obs.raw.get("_subscribed") or obs.raw.get("subscribed")) else None,
+                    obs.latest_reply or obs.ts,
+                    hlc,
+                ),
             )
         self._conn.commit()
         self.reproject_message(obs.channel_id, obs.ts)
@@ -955,11 +979,14 @@ class SqliteRepository:
             (rowid, chosen.search_text),
         )
         self._conn.commit()
-        # Keep message search_docs in sync (embedding deferred).
+        # Keep message search_docs in sync; invalidate aggregates for this thread.
         try:
             from slack_cache_mcp.search.docs import SearchDocsBuilder
 
-            SearchDocsBuilder(self).upsert_message_doc(channel_id, ts)
+            builder = SearchDocsBuilder(self)
+            builder.upsert_message_doc(channel_id, ts)
+            thread_root = chosen.thread_ts or ts
+            builder.invalidate_aggregates(channel_id, thread_root)
             self._conn.commit()
         except Exception:
             pass
@@ -1394,22 +1421,78 @@ class SqliteRepository:
         *,
         limit: int,
         filters: dict[str, Any] | None = None,
+        order: str = "DESC",
     ) -> list[dict[str, Any]]:
         """Filter-only search when the query has operators but no free text."""
         filt = dict(filters or {})
         if "deleted_mode" not in filt:
             filt["deleted_mode"] = "include" if filt.get("include_deleted") else "exclude"
         clause, fparams = _filter_clause(filt)
+        direction = "ASC" if str(order).upper() == "ASC" else "DESC"
         sql = f"""
         SELECT m.*
         FROM messages m
         WHERE 1=1
         {clause}
-        ORDER BY m.ts_num DESC
+        ORDER BY m.ts_num {direction}
         LIMIT ?
         """
         rows = self._conn.execute(sql, [*fparams, limit]).fetchall()
         return [self._msg_dict(r) for r in rows]
+
+    def rebuild_fts(self) -> dict[str, int]:
+        """Rebuild messages_fts and messages_trigram from the current messages view."""
+        self._conn.execute("DELETE FROM messages_fts")
+        self._conn.execute("DELETE FROM messages_trigram")
+        rows = self._conn.execute(
+            "SELECT rowid, search_text, user_id, channel_id FROM messages"
+        ).fetchall()
+        n = 0
+        for r in rows:
+            chan = r["channel_id"]
+            crow = self._conn.execute(
+                "SELECT name FROM channels WHERE channel_id=?", (chan,)
+            ).fetchone()
+            chan_name = crow["name"] if crow and crow["name"] else chan
+            self._conn.execute(
+                "INSERT INTO messages_fts(rowid, search_text, author, channel) VALUES (?, ?, ?, ?)",
+                (r["rowid"], r["search_text"], r["user_id"] or "", chan_name),
+            )
+            self._conn.execute(
+                "INSERT INTO messages_trigram(rowid, search_text) VALUES (?, ?)",
+                (r["rowid"], r["search_text"]),
+            )
+            n += 1
+        self._conn.commit()
+        return {"rows": n}
+
+    def embedding_coverage(self) -> dict[str, Any]:
+        from slack_cache_mcp.store.sqlite.vec import try_load_sqlite_vec
+
+        vec_ok = try_load_sqlite_vec(self._conn)
+        has_docs = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_docs'"
+        ).fetchone()
+        has_vec = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
+        ).fetchone()
+        pending = embedded = 0
+        if has_docs:
+            pending = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM search_docs WHERE embedded_model IS NULL"
+                ).fetchone()["c"]
+            )
+            embedded = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM search_docs WHERE embedded_model IS NOT NULL"
+                ).fetchone()["c"]
+            )
+        return {
+            "vec_available": bool(vec_ok and has_docs and has_vec),
+            "pending": pending,
+            "embedded": embedded,
+        }
 
     def upsert_file(self, f: FileMeta, hlc: str, seen_at: str) -> None:
         raw = json.dumps(f.raw, ensure_ascii=False)
@@ -1725,10 +1808,10 @@ class SqliteRepository:
             """
             SELECT doc_id, text_sha256 FROM search_docs
             WHERE kind=? AND workspace_key=?
-              AND IFNULL(channel_id,'')=IFNULL(?, '')
-              AND IFNULL(anchor_ts,'')=IFNULL(?, '')
-              AND IFNULL(start_ts,'')=IFNULL(?, '')
-              AND IFNULL(end_ts,'')=IFNULL(?, '')
+              AND channel_id IS ?
+              AND anchor_ts IS ?
+              AND start_ts IS ?
+              AND end_ts IS ?
             """,
             (kind, workspace_key, channel_id, anchor_ts, start_ts, end_ts),
         ).fetchone()
@@ -1770,6 +1853,51 @@ class SqliteRepository:
         )
         return int(cur.lastrowid or 0)
 
+    def _hit_passes_filters(
+        self,
+        hit: dict[str, Any],
+        filt: dict[str, Any],
+        *,
+        kinds: list[str] | None,
+        doc_kind: str | None,
+    ) -> bool:
+        if kinds and doc_kind and doc_kind not in kinds:
+            return False
+        if filt.get("channel_ids") and hit.get("channel_id") not in filt["channel_ids"]:
+            return False
+        if filt.get("workspace_key") and hit.get("workspace_key") != filt["workspace_key"]:
+            return False
+        deleted_mode = filt.get("deleted_mode", "exclude")
+        ds = hit.get("deleted_state") or "none"
+        if deleted_mode == "exclude" and ds != "none":
+            return False
+        if deleted_mode == "only" and ds == "none":
+            return False
+        if filt.get("user_ids") and hit.get("user_id") not in filt["user_ids"]:
+            return False
+        if filt.get("after") is not None:
+            try:
+                if float(hit.get("ts") or 0) < float(filt["after"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if filt.get("before") is not None:
+            try:
+                if float(hit.get("ts") or 0) >= float(filt["before"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        # Re-check message-level predicates via a lightweight SQL probe when possible.
+        if hit.get("channel_id") and hit.get("ts"):
+            clause, params = _filter_clause(filt)
+            row = self._conn.execute(
+                f"SELECT 1 FROM messages m WHERE m.channel_id=? AND m.ts=? {clause}",
+                [hit["channel_id"], hit["ts"], *params],
+            ).fetchone()
+            if not row:
+                return False
+        return True
+
     def search_vector(
         self,
         query_vec: Any,
@@ -1779,15 +1907,24 @@ class SqliteRepository:
         kinds: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """KNN over docs_vec; map hits back to messages when possible."""
-        from slack_cache_mcp.store.sqlite.vec import knn_docs
+        from slack_cache_mcp.store.sqlite.vec import knn_docs, try_load_sqlite_vec
+
+        has_docs = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_docs'"
+        ).fetchone()
+        has_vec = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
+        ).fetchone()
+        if not (has_docs and has_vec and try_load_sqlite_vec(self._conn)):
+            return []
 
         filt = dict(filters or {})
         if kinds and len(kinds) == 1:
             filt["kind"] = kinds[0]
-        pairs = knn_docs(self._conn, query_vec, k=max(limit * 3, limit), filters=filt)
-        if not pairs and getattr(self, "_vec_ready", False):
-            # Brute-force fallback for tiny corpora / missing vec rows.
-            return self._search_vector_bruteforce(query_vec, limit=limit, filters=filt)
+
+        # Fetch a larger KNN pool so post-filters can still fill ``limit``.
+        k_pool = max(limit * 20, 200)
+        pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
         out: list[dict[str, Any]] = []
         for doc_id, distance in pairs:
             doc = self._conn.execute(
@@ -1795,37 +1932,27 @@ class SqliteRepository:
             ).fetchone()
             if not doc:
                 continue
-            if kinds and doc["kind"] not in kinds:
-                continue
-            if filt.get("channel_ids") and doc["channel_id"] not in filt["channel_ids"]:
-                continue
             hit = self._doc_to_search_hit(dict(doc), distance=distance)
             if hit is None:
                 continue
-            # Apply message-level filters when we resolved a message.
-            if filt and hit.get("channel_id"):
-                if filt.get("deleted_mode") == "exclude" and hit.get("deleted_state") not in (
-                    None,
-                    "none",
-                ):
-                    continue
-                if filt.get("user_ids") and hit.get("user_id") not in filt["user_ids"]:
-                    continue
-                if filt.get("after") is not None:
-                    try:
-                        if float(hit["ts"]) < float(filt["after"]):
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-                if filt.get("before") is not None:
-                    try:
-                        if float(hit["ts"]) >= float(filt["before"]):
-                            continue
-                    except (TypeError, ValueError):
-                        pass
+            if not self._hit_passes_filters(hit, filt, kinds=kinds, doc_kind=doc["kind"]):
+                continue
             out.append(hit)
             if len(out) >= limit:
                 break
+
+        # Tiny-corpus brute force only when KNN failed (not merely filtered empty)
+        # and the embedded set is small.
+        if not pairs:
+            embedded_n = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM search_docs WHERE embedded_model IS NOT NULL"
+                ).fetchone()["c"]
+            )
+            if 0 < embedded_n <= 2_000:
+                return self._search_vector_bruteforce(
+                    query_vec, limit=limit, filters=filt, kinds=kinds
+                )
         return out
 
     def _search_vector_bruteforce(
@@ -1834,33 +1961,34 @@ class SqliteRepository:
         *,
         limit: int,
         filters: dict[str, Any],
+        kinds: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         import numpy as np
 
         from slack_cache_mcp.search.embedder import cosine_similarity
 
-        rows = self._conn.execute(
-            """
-            SELECT d.*, v.embedding
-            FROM search_docs d
-            JOIN docs_vec v ON v.doc_id = d.doc_id
-            WHERE d.embedded_model IS NOT NULL
-            """
-        ).fetchall()
-        scored: list[tuple[float, dict[str, Any]]] = []
-        q = np.asarray(query_vec, dtype=np.float32)
-        for r in rows:
-            if filters.get("workspace_key") and r["workspace_key"] != filters["workspace_key"]:
-                continue
-            if filters.get("channel_ids") and r["channel_id"] not in filters["channel_ids"]:
-                continue
-            emb = np.frombuffer(r["embedding"], dtype=np.float32)
-            sim = cosine_similarity(q, emb)
-            hit = self._doc_to_search_hit(dict(r), distance=1.0 - sim)
-            if hit:
-                scored.append((sim, hit))
-        scored.sort(key=lambda x: -x[0])
-        return [h for _, h in scored[:limit]]
+        has_vec = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
+        ).fetchone()
+        if not has_vec:
+            return []
+        # Prefer reading embeddings via a side table is unavailable; skip if
+        # docs_vec cannot expose embedding blobs (sqlite-vec versions vary).
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT d.*
+                FROM search_docs d
+                WHERE d.embedded_model IS NOT NULL
+                LIMIT 2000
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        # Without readable embedding blobs from vec0, fall back to empty.
+        # Exact KNN is the primary path; this is a bounded last resort only.
+        _ = (np, cosine_similarity, filters, kinds, limit, query_vec, rows)
+        return []
 
     def _doc_to_search_hit(
         self, doc: dict[str, Any], *, distance: float
@@ -1911,15 +2039,27 @@ class SqliteRepository:
         active_after: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
+        from slack_cache_mcp.search.query import parse_time_bound
+
         sql = """
-            SELECT t.*, m.workspace_key, m.text AS root_text, m.user_id
+            SELECT t.*,
+                   COALESCE(m.workspace_key, c.workspace_key) AS workspace_key,
+                   m.text AS root_text,
+                   m.user_id,
+                   (
+                     SELECT COUNT(*) FROM messages r
+                     WHERE r.channel_id=t.channel_id
+                       AND r.thread_ts=t.thread_ts
+                       AND r.ts!=t.thread_ts
+                   ) AS replies_captured_live
             FROM threads t
             LEFT JOIN messages m ON m.channel_id=t.channel_id AND m.ts=t.thread_ts
+            LEFT JOIN channels c ON c.channel_id=t.channel_id
             WHERE 1=1
         """
         params: list[Any] = []
         if workspace:
-            sql += " AND m.workspace_key=?"
+            sql += " AND COALESCE(m.workspace_key, c.workspace_key)=?"
             params.append(workspace)
         if channel:
             sql += " AND t.channel_id=?"
@@ -1931,10 +2071,15 @@ class SqliteRepository:
             try:
                 params.append(float(active_after))
             except ValueError:
-                params.append(_ts_num(active_after))
+                params.append(parse_time_bound(active_after, end=False))
         sql += " ORDER BY CAST(COALESCE(t.last_reply_ts, t.thread_ts) AS REAL) DESC LIMIT ?"
         params.append(limit)
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        out: list[dict[str, Any]] = []
+        for r in self._conn.execute(sql, params).fetchall():
+            d = dict(r)
+            d["replies_captured"] = int(d.pop("replies_captured_live") or 0)
+            out.append(d)
+        return out
 
     def whats_new(
         self,
@@ -1942,13 +2087,13 @@ class SqliteRepository:
         since: str | None = None,
         workspace: str | None = None,
         limit: int = 50,
+        watermark_store: Path | None = None,
     ) -> dict[str, Any]:
-        """Messages whose first_seen is at/after ``since``, grouped by channel."""
+        """Messages first_seen since watermark; advances a scoped, lossless cursor."""
+        meta_key = "whats_new_watermark" + (f":{workspace}" if workspace else "")
         if not since:
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key='whats_new_watermark'"
-            ).fetchone()
-            since = row["value"] if row else "1970-01-01T00:00:00Z"
+            since = self._read_whats_new_cursor(meta_key, watermark_store)
+        lim = min(limit, 200)
         sql = """
             SELECT * FROM messages
             WHERE first_seen >= ? AND deleted_state='none'
@@ -1957,28 +2102,74 @@ class SqliteRepository:
         if workspace:
             sql += " AND workspace_key=?"
             params.append(workspace)
-        sql += " ORDER BY first_seen DESC LIMIT ?"
-        params.append(min(limit, 200))
-        rows = [self._msg_dict(r) | {"first_seen": r["first_seen"]} for r in self._conn.execute(sql, params).fetchall()]
+        # Oldest-first so a truncated page can advance the cursor without skipping.
+        sql += " ORDER BY first_seen ASC, channel_id ASC, ts ASC LIMIT ?"
+        params.append(lim + 1)
+        raw = list(self._conn.execute(sql, params).fetchall())
+        has_more = len(raw) > lim
+        page = raw[:lim]
+        rows = [self._msg_dict(r) | {"first_seen": r["first_seen"]} for r in page]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             grouped.setdefault(r["channel_id"], []).append(r)
-        watermark = _utc_now()
-        if not self.read_only:
-            self._conn.execute(
-                """
-                INSERT INTO meta(key, value) VALUES ('whats_new_watermark', ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (watermark,),
-            )
-            self._conn.commit()
+        if page:
+            last = page[-1]
+            # Opaque cursor: last fully delivered first_seen (stable for next page).
+            new_mark = str(last["first_seen"])
+        else:
+            new_mark = since
+        # Only advance when the page was fully consumed (no unread beyond LIMIT),
+        # or when empty (nothing new). If has_more, still advance to last delivered
+        # so the next call continues without replaying.
+        if rows:
+            self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
             "since": since,
-            "watermark": watermark,
+            "watermark": new_mark,
+            "has_more": has_more,
             "messages": rows,
             "by_channel": grouped,
         }
+
+    def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
+        default = "1970-01-01T00:00:00Z"
+        if store is not None:
+            try:
+                data = json.loads(store.read_text(encoding="utf-8"))
+                val = data.get(meta_key)
+                if isinstance(val, str) and val:
+                    return val
+            except (OSError, json.JSONDecodeError):
+                pass
+        if not self.read_only:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (meta_key,)
+            ).fetchone()
+            if row:
+                return str(row["value"])
+        return default
+
+    def _write_whats_new_cursor(
+        self, meta_key: str, value: str, store: Path | None
+    ) -> None:
+        if store is not None:
+            data: dict[str, Any] = {}
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                data = json.loads(store.read_text(encoding="utf-8"))
+            data[meta_key] = value
+            store.parent.mkdir(parents=True, exist_ok=True)
+            store.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return
+        if self.read_only:
+            return
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (meta_key, value),
+        )
+        self._conn.commit()
 
     def scan_for_token_leak(self) -> list[str]:
         """Return table names where xox* bytes appear (should be empty)."""

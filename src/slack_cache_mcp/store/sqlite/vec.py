@@ -13,7 +13,6 @@ from slack_cache_mcp.search.embedder import DEFAULT_DIM, embedding_to_bytes
 
 def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     """Load sqlite-vec into ``conn``. Returns False if unavailable."""
-    # Already usable?
     try:
         conn.execute("SELECT vec_version()").fetchone()
         return True
@@ -32,24 +31,32 @@ def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
         with contextlib.suppress(Exception):
             conn.enable_load_extension(False)
         return False
-    # Leave load_extension enabled: some Windows SQLite builds unregister
-    # dynamically loaded modules when the flag is cleared.
+    # Leave load_extension enabled: some Windows builds unregister modules
+    # when the flag is cleared.
     return True
 
 
 def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool:
-    """Create ``docs_vec`` if missing. Returns True when vec search is usable."""
+    """Create or rebuild ``docs_vec`` for ``dim``. Returns True when usable."""
     if not try_load_sqlite_vec(conn):
         return False
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
     ).fetchone()
-    if row:
+    meta_dim = conn.execute(
+        "SELECT value FROM meta WHERE key='embedding_dim'"
+    ).fetchone()
+    if row and meta_dim and int(meta_dim["value"]) == int(dim):
         return True
+    if row and (not meta_dim or int(meta_dim["value"]) != int(dim)):
+        conn.execute("DROP TABLE IF EXISTS docs_vec")
+        conn.execute(
+            "UPDATE search_docs SET embedded_model=NULL, embedded_at=NULL"
+        )
     try:
         conn.execute(
             f"""
-            CREATE VIRTUAL TABLE docs_vec USING vec0(
+            CREATE VIRTUAL TABLE IF NOT EXISTS docs_vec USING vec0(
               doc_id INTEGER PRIMARY KEY,
               embedding float[{int(dim)}] distance_metric=cosine,
               workspace_key TEXT partition key,
@@ -61,6 +68,13 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         )
     except sqlite3.OperationalError:
         return False
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES ('embedding_dim', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (str(int(dim)),),
+    )
     return True
 
 

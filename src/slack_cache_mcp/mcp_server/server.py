@@ -29,6 +29,7 @@ def build_server(
 ) -> MCPServer:
     repo = SqliteRepository(settings.archive_db, read_only=settings.archive_db.exists())
     search = SearchService(repo, embedder=embedder or HashingEmbedder())
+    watermark_store = settings.data_dir / "client_state.json"
     mcp = MCPServer("slack-cache")
 
     @mcp.tool(annotations=_ANNOT)
@@ -210,7 +211,12 @@ def build_server(
         limit: int = 50,
     ) -> dict[str, Any]:
         """Messages first seen since a watermark (default: last call)."""
-        return repo.whats_new(since=since, workspace=workspace, limit=min(limit, 200))
+        return repo.whats_new(
+            since=since,
+            workspace=workspace,
+            limit=min(limit, 200),
+            watermark_store=watermark_store,
+        )
 
     @mcp.tool(annotations=_ANNOT)
     def search_canvases(
@@ -241,10 +247,15 @@ def build_server(
         status = repo.cache_status(channel=id)
         return str(status)
 
-    @mcp.resource("slk://message/{channel}/{ts}")
-    def message_resource(channel: str, ts: str) -> str:
+    # Match tool citation refs: slk://{workspace_key}/{channel_id}/{ts}
+    @mcp.resource("slk://{workspace}/{channel}/{ts}")
+    def message_resource(workspace: str, channel: str, ts: str) -> str:
         msg = repo.get_message(channel=channel, ts=ts)
-        return str(msg or {"error": "not_found"})
+        if not msg:
+            return str({"error": "not_found"})
+        if msg.get("workspace_key") and msg["workspace_key"] != workspace:
+            return str({"error": "workspace_mismatch"})
+        return str(msg)
 
     @mcp.prompt()
     def catch_up(workspace: str | None = None, since: str | None = None) -> str:

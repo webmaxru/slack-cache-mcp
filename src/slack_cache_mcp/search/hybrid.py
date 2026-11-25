@@ -18,7 +18,9 @@ def fuse_rrf(
 ) -> list[dict[str, Any]]:
     """Fuse two ranked lists with Reciprocal Rank Fusion.
 
-    Result items carry ``score``, ``match.lexical_rank``, ``match.vector_rank``.
+    Vector contributions are deduplicated by message identity so message/thread/
+    window docs that resolve to the same `(channel_id, ts)` only score once
+    (best/first occurrence keeps the rank slot).
     """
 
     def _id(hit: dict[str, Any]) -> tuple[Any, ...]:
@@ -33,18 +35,26 @@ def fuse_rrf(
         key = _id(hit)
         scores[key] = scores.get(key, 0.0) + rrf_score(i, k=k, weight=w_lex)
         lex_rank[key] = i
-        base = merged.get(key) or dict(hit)
-        merged[key] = base
+        merged[key] = dict(hit)
 
-    for i, hit in enumerate(vector, start=1):
+    # Deduplicate vector list by message identity before assigning ranks.
+    seen_vec: set[tuple[Any, ...]] = set()
+    vec_unique: list[dict[str, Any]] = []
+    for hit in vector:
+        key = _id(hit)
+        if key in seen_vec:
+            continue
+        seen_vec.add(key)
+        vec_unique.append(hit)
+
+    for i, hit in enumerate(vec_unique, start=1):
         key = _id(hit)
         scores[key] = scores.get(key, 0.0) + rrf_score(i, k=k, weight=w_vec)
         vec_rank[key] = i
-        base = merged.get(key) or dict(hit)
-        # Prefer richer lexical payload when both present.
         if key not in merged:
             merged[key] = dict(hit)
         else:
+            base = merged[key]
             for field, value in hit.items():
                 if field not in base or base[field] in (None, ""):
                     base[field] = value
@@ -89,4 +99,5 @@ def diversify_mmr(
     limit: int,
     lambda_: float = 0.7,
 ) -> list[dict[str, Any]]:
-    return mmr_select(hits, lambda_=lambda_, limit=limit, diversity_key="channel_id")
+    selected = mmr_select(hits, lambda_=lambda_, limit=limit, diversity_key="channel_id")
+    return selected  # list[dict[str, object]] is compatible for callers

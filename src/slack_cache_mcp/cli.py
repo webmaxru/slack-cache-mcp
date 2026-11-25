@@ -262,20 +262,24 @@ def rebuild_cmd(
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db, read_only=False)
     result: dict[str, object] = {"ok": True}
-    if all_derived or embeddings or fts or not (fts or embeddings or projection):
-        counts = SearchDocsBuilder(repo).rebuild_all()
-        result["search_docs"] = counts
-    if all_derived or embeddings or not (fts or embeddings or projection):
-        emb = load_embedder(models_dir=settings.models_dir)
-        result["embeddings"] = embed_pending(repo, emb)
-    if projection:
-        # Reproject all messages from versions
+    do_all = all_derived or not (fts or embeddings or projection)
+    # Projection first so FTS/docs see the repaired current view.
+    if do_all or projection:
         rows = repo._conn.execute(  # noqa: SLF001
             "SELECT DISTINCT channel_id, ts FROM message_versions"
         ).fetchall()
         for r in rows:
             repo.reproject_message(r["channel_id"], r["ts"])
         result["projection_rebuilt"] = len(rows)
+    if do_all or fts:
+        result["fts"] = repo.rebuild_fts()
+    if do_all or embeddings or fts:
+        # --fts alone still refreshes search_docs text; embeddings only when asked/all.
+        counts = SearchDocsBuilder(repo).rebuild_all()
+        result["search_docs"] = counts
+    if do_all or embeddings:
+        emb = load_embedder(models_dir=settings.models_dir)
+        result["embeddings"] = embed_pending(repo, emb)
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
 
@@ -348,13 +352,14 @@ def eval_cmd(
 
     settings = load_settings(data_dir=data_dir)
     if private:
+        from slack_cache_mcp.search.eval_harness import run_private_eval
+
         path = P(os.environ.get("LOCALAPPDATA", "")) / "slackcache" / "eval" / "private.jsonl"
-        if not path.is_file():
-            typer.echo(json.dumps({"ok": False, "error": "private.jsonl not found"}))
+        # Metrics only — never print query text or expected refs.
+        result = run_private_eval(settings.archive_db, path)
+        typer.echo(json.dumps(result, indent=2, default=str))
+        if not result.get("ok"):
             raise typer.Exit(1)
-        # Metrics-only: count lines; never echo query text.
-        n = sum(1 for _ in path.open(encoding="utf-8") if _.strip())
-        typer.echo(json.dumps({"ok": True, "private_queries": n, "note": "content not printed"}))
         return
 
     if bench:
@@ -362,7 +367,7 @@ def eval_cmd(
         result = bench_hybrid_latency(repo, n_messages=bench_n)
         repo.close()
         typer.echo(json.dumps(result, indent=2, default=str))
-        if not result.get("pass_p95_under_300ms"):
+        if not result.get("ok") or not result.get("pass_p95_under_300ms"):
             raise typer.Exit(2)
         return
 
@@ -411,8 +416,12 @@ def task_status_cmd() -> None:
 
 
 def main() -> None:
-    # Ensure guard even if Typer callback path changes.
-    netguard.install()
+    # PLAN §10.3 / §13: `models fetch` is the only command allowed network
+    # (HuggingFace, never Slack). Skip netguard for that argv only.
+    argv = [a.lower() for a in sys.argv[1:] if not a.startswith("-")]
+    allow_hf = len(argv) >= 2 and argv[0] == "models" and argv[1] == "fetch"
+    if not allow_hf:
+        netguard.install()
     app()
 
 

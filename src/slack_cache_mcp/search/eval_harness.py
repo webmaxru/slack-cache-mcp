@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -92,7 +93,11 @@ def seed_eval_corpus(repo: SqliteRepository) -> list[EvalQuery]:
     repo.upsert_device(device, "eval")
     repo.upsert_source("SRCEVAL01", device, "test", "eval", None)
     snap = "SNEVAL00000000000000000001"
-    repo.begin_snapshot(snap, "SRCEVAL01", "manual")
+    existing = repo._conn.execute(  # noqa: SLF001
+        "SELECT 1 FROM snapshots WHERE snapshot_id=?", (snap,)
+    ).fetchone()
+    if not existing:
+        repo.begin_snapshot(snap, "SRCEVAL01", "manual")
 
     ws = Workspace(
         workspace_key="TEVAL01",
@@ -212,15 +217,21 @@ def run_eval(
     semantic = _metrics("semantic")
     lex_ndcg = lexical[f"ndcg@{k_ndcg}"]
     hyb_ndcg = hybrid[f"ndcg@{k_ndcg}"]
-    relative = (hyb_ndcg - lex_ndcg) / lex_ndcg if lex_ndcg > 1e-9 else float("inf")
+    if lex_ndcg <= 1e-9 and hyb_ndcg <= 1e-9:
+        relative = 0.0
+        passed = False
+    elif lex_ndcg <= 1e-9:
+        relative = float("inf")
+        passed = hyb_ndcg > 0
+    else:
+        relative = (hyb_ndcg - lex_ndcg) / lex_ndcg
+        passed = relative >= 0.10
     return {
         "lexical": lexical,
         "semantic": semantic,
         "hybrid": hybrid,
         "hybrid_vs_lexical_ndcg_relative": relative,
-        "pass_hybrid_ge_lexical_plus_10pct": bool(
-            relative >= 0.10 or hyb_ndcg >= lex_ndcg + 0.05
-        ),
+        "pass_hybrid_ge_lexical_plus_10pct": bool(passed),
         "queries": len(queries),
     }
 
@@ -313,8 +324,15 @@ def bench_hybrid_latency(
         )
 
     SearchDocsBuilder(repo).rebuild_message_docs()
-    cap = embed_limit if embed_limit is not None else min(n_messages, 20_000)
-    embed_pending(repo, emb, limit=cap)
+    cap = embed_limit if embed_limit is not None else n_messages
+    emb_result = embed_pending(repo, emb, limit=cap)
+    if not emb_result.get("ok"):
+        return {
+            "ok": False,
+            "error": emb_result.get("error") or "embed_pending failed",
+            "n_messages": n_messages,
+            "pass_p95_under_300ms": False,
+        }
 
     svc = SearchService(repo, embedder=emb)
     queries = [
@@ -333,10 +351,65 @@ def bench_hybrid_latency(
     latencies.sort()
     p95 = latencies[int(0.95 * (len(latencies) - 1))]
     return {
+        "ok": True,
         "n_messages": n_messages,
-        "embedded": cap,
+        "embedded": int(emb_result.get("embedded") or 0),
         "n_queries": n_queries,
         "p50_ms": latencies[len(latencies) // 2],
         "p95_ms": p95,
         "pass_p95_under_300ms": p95 < 300.0,
+    }
+
+
+def run_private_eval(archive_db: Any, private_path: Any) -> dict[str, Any]:
+    """Evaluate private.jsonl labelled queries; never echo query/ref text."""
+    from pathlib import Path
+
+    path = Path(private_path)
+    if not path.is_file():
+        return {"ok": False, "error": "private.jsonl not found"}
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+    queries: list[EvalQuery] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        q = obj.get("query")
+        rel = obj.get("relevant") or obj.get("refs") or []
+        if not isinstance(q, str) or not q:
+            continue
+        pairs: list[tuple[str, str]] = []
+        for item in rel:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                pairs.append((str(item[0]), str(item[1])))
+            elif isinstance(item, dict) and item.get("channel_id") and item.get("ts"):
+                pairs.append((str(item["channel_id"]), str(item["ts"])))
+            elif isinstance(item, str) and item.startswith("slk://"):
+                parts = item.split("/")
+                if len(parts) >= 4:
+                    pairs.append((parts[3], parts[4] if len(parts) > 4 else parts[-1]))
+        if pairs:
+            queries.append(EvalQuery(query=q, relevant=pairs))
+    if not queries:
+        return {"ok": False, "error": "no labelled queries", "private_queries": 0}
+    if not Path(archive_db).exists():
+        return {"ok": False, "error": "archive.db missing", "private_queries": len(queries)}
+    repo = SqliteRepository(Path(archive_db), read_only=True)
+    try:
+        metrics = run_eval(repo, queries=queries)
+    finally:
+        repo.close()
+    # Strip anything that could echo private query text.
+    return {
+        "ok": True,
+        "private_queries": len(queries),
+        "lexical_ndcg": metrics["lexical"].get("ndcg@10"),
+        "hybrid_ndcg": metrics["hybrid"].get("ndcg@10"),
+        "hybrid_vs_lexical_ndcg_relative": metrics["hybrid_vs_lexical_ndcg_relative"],
+        "pass_hybrid_ge_lexical_plus_10pct": metrics["pass_hybrid_ge_lexical_plus_10pct"],
     }
