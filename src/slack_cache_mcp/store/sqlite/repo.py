@@ -261,6 +261,14 @@ class SqliteRepository:
               UNIQUE (kind, workspace_key, channel_id, anchor_ts, start_ts, end_ts)
             ) STRICT
             """,
+            """
+            CREATE TABLE IF NOT EXISTS doc_embeddings (
+              doc_id INTEGER PRIMARY KEY,
+              dim INTEGER NOT NULL,
+              embedding BLOB NOT NULL,
+              model_id TEXT NOT NULL
+            ) STRICT
+            """,
         ):
             self._conn.execute(ddl)
         self._conn.execute(
@@ -979,14 +987,14 @@ class SqliteRepository:
             (rowid, chosen.search_text),
         )
         self._conn.commit()
-        # Keep message search_docs in sync; invalidate aggregates for this thread.
+        # Keep message + aggregate search_docs in sync during normal ingest.
         try:
             from slack_cache_mcp.search.docs import SearchDocsBuilder
 
             builder = SearchDocsBuilder(self)
             builder.upsert_message_doc(channel_id, ts)
             thread_root = chosen.thread_ts or ts
-            builder.invalidate_aggregates(channel_id, thread_root)
+            builder.refresh_aggregates(channel_id, thread_root)
             self._conn.commit()
         except Exception:
             pass
@@ -1476,6 +1484,9 @@ class SqliteRepository:
         has_vec = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
         ).fetchone()
+        has_blob = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_embeddings'"
+        ).fetchone()
         pending = embedded = 0
         if has_docs:
             pending = int(
@@ -1489,7 +1500,8 @@ class SqliteRepository:
                 ).fetchone()["c"]
             )
         return {
-            "vec_available": bool(vec_ok and has_docs and has_vec),
+            "vec_available": bool(has_docs and (has_blob or (vec_ok and has_vec))),
+            "sqlite_vec": bool(vec_ok and has_vec),
             "pending": pending,
             "embedded": embedded,
         }
@@ -1905,90 +1917,71 @@ class SqliteRepository:
         limit: int,
         filters: dict[str, Any] | None = None,
         kinds: list[str] | None = None,
+        model_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """KNN over docs_vec; map hits back to messages when possible."""
-        from slack_cache_mcp.store.sqlite.vec import knn_docs, try_load_sqlite_vec
+        """KNN over docs_vec or numpy ``doc_embeddings`` fallback."""
+        from slack_cache_mcp.store.sqlite.vec import knn_docs, knn_docs_numpy, try_load_sqlite_vec
 
         has_docs = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_docs'"
         ).fetchone()
-        has_vec = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
-        ).fetchone()
-        if not (has_docs and has_vec and try_load_sqlite_vec(self._conn)):
+        if not has_docs:
             return []
 
         filt = dict(filters or {})
         if kinds and len(kinds) == 1:
             filt["kind"] = kinds[0]
-
-        # Fetch a larger KNN pool so post-filters can still fill ``limit``.
-        k_pool = max(limit * 20, 200)
-        pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
-        out: list[dict[str, Any]] = []
-        for doc_id, distance in pairs:
-            doc = self._conn.execute(
-                "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
-            ).fetchone()
-            if not doc:
-                continue
-            hit = self._doc_to_search_hit(dict(doc), distance=distance)
-            if hit is None:
-                continue
-            if not self._hit_passes_filters(hit, filt, kinds=kinds, doc_kind=doc["kind"]):
-                continue
-            out.append(hit)
-            if len(out) >= limit:
-                break
-
-        # Tiny-corpus brute force only when KNN failed (not merely filtered empty)
-        # and the embedded set is small.
-        if not pairs:
-            embedded_n = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS c FROM search_docs WHERE embedded_model IS NOT NULL"
-                ).fetchone()["c"]
-            )
-            if 0 < embedded_n <= 2_000:
-                return self._search_vector_bruteforce(
-                    query_vec, limit=limit, filters=filt, kinds=kinds
-                )
-        return out
-
-    def _search_vector_bruteforce(
-        self,
-        query_vec: Any,
-        *,
-        limit: int,
-        filters: dict[str, Any],
-        kinds: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        import numpy as np
-
-        from slack_cache_mcp.search.embedder import cosine_similarity
+        if model_id:
+            filt["model_id"] = model_id
 
         has_vec = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
         ).fetchone()
-        if not has_vec:
-            return []
-        # Prefer reading embeddings via a side table is unavailable; skip if
-        # docs_vec cannot expose embedding blobs (sqlite-vec versions vary).
-        try:
-            rows = self._conn.execute(
-                """
-                SELECT d.*
-                FROM search_docs d
-                WHERE d.embedded_model IS NOT NULL
-                LIMIT 2000
-                """
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return []
-        # Without readable embedding blobs from vec0, fall back to empty.
-        # Exact KNN is the primary path; this is a bounded last resort only.
-        _ = (np, cosine_similarity, filters, kinds, limit, query_vec, rows)
-        return []
+        use_vec = bool(has_vec and try_load_sqlite_vec(self._conn))
+
+        # Expand the KNN pool until eligibility filters fill ``limit`` or the
+        # corpus is exhausted (avoids truncating before author/date checks).
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        k_pool = max(limit * 20, 200)
+        max_pool = 10_000
+        while True:
+            if use_vec:
+                pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
+            else:
+                pairs = knn_docs_numpy(
+                    self._conn,
+                    query_vec,
+                    k=k_pool,
+                    filters=filt,
+                    kinds=kinds,
+                    model_id=model_id,
+                )
+            for doc_id, distance in pairs:
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                doc = self._conn.execute(
+                    "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+                ).fetchone()
+                if not doc:
+                    continue
+                if model_id and doc["embedded_model"] != model_id:
+                    continue
+                hit = self._doc_to_search_hit(dict(doc), distance=distance)
+                if hit is None:
+                    continue
+                if not self._hit_passes_filters(
+                    hit, filt, kinds=kinds, doc_kind=doc["kind"]
+                ):
+                    continue
+                out.append(hit)
+                if len(out) >= limit:
+                    return out
+            if len(pairs) < k_pool or k_pool >= max_pool:
+                break
+            k_pool = min(k_pool * 2, max_pool)
+        return out
 
     def _doc_to_search_hit(
         self, doc: dict[str, Any], *, distance: float
@@ -2093,12 +2086,27 @@ class SqliteRepository:
         meta_key = "whats_new_watermark" + (f":{workspace}" if workspace else "")
         if not since:
             since = self._read_whats_new_cursor(meta_key, watermark_store)
+        # Cursor: ``first_seen`` or ``first_seen|channel_id|ts`` (tie-broken).
+        cur_fs, cur_ch, cur_ts = self._parse_whats_new_cursor(since)
         lim = min(limit, 200)
-        sql = """
-            SELECT * FROM messages
-            WHERE first_seen >= ? AND deleted_state='none'
-        """
-        params: list[Any] = [since]
+        if cur_ch and cur_ts:
+            # Exclusive after the last fully delivered row (no replay on ties).
+            sql = """
+                SELECT * FROM messages
+                WHERE deleted_state='none'
+                  AND (
+                    first_seen > ?
+                    OR (first_seen = ? AND channel_id > ?)
+                    OR (first_seen = ? AND channel_id = ? AND ts > ?)
+                  )
+            """
+            params: list[Any] = [cur_fs, cur_fs, cur_ch, cur_fs, cur_ch, cur_ts]
+        else:
+            sql = """
+                SELECT * FROM messages
+                WHERE first_seen >= ? AND deleted_state='none'
+            """
+            params = [cur_fs]
         if workspace:
             sql += " AND workspace_key=?"
             params.append(workspace)
@@ -2114,13 +2122,9 @@ class SqliteRepository:
             grouped.setdefault(r["channel_id"], []).append(r)
         if page:
             last = page[-1]
-            # Opaque cursor: last fully delivered first_seen (stable for next page).
-            new_mark = str(last["first_seen"])
+            new_mark = f"{last['first_seen']}|{last['channel_id']}|{last['ts']}"
         else:
             new_mark = since
-        # Only advance when the page was fully consumed (no unread beyond LIMIT),
-        # or when empty (nothing new). If has_more, still advance to last delivered
-        # so the next call continues without replaying.
         if rows:
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
@@ -2130,6 +2134,13 @@ class SqliteRepository:
             "messages": rows,
             "by_channel": grouped,
         }
+
+    @staticmethod
+    def _parse_whats_new_cursor(since: str) -> tuple[str, str, str]:
+        parts = since.split("|", 2)
+        if len(parts) == 3 and parts[0] and parts[1] and parts[2]:
+            return parts[0], parts[1], parts[2]
+        return since, "", ""
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
         default = "1970-01-01T00:00:00Z"

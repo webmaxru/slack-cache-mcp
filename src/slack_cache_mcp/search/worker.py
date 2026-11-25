@@ -26,8 +26,8 @@ def embed_pending(
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Embed search_docs rows pending for the active model."""
-    if not ensure_docs_vec(repo._conn, dim=embedder.dim):  # noqa: SLF001
-        return {"ok": False, "error": "sqlite-vec unavailable", "embedded": 0}
+    # Prefer sqlite-vec when available; always have doc_embeddings fallback.
+    ensure_docs_vec(repo._conn, dim=embedder.dim)  # noqa: SLF001
 
     prev = repo._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='embedding_model'"
@@ -43,6 +43,8 @@ def embed_pending(
         )
         with contextlib.suppress(sqlite3.OperationalError):
             repo._conn.execute("DELETE FROM docs_vec")  # noqa: SLF001
+        with contextlib.suppress(sqlite3.OperationalError):
+            repo._conn.execute("DELETE FROM doc_embeddings")  # noqa: SLF001
         repo._conn.commit()  # noqa: SLF001
 
     sql = """
@@ -63,37 +65,54 @@ def embed_pending(
         vectors = embedder.embed_documents(texts)
         now = _utc_now()
         for j, r in enumerate(batch):
-            cur = repo._conn.execute(  # noqa: SLF001
-                "SELECT text_sha256 FROM search_docs WHERE doc_id=?",
-                (int(r["doc_id"]),),
-            ).fetchone()
-            if not cur or cur["text_sha256"] != r["text_sha256"]:
-                continue
-            ts_num = 0.0
-            if r["anchor_ts"]:
-                try:
-                    ts_num = float(r["anchor_ts"])
-                except ValueError:
-                    ts_num = 0.0
-            upsert_doc_embedding(
-                repo._conn,  # noqa: SLF001
-                doc_id=int(r["doc_id"]),
-                embedding=vectors[j],
-                workspace_key=r["workspace_key"],
-                channel_id=r["channel_id"],
-                ts_num=ts_num,
-                kind=r["kind"],
-            )
-            repo._conn.execute(  # noqa: SLF001
-                """
-                UPDATE search_docs
-                SET embedded_model=?, embedded_at=?
-                WHERE doc_id=? AND text_sha256=?
-                """,
-                (embedder.model_id, now, int(r["doc_id"]), r["text_sha256"]),
-            )
-            embedded += 1
-        repo._conn.commit()  # noqa: SLF001
+            # Hash check + vector upsert + status update under one write lock so a
+            # concurrent edit cannot leave a stale vector marked complete.
+            with contextlib.suppress(sqlite3.OperationalError):
+                # OperationalError if already inside a transaction.
+                repo._conn.execute("BEGIN IMMEDIATE")  # noqa: SLF001
+            try:
+                cur = repo._conn.execute(  # noqa: SLF001
+                    "SELECT text_sha256 FROM search_docs WHERE doc_id=?",
+                    (int(r["doc_id"]),),
+                ).fetchone()
+                if not cur or cur["text_sha256"] != r["text_sha256"]:
+                    repo._conn.execute("ROLLBACK")  # noqa: SLF001
+                    continue
+                ts_num = 0.0
+                if r["anchor_ts"]:
+                    try:
+                        ts_num = float(r["anchor_ts"])
+                    except ValueError:
+                        ts_num = 0.0
+                upsert_doc_embedding(
+                    repo._conn,  # noqa: SLF001
+                    doc_id=int(r["doc_id"]),
+                    embedding=vectors[j],
+                    workspace_key=r["workspace_key"],
+                    channel_id=r["channel_id"],
+                    ts_num=ts_num,
+                    kind=r["kind"],
+                    model_id=embedder.model_id,
+                )
+                updated = repo._conn.execute(  # noqa: SLF001
+                    """
+                    UPDATE search_docs
+                    SET embedded_model=?, embedded_at=?
+                    WHERE doc_id=? AND text_sha256=?
+                    """,
+                    (embedder.model_id, now, int(r["doc_id"]), r["text_sha256"]),
+                )
+                if updated.rowcount == 0:
+                    # Roll back the vector upsert so a concurrent edit cannot leave
+                    # a stale embedding marked complete for newer text.
+                    repo._conn.execute("ROLLBACK")  # noqa: SLF001
+                    continue
+                repo._conn.execute("COMMIT")  # noqa: SLF001
+                embedded += 1
+            except Exception:
+                with contextlib.suppress(sqlite3.Error):
+                    repo._conn.execute("ROLLBACK")  # noqa: SLF001
+                raise
 
     repo._conn.execute(  # noqa: SLF001
         """

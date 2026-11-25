@@ -87,25 +87,97 @@ def upsert_doc_embedding(
     channel_id: str | None,
     ts_num: float | None,
     kind: str,
+    model_id: str = "",
 ) -> None:
+    blob = embedding_to_bytes(embedding)
+    dim = int(np.asarray(embedding, dtype=np.float32).reshape(-1).shape[0])
+    # Always persist in doc_embeddings (portable fallback / primary on macOS).
+    conn.execute(
+        """
+        INSERT INTO doc_embeddings(doc_id, dim, embedding, model_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+          dim=excluded.dim,
+          embedding=excluded.embedding,
+          model_id=excluded.model_id
+        """,
+        (doc_id, dim, blob, model_id or ""),
+    )
     if not try_load_sqlite_vec(conn):
+        return
+    if not ensure_docs_vec(conn, dim=dim):
         return
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))
-    conn.execute(
-        """
-        INSERT INTO docs_vec(doc_id, embedding, workspace_key, channel_id, ts_num, kind)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            doc_id,
-            embedding_to_bytes(embedding),
-            workspace_key,
-            channel_id or "",
-            float(ts_num) if ts_num is not None else 0.0,
-            kind,
-        ),
-    )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            """
+            INSERT INTO docs_vec(doc_id, embedding, workspace_key, channel_id, ts_num, kind)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc_id,
+                blob,
+                workspace_key,
+                channel_id or "",
+                float(ts_num) if ts_num is not None else 0.0,
+                kind,
+            ),
+        )
+
+
+def knn_docs_numpy(
+    conn: sqlite3.Connection,
+    query_vec: np.ndarray,
+    *,
+    k: int = 100,
+    filters: dict[str, Any] | None = None,
+    kinds: list[str] | None = None,
+    model_id: str | None = None,
+) -> list[tuple[int, float]]:
+    """Cosine KNN over ``doc_embeddings`` (no extension required)."""
+    from slack_cache_mcp.search.embedder import cosine_similarity
+
+    filt = filters or {}
+    mid = model_id or filt.get("model_id")
+    sql = """
+        SELECT e.doc_id, e.embedding, d.kind, d.workspace_key, d.channel_id
+        FROM doc_embeddings e
+        JOIN search_docs d ON d.doc_id = e.doc_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if mid:
+        sql += " AND e.model_id=? AND d.embedded_model=?"
+        params.extend([mid, mid])
+    if filt.get("workspace_key"):
+        sql += " AND d.workspace_key=?"
+        params.append(filt["workspace_key"])
+    if filt.get("channel_ids"):
+        ids = list(filt["channel_ids"])
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        sql += f" AND d.channel_id IN ({placeholders})"
+        params.extend(ids)
+    if kinds and len(kinds) == 1:
+        sql += " AND d.kind=?"
+        params.append(kinds[0])
+    elif filt.get("kind"):
+        sql += " AND d.kind=?"
+        params.append(filt["kind"])
+    rows = conn.execute(sql, params).fetchall()
+    q = np.asarray(query_vec, dtype=np.float32)
+    scored: list[tuple[int, float]] = []
+    for r in rows:
+        if kinds and r["kind"] not in kinds:
+            continue
+        emb = np.frombuffer(r["embedding"], dtype=np.float32)
+        sim = cosine_similarity(q, emb)
+        # distance = 1 - cosine (matches docs_vec cosine distance convention)
+        scored.append((int(r["doc_id"]), 1.0 - sim))
+    scored.sort(key=lambda x: x[1])
+    return scored[:k]
 
 
 def knn_docs(

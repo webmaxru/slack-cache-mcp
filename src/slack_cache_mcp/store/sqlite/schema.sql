@@ -378,3 +378,12 @@ CREATE INDEX IF NOT EXISTS search_docs_pending
   ON search_docs(embedded_model) WHERE embedded_model IS NULL;
 CREATE INDEX IF NOT EXISTS search_docs_channel
   ON search_docs(channel_id, anchor_ts);
+
+-- Always-available embedding store (numpy KNN fallback when sqlite-vec cannot load,
+-- e.g. macOS Python builds without enable_load_extension).
+CREATE TABLE IF NOT EXISTS doc_embeddings (
+  doc_id INTEGER PRIMARY KEY,
+  dim INTEGER NOT NULL,
+  embedding BLOB NOT NULL,
+  model_id TEXT NOT NULL
+) STRICT;

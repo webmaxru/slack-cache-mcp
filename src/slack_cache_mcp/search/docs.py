@@ -134,6 +134,10 @@ class SearchDocsBuilder:
                 self.repo._conn.execute(  # noqa: SLF001
                     f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
                 )
+            with contextlib.suppress(Exception):
+                self.repo._conn.execute(  # noqa: SLF001
+                    f"DELETE FROM doc_embeddings WHERE doc_id IN ({placeholders})", ids
+                )
         self.repo._conn.execute(  # noqa: SLF001
             "DELETE FROM search_docs WHERE kind=?", (kind,)
         )
@@ -155,9 +159,101 @@ class SearchDocsBuilder:
                 self.repo._conn.execute(  # noqa: SLF001
                     f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
                 )
+            with contextlib.suppress(Exception):
+                self.repo._conn.execute(  # noqa: SLF001
+                    f"DELETE FROM doc_embeddings WHERE doc_id IN ({placeholders})", ids
+                )
             self.repo._conn.execute(  # noqa: SLF001
                 f"DELETE FROM search_docs WHERE doc_id IN ({placeholders})", ids
             )
+
+    def refresh_aggregates(self, channel_id: str, thread_ts: str) -> None:
+        """Invalidate then rebuild thread + channel window docs (daemon path)."""
+        self.invalidate_aggregates(channel_id, thread_ts)
+        self._upsert_thread_doc(channel_id, thread_ts)
+        self._rebuild_windows_for_channel(channel_id)
+
+    def _upsert_thread_doc(self, channel_id: str, thread_ts: str) -> None:
+        msgs = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT * FROM messages
+            WHERE channel_id=? AND (ts=? OR thread_ts=?) AND deleted_state='none'
+            ORDER BY ts_num ASC
+            """,
+            (channel_id, thread_ts, thread_ts),
+        ).fetchall()
+        if not msgs:
+            return
+        parts: list[str] = []
+        total = 0
+        for m in msgs:
+            chunk = f"{m['user_id'] or '?'}: {m['search_text'] or m['text']}"
+            if total + len(chunk) > THREAD_MAX_CHARS and parts:
+                break
+            parts.append(chunk)
+            total += len(chunk) + 1
+        text = "\n".join(parts)
+        self.repo.upsert_search_doc(
+            kind="thread",
+            workspace_key=msgs[0]["workspace_key"],
+            channel_id=channel_id,
+            anchor_ts=thread_ts,
+            start_ts=msgs[0]["ts"],
+            end_ts=msgs[-1]["ts"],
+            text=text,
+        )
+
+    def _rebuild_windows_for_channel(self, channel_id: str) -> None:
+        ch = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT DISTINCT channel_id, workspace_key FROM messages
+            WHERE channel_id=? AND deleted_state='none'
+            """,
+            (channel_id,),
+        ).fetchone()
+        if not ch:
+            return
+        # Drop existing window docs for this channel (already done in invalidate
+        # when kind='window'; still clear any leftover).
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT doc_id FROM search_docs WHERE channel_id=? AND kind='window'",
+            (channel_id,),
+        ).fetchall()
+        ids = [int(r["doc_id"]) for r in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            with contextlib.suppress(Exception):
+                self.repo._conn.execute(  # noqa: SLF001
+                    f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
+                )
+            with contextlib.suppress(Exception):
+                self.repo._conn.execute(  # noqa: SLF001
+                    f"DELETE FROM doc_embeddings WHERE doc_id IN ({placeholders})", ids
+                )
+            self.repo._conn.execute(  # noqa: SLF001
+                f"DELETE FROM search_docs WHERE doc_id IN ({placeholders})", ids
+            )
+        msgs = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT * FROM messages
+            WHERE channel_id=? AND deleted_state='none'
+              AND (thread_ts IS NULL OR thread_ts=ts)
+            ORDER BY ts_num ASC
+            """,
+            (channel_id,),
+        ).fetchall()
+        bucket: list[Any] = []
+        for m in msgs:
+            if bucket:
+                prev_ts = float(bucket[-1]["ts_num"])
+                gap = float(m["ts_num"]) - prev_ts
+                size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
+                if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
+                    self._flush_window(ch["workspace_key"], channel_id, bucket)
+                    bucket = []
+            bucket.append(m)
+        if bucket:
+            self._flush_window(ch["workspace_key"], channel_id, bucket)
 
     def rebuild_thread_docs(self) -> int:
         self._delete_kind("thread")

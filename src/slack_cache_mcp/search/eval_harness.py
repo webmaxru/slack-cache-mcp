@@ -399,7 +399,8 @@ def run_private_eval(archive_db: Any, private_path: Any) -> dict[str, Any]:
         return {"ok": False, "error": "no labelled queries", "private_queries": 0}
     if not Path(archive_db).exists():
         return {"ok": False, "error": "archive.db missing", "private_queries": len(queries)}
-    repo = SqliteRepository(Path(archive_db), read_only=True)
+    # Writable: run_eval rebuilds search_docs and writes embeddings.
+    repo = SqliteRepository(Path(archive_db), read_only=False)
     try:
         metrics = run_eval(repo, queries=queries)
     finally:

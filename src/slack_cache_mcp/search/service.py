@@ -272,6 +272,7 @@ class SearchService:
             limit=limit,
             filters=filters,
             kinds=["message", "thread", "window"],
+            model_id=self.embedder.model_id,
         )
 
 

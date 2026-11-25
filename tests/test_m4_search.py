@@ -16,7 +16,7 @@ from slack_cache_mcp.search.hybrid import collapse_threads, fuse_rrf
 from slack_cache_mcp.search.service import SearchService
 from slack_cache_mcp.search.worker import embed_pending
 from slack_cache_mcp.store.sqlite.repo import SCHEMA_VERSION, SqliteRepository
-from slack_cache_mcp.store.sqlite.vec import ensure_docs_vec, try_load_sqlite_vec
+from slack_cache_mcp.store.sqlite.vec import try_load_sqlite_vec
 from tests.fixture_gen.build_profile import build_synthetic_profile
 
 
@@ -40,8 +40,9 @@ def test_schema_v4_search_docs(archive: SqliteRepository) -> None:
         ).fetchall()
     }
     assert "search_docs" in tables
-    assert try_load_sqlite_vec(archive._conn)  # noqa: SLF001
-    assert ensure_docs_vec(archive._conn)  # noqa: SLF001
+    assert "doc_embeddings" in tables
+    # sqlite-vec may be unavailable (macOS Python without load_extension).
+    _ = try_load_sqlite_vec(archive._conn)  # noqa: SLF001
 
 
 def test_hashing_embedder_deterministic() -> None:
@@ -50,6 +51,12 @@ def test_hashing_embedder_deterministic() -> None:
     b = emb.embed_documents(["hello widgets"])[0]
     assert a.shape == (64,)
     assert np.allclose(a, b)
+
+
+def test_hashing_embedder_unicode() -> None:
+    emb = HashingEmbedder(dim=64)
+    v = emb.embed_query("東京 привет")
+    assert float(np.linalg.norm(v)) > 0.1
 
 
 def test_rrf_and_collapse() -> None:
@@ -79,12 +86,18 @@ def test_hybrid_search_after_embed(archive: SqliteRepository) -> None:
     result = embed_pending(archive, emb)
     assert result["ok"]
     assert result["embedded"] > 0
+    # Portable store always populated even without sqlite-vec.
+    n = archive._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) AS c FROM doc_embeddings"
+    ).fetchone()["c"]
+    assert n > 0
     svc = SearchService(archive, embedder=emb)
     hits = svc.search_messages(query="widgets", mode="hybrid", limit=5)
     assert hits["mode"] == "hybrid"
     assert hits["results"]
     sem = svc.search_messages(query="widgets", mode="semantic", limit=5)
     assert sem["mode"] == "semantic"
+    assert sem["results"]
 
 
 def test_list_threads_and_whats_new(archive: SqliteRepository) -> None:
@@ -106,6 +119,7 @@ def test_eval_hybrid_beats_lexical(tmp_path: Path) -> None:
 def test_bench_p95_small(tmp_path: Path) -> None:
     repo = SqliteRepository(tmp_path / "bench.db")
     result = bench_hybrid_latency(repo, n_messages=800, n_queries=20, embed_limit=800)
+    assert result.get("ok") is True
     assert result["pass_p95_under_300ms"] is True
     repo.close()
 

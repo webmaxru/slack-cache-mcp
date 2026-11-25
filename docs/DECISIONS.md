@@ -78,7 +78,7 @@ Production path: fastembed ONNX `sentence-transformers/paraphrase-multilingual-M
 `slack_cache_mcp.embeddings` is outside the offline import-linter source set (same idea as `sync/`): it may depend on fastembed/httpx transitively. `search/` and `mcp_server/` only use the `Embedder` protocol + `HashingEmbedder`. CLI/daemon inject the concrete backend.
 
 ### sqlite-vec
-Load via `sqlite_vec.load(conn)` when `enable_load_extension` works. `docs_vec` is created at runtime (dimension from the active embedder). Brute-force cosine fallback exists for tiny corpora if KNN returns empty.
+Load via `sqlite_vec.load(conn)` when `enable_load_extension` works. `docs_vec` is created at runtime (dimension from the active embedder). Always also write float32 BLOBs to `doc_embeddings` and use numpy cosine KNN when sqlite-vec cannot load (common on macOS Python builds without `enable_load_extension`).
 
 ### Eval harness
 CI uses `HashingEmbedder` with planted synonym groups so paraphrase queries prove hybrid ≥ lexical + 10% relative on a synthetic labelled set. Latency bench defaults to a few thousand messages in CI; `slackcache eval --bench --bench-n 200000` is the PLAN laptop check.
