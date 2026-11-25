@@ -1,0 +1,273 @@
+"""Build retrieval units (message / thread / window / canvas / file) for embeddings."""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, datetime
+from typing import Any
+
+from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+WINDOW_GAP_S = 15 * 60
+WINDOW_MAX_CHARS = 1600
+THREAD_MAX_CHARS = 1600
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fmt_ts(ts: str) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=UTC)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ts
+
+
+def format_message_doc(
+    *,
+    channel_name: str | None,
+    workspace_key: str,
+    author: str | None,
+    ts: str,
+    text: str,
+    thread_parent_preview: str | None = None,
+) -> str:
+    chan = channel_name or "?"
+    who = author or "unknown"
+    body = f"[#{chan} | {workspace_key}] {who} ({_fmt_ts(ts)}): {text}"
+    if thread_parent_preview:
+        preview = thread_parent_preview[:200]
+        body += f" (reply in thread: {preview})"
+    return body
+
+
+class SearchDocsBuilder:
+    """Materialize ``search_docs`` rows from archive tables (no embedding yet)."""
+
+    def __init__(self, repo: SqliteRepository) -> None:
+        self.repo = repo
+
+    def rebuild_all(self) -> dict[str, int]:
+        counts = {
+            "message": self.rebuild_message_docs(),
+            "thread": self.rebuild_thread_docs(),
+            "window": self.rebuild_window_docs(),
+            "canvas": self.rebuild_canvas_docs(),
+            "file": self.rebuild_file_docs(),
+        }
+        return counts
+
+    def upsert_message_doc(self, channel_id: str, ts: str) -> int | None:
+        row = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT * FROM messages WHERE channel_id=? AND ts=?",
+            (channel_id, ts),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._upsert_from_message_row(dict(row))
+
+    def rebuild_message_docs(self) -> int:
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT * FROM messages WHERE deleted_state='none'"
+        ).fetchall()
+        n = 0
+        for r in rows:
+            if self._upsert_from_message_row(dict(r)) is not None:
+                n += 1
+        self.repo._conn.commit()  # noqa: SLF001
+        return n
+
+    def _upsert_from_message_row(self, m: dict[str, Any]) -> int | None:
+        channel_id = m["channel_id"]
+        ts = m["ts"]
+        chan = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT name FROM channels WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        author = None
+        if m.get("user_id"):
+            u = self.repo._conn.execute(  # noqa: SLF001
+                "SELECT display_name, name, real_name FROM users WHERE user_id=?",
+                (m["user_id"],),
+            ).fetchone()
+            if u:
+                author = u["display_name"] or u["name"] or u["real_name"] or m["user_id"]
+            else:
+                author = m["user_id"]
+        parent_preview = None
+        if m.get("thread_ts") and m["thread_ts"] != ts:
+            parent = self.repo._conn.execute(  # noqa: SLF001
+                "SELECT text FROM messages WHERE channel_id=? AND ts=?",
+                (channel_id, m["thread_ts"]),
+            ).fetchone()
+            if parent:
+                parent_preview = parent["text"]
+        text = format_message_doc(
+            channel_name=chan["name"] if chan else None,
+            workspace_key=m["workspace_key"],
+            author=author,
+            ts=ts,
+            text=m.get("search_text") or m.get("text") or "",
+            thread_parent_preview=parent_preview,
+        )
+        return self.repo.upsert_search_doc(
+            kind="message",
+            workspace_key=m["workspace_key"],
+            channel_id=channel_id,
+            anchor_ts=ts,
+            start_ts=ts,
+            end_ts=ts,
+            text=text,
+            message_rowid=m.get("rowid"),
+        )
+
+    def rebuild_thread_docs(self) -> int:
+        self.repo._conn.execute(  # noqa: SLF001
+            "DELETE FROM search_docs WHERE kind='thread'"
+        )
+        threads = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT channel_id, thread_ts FROM messages
+            WHERE thread_ts IS NOT NULL AND deleted_state='none'
+            GROUP BY channel_id, thread_ts
+            """
+        ).fetchall()
+        n = 0
+        for t in threads:
+            msgs = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT * FROM messages
+                WHERE channel_id=? AND (ts=? OR thread_ts=?) AND deleted_state='none'
+                ORDER BY ts_num ASC
+                """,
+                (t["channel_id"], t["thread_ts"], t["thread_ts"]),
+            ).fetchall()
+            if not msgs:
+                continue
+            parts: list[str] = []
+            total = 0
+            for m in msgs:
+                chunk = f"{m['user_id'] or '?'}: {m['search_text'] or m['text']}"
+                if total + len(chunk) > THREAD_MAX_CHARS and parts:
+                    break
+                parts.append(chunk)
+                total += len(chunk) + 1
+            text = "\n".join(parts)
+            ws = msgs[0]["workspace_key"]
+            self.repo.upsert_search_doc(
+                kind="thread",
+                workspace_key=ws,
+                channel_id=t["channel_id"],
+                anchor_ts=t["thread_ts"],
+                start_ts=msgs[0]["ts"],
+                end_ts=msgs[-1]["ts"],
+                text=text,
+            )
+            n += 1
+        self.repo._conn.commit()  # noqa: SLF001
+        return n
+
+    def rebuild_window_docs(self) -> int:
+        self.repo._conn.execute(  # noqa: SLF001
+            "DELETE FROM search_docs WHERE kind='window'"
+        )
+        channels = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT DISTINCT channel_id, workspace_key FROM messages WHERE deleted_state='none'"
+        ).fetchall()
+        n = 0
+        for ch in channels:
+            msgs = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT * FROM messages
+                WHERE channel_id=? AND deleted_state='none'
+                  AND (thread_ts IS NULL OR thread_ts=ts)
+                ORDER BY ts_num ASC
+                """,
+                (ch["channel_id"],),
+            ).fetchall()
+            if not msgs:
+                continue
+            bucket: list[Any] = []
+            for m in msgs:
+                if bucket:
+                    prev_ts = float(bucket[-1]["ts_num"])
+                    gap = float(m["ts_num"]) - prev_ts
+                    size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
+                    if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
+                        n += self._flush_window(ch["workspace_key"], ch["channel_id"], bucket)
+                        bucket = []
+                bucket.append(m)
+            if bucket:
+                n += self._flush_window(ch["workspace_key"], ch["channel_id"], bucket)
+        self.repo._conn.commit()  # noqa: SLF001
+        return n
+
+    def _flush_window(self, workspace_key: str, channel_id: str, msgs: list[Any]) -> int:
+        text = "\n".join(f"{m['user_id'] or '?'}: {m['search_text'] or m['text']}" for m in msgs)
+        self.repo.upsert_search_doc(
+            kind="window",
+            workspace_key=workspace_key,
+            channel_id=channel_id,
+            anchor_ts=msgs[0]["ts"],
+            start_ts=msgs[0]["ts"],
+            end_ts=msgs[-1]["ts"],
+            text=text[: WINDOW_MAX_CHARS * 2],
+        )
+        return 1
+
+    def rebuild_canvas_docs(self) -> int:
+        self.repo._conn.execute("DELETE FROM search_docs WHERE kind='canvas'")  # noqa: SLF001
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT * FROM canvases"
+        ).fetchall()
+        n = 0
+        for r in rows:
+            title = r["title"] or ""
+            body = r["text"] or ""
+            text = f"{title}\n{body}".strip()
+            if not text:
+                continue
+            self.repo.upsert_search_doc(
+                kind="canvas",
+                workspace_key=r["workspace_key"] or "unknown",
+                channel_id=r["channel_id"],
+                anchor_ts=r["canvas_id"],
+                start_ts=None,
+                end_ts=None,
+                text=text,
+            )
+            n += 1
+        self.repo._conn.commit()  # noqa: SLF001
+        return n
+
+    def rebuild_file_docs(self) -> int:
+        self.repo._conn.execute("DELETE FROM search_docs WHERE kind='file'")  # noqa: SLF001
+        rows = self.repo._conn.execute("SELECT * FROM files").fetchall()  # noqa: SLF001
+        n = 0
+        for r in rows:
+            parts = [
+                p
+                for p in (
+                    r["title"],
+                    r["name"],
+                    r["preview_text"],
+                    r["ocr_text"],
+                )
+                if p
+            ]
+            text = "\n".join(parts).strip()
+            if not text:
+                continue
+            self.repo.upsert_search_doc(
+                kind="file",
+                workspace_key=r["workspace_key"] or "unknown",
+                channel_id=None,
+                anchor_ts=r["file_id"],
+                start_ts=None,
+                end_ts=None,
+                text=text,
+            )
+            n += 1
+        self.repo._conn.commit()  # noqa: SLF001
+        return n

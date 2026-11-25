@@ -1,9 +1,11 @@
-"""Search service over ArchiveRepository."""
+"""Search service over ArchiveRepository (lexical + semantic hybrid)."""
 
 from __future__ import annotations
 
 from typing import Any
 
+from slack_cache_mcp.search.embedder import HashingEmbedder
+from slack_cache_mcp.search.hybrid import collapse_threads, diversify_mmr, fuse_rrf
 from slack_cache_mcp.search.query import (
     fts_match_from_terms,
     parse_query,
@@ -12,10 +14,20 @@ from slack_cache_mcp.search.query import (
 )
 from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
+try:
+    from slack_cache_mcp.search.embedder import Embedder
+except ImportError:  # pragma: no cover
+    Embedder = Any  # type: ignore[misc, assignment]
+
 
 class SearchService:
-    def __init__(self, repo: SqliteRepository) -> None:
+    def __init__(
+        self,
+        repo: SqliteRepository,
+        embedder: Embedder | None = None,
+    ) -> None:
         self.repo = repo
+        self.embedder: Embedder = embedder or HashingEmbedder()
 
     def _resolve_channel_ids(self, values: list[str]) -> list[str]:
         ids: list[str] = []
@@ -23,7 +35,6 @@ class SearchService:
             v = raw.strip()
             if not v:
                 continue
-            # Bare channel/user IDs pass through; names and @user go through resolve.
             if re_looks_like_channel_id(v):
                 ids.append(v)
                 continue
@@ -50,34 +61,18 @@ class SearchService:
             ids.append(user_hits[0]["id"])
         return ids
 
-    def search_messages(
+    def _build_filters(
         self,
+        parsed: Any,
         *,
-        query: str,
-        mode: str = "lexical",
-        limit: int = 10,
-        include_deleted: bool = False,
-        workspace: str | None = None,
-        channels: list[str] | None = None,
-        users: list[str] | None = None,
-        after: str | None = None,
-        before: str | None = None,
-        context: str = "none",
-        context_size: int = 3,
+        include_deleted: bool,
+        workspace: str | None,
+        channels: list[str] | None,
+        users: list[str] | None,
+        after: str | None,
+        before: str | None,
     ) -> dict[str, Any]:
-        parsed = parse_query(query)
-        bad = unsupported_operators(parsed)
-        if bad:
-            raise ValueError(
-                "Unsupported search operators: "
-                + ", ".join(bad)
-                + " (supported: in, from, before, after, on, has:file|link, is:thread|deleted, workspace)"
-            )
-
         filters: dict[str, Any] = {}
-        notes: list[str] = []
-
-        # Deletion policy
         is_vals = [str(x).lower() for x in (parsed.filters.get("is") or [])]
         if "deleted" in is_vals:
             filters["deleted_mode"] = "only"
@@ -92,20 +87,23 @@ class SearchService:
         if ws:
             filters["workspace_key"] = ws
 
-        # Time bounds (convert calendar dates to unix ts)
         after_v = after or parsed.filters.get("after")
         before_v = before or parsed.filters.get("before")
         on_v = parsed.filters.get("on")
+        during_v = parsed.filters.get("during")
         if on_v:
             filters["after"] = parse_time_bound(on_v, end=False)
             filters["before"] = parse_time_bound(on_v, end=True)
+        elif during_v:
+            # during:YYYY-MM or during:YYYY-MM-DD..YYYY-MM-DD
+            filters["after"] = parse_time_bound(str(during_v), end=False)
+            filters["before"] = parse_time_bound(str(during_v), end=True)
         else:
             if after_v:
                 filters["after"] = parse_time_bound(str(after_v), end=False)
             if before_v:
                 filters["before"] = parse_time_bound(str(before_v), end=False)
 
-        # Channel / user filters — resolve every entry; never silently widen.
         channel_vals: list[str] = list(channels or [])
         if parsed.filters.get("in"):
             channel_vals.append(str(parsed.filters["in"]))
@@ -118,65 +116,147 @@ class SearchService:
         if user_vals:
             filters["user_ids"] = self._resolve_user_ids(user_vals)
 
+        if parsed.filters.get("with"):
+            # Participant filter: treat as user_id presence in thread — approx via from.
+            with_ids = self._resolve_user_ids([str(parsed.filters["with"])])
+            filters.setdefault("user_ids", [])
+            for uid in with_ids:
+                if uid not in filters["user_ids"]:
+                    filters["user_ids"].append(uid)
+
         for h in parsed.filters.get("has") or []:
             if h == "file":
                 filters["has_files"] = True
             elif h == "link":
                 filters["has_links"] = True
+            elif h == "reaction":
+                filters["has_reaction"] = True
 
         if "thread" in is_vals:
             filters["is_thread"] = True
+        if "reply" in is_vals:
+            filters["is_reply"] = True
+        if "edited" in is_vals:
+            filters["is_edited"] = True
+        return filters
 
-        note = None
-        effective_mode = mode
-        if mode == "hybrid":
-            effective_mode = "lexical"
-            notes.append("hybrid mode returns lexical results until embeddings (M4)")
+    def search_messages(
+        self,
+        *,
+        query: str,
+        mode: str = "hybrid",
+        limit: int = 10,
+        include_deleted: bool = False,
+        workspace: str | None = None,
+        channels: list[str] | None = None,
+        users: list[str] | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        context: str = "none",
+        context_size: int = 3,
+        sort: str = "relevance",
+    ) -> dict[str, Any]:
+        parsed = parse_query(query)
+        bad = unsupported_operators(parsed)
+        if bad:
+            raise ValueError(
+                "Unsupported search operators: "
+                + ", ".join(bad)
+                + " (supported: in, from, with, before, after, on, during, "
+                "has:file|link|reaction, is:thread|reply|edited|deleted, workspace)"
+            )
+
+        filters = self._build_filters(
+            parsed,
+            include_deleted=include_deleted,
+            workspace=workspace,
+            channels=channels,
+            users=users,
+            after=after,
+            before=before,
+        )
 
         free = parsed.free_text.strip()
+        candidate_limit = max(limit * 10, 100)
+
         if not free:
-            # Operator-only / filter-only query — do not feed operators into FTS.
-            hits = self.repo.search_filtered(limit=limit, filters=filters)
-        elif effective_mode == "exact":
-            hits = self.repo.search_trigram(free, limit=limit, filters=filters)
+            hits = self.repo.search_filtered(limit=candidate_limit, filters=filters)
+            effective_mode = "filter"
+            fused = hits
+        elif mode == "exact":
+            fused = self.repo.search_trigram(free, limit=candidate_limit, filters=filters)
+            effective_mode = "exact"
+        elif mode == "semantic":
+            fused = self._semantic(free, limit=candidate_limit, filters=filters)
+            effective_mode = "semantic"
+        elif mode in {"lexical", "phrase", "any", "all"}:
+            fused = self._lexical(free, mode=mode, limit=candidate_limit, filters=filters)
+            effective_mode = mode if mode != "all" else "lexical"
         else:
-            fts_mode = "phrase" if effective_mode == "phrase" else "all"
-            if effective_mode == "any":
-                fts_mode = "any"
-            match = fts_match_from_terms(free, fts_mode)
-            hits = self.repo.search_fts(match, limit=limit, filters=filters)
+            # hybrid (default)
+            lex = self._lexical(free, mode="all", limit=candidate_limit, filters=filters)
+            vec = self._semantic(free, limit=candidate_limit, filters=filters)
+            fused = fuse_rrf(lex, vec)
+            effective_mode = "hybrid"
 
-        # Thread collapse: keep best hit per (channel, thread root)
-        collapsed: list[dict[str, Any]] = []
-        seen_threads: set[tuple[str, str]] = set()
-        for h in hits:
-            root = h.get("thread_ts") or h["ts"]
-            key = (h["channel_id"], root)
-            if key in seen_threads:
-                continue
-            seen_threads.add(key)
-            if context == "thread" and h.get("thread_ts"):
+        if sort == "newest":
+            fused = sorted(fused, key=lambda h: float(h.get("ts") or 0), reverse=True)
+        elif sort == "oldest":
+            fused = sorted(fused, key=lambda h: float(h.get("ts") or 0))
+
+        collapsed = collapse_threads(fused)
+        diversified = diversify_mmr(collapsed, limit=limit)
+
+        results: list[dict[str, Any]] = []
+        for h in diversified:
+            item = dict(h)
+            if context == "thread" and item.get("thread_ts"):
                 thr = self.repo.get_thread(
-                    h["channel_id"], h["thread_ts"] or h["ts"], limit=context_size
+                    item["channel_id"], item["thread_ts"] or item["ts"], limit=context_size
                 )
-                h = {**h, "context": thr}
-            elif context == "window":
-                h = {
-                    **h,
-                    "context": self.repo.get_context(
-                        h["channel_id"], h["ts"], before=context_size, after=context_size
-                    ),
-                }
-            collapsed.append(h)
+                item["context"] = thr
+            elif context == "window" and item.get("channel_id") and item.get("ts"):
+                item["context"] = self.repo.get_context(
+                    item["channel_id"], item["ts"], before=context_size, after=context_size
+                )
+            results.append(item)
 
-        if notes:
-            note = "; ".join(notes)
         return {
-            "results": collapsed,
-            "mode": effective_mode if free else "filter",
-            "coverage_note": note,
+            "results": results,
+            "mode": effective_mode,
+            "coverage_note": None,
             "next_cursor": None,
+            "embedder": self.embedder.model_id,
         }
+
+    def _lexical(
+        self,
+        free: str,
+        *,
+        mode: str,
+        limit: int,
+        filters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        fts_mode = "phrase" if mode == "phrase" else "all"
+        if mode == "any":
+            fts_mode = "any"
+        match = fts_match_from_terms(free, fts_mode)
+        return self.repo.search_fts(match, limit=limit, filters=filters)
+
+    def _semantic(
+        self,
+        free: str,
+        *,
+        limit: int,
+        filters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        qvec = self.embedder.embed_query(free)
+        return self.repo.search_vector(
+            qvec,
+            limit=limit,
+            filters=filters,
+            kinds=["message", "thread", "window"],
+        )
 
 
 def re_looks_like_channel_id(v: str) -> bool:
