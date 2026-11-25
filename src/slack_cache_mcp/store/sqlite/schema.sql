@@ -355,3 +355,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_trigram USING fts5(
   contentless_delete=1,
   tokenize='trigram'
 );
+
+-- M4 search units (embeddings). docs_vec is created at runtime via sqlite-vec
+-- once the extension loads (dimension comes from the configured model).
+CREATE TABLE IF NOT EXISTS search_docs (
+  doc_id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  workspace_key TEXT NOT NULL,
+  channel_id TEXT,
+  anchor_ts TEXT,
+  start_ts TEXT,
+  end_ts TEXT,
+  text TEXT NOT NULL,
+  text_sha256 TEXT NOT NULL,
+  embedded_model TEXT,
+  embedded_at TEXT,
+  message_rowid INTEGER,
+  UNIQUE (kind, workspace_key, channel_id, anchor_ts, start_ts, end_ts)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS search_docs_pending
+  ON search_docs(embedded_model) WHERE embedded_model IS NULL;
+CREATE INDEX IF NOT EXISTS search_docs_channel
+  ON search_docs(channel_id, anchor_ts);
