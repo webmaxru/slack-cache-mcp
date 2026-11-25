@@ -361,14 +361,25 @@ def bench_hybrid_latency(
     }
 
 
-def run_private_eval(archive_db: Any, private_path: Any) -> dict[str, Any]:
-    """Evaluate private.jsonl labelled queries; never echo query/ref text."""
+def run_private_eval(
+    archive_db: Any,
+    private_path: Any,
+    *,
+    models_dir: Any | None = None,
+) -> dict[str, Any]:
+    """Evaluate private.jsonl against a consistent snapshot of the live index.
+
+    Uses SQLite's backup API (not a raw file/WAL copy) and the active production
+    embedder so metrics reflect the deployed model without mutating the archive.
+    Never echoes query/ref text.
+    """
+    import sqlite3
+    import tempfile
     from pathlib import Path
 
     path = Path(private_path)
     if not path.is_file():
         return {"ok": False, "error": "private.jsonl not found"}
-    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
     queries: list[EvalQuery] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -397,34 +408,83 @@ def run_private_eval(archive_db: Any, private_path: Any) -> dict[str, Any]:
             queries.append(EvalQuery(query=q, relevant=pairs))
     if not queries:
         return {"ok": False, "error": "no labelled queries", "private_queries": 0}
-    if not Path(archive_db).exists():
+    src_path = Path(archive_db)
+    if not src_path.exists():
         return {"ok": False, "error": "archive.db missing", "private_queries": len(queries)}
-    # Isolated copy so HashingEmbedder eval never overwrites the live index.
-    import shutil
-    import tempfile
 
-    src = Path(archive_db)
+    import shutil
+
+    from slack_cache_mcp.embeddings.factory import load_embedder
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="slackcache-private-eval-"))
     tmp_db = tmp_dir / "archive.db"
+    result: dict[str, Any] = {
+        "ok": False,
+        "private_queries": len(queries),
+    }
     try:
-        shutil.copy2(src, tmp_db)
-        for suffix in ("-wal", "-shm"):
-            side = Path(str(src) + suffix)
-            if side.exists():
-                shutil.copy2(side, Path(str(tmp_db) + suffix))
+        src = sqlite3.connect(f"file:{src_path.as_posix()}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(str(tmp_db))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
         repo = SqliteRepository(tmp_db, read_only=False)
         try:
-            metrics = run_eval(repo, queries=queries)
+            embedder = load_embedder(
+                models_dir=Path(models_dir) if models_dir else None
+            )
+            svc = SearchService(repo, embedder=embedder)
+            k_ndcg, k_recall = 10, 20
+
+            def _metrics(mode: str) -> dict[str, float]:
+                ndcgs: list[float] = []
+                recalls: list[float] = []
+                mrrs: list[float] = []
+                for q in queries:
+                    hits = svc.search_messages(
+                        query=q.query, mode=mode, limit=max(k_recall, k_ndcg)
+                    )
+                    ranked = [(h["channel_id"], h["ts"]) for h in hits["results"]]
+                    ndcgs.append(ndcg_at_k(ranked, q.relevant, k_ndcg))
+                    recalls.append(recall_at_k(ranked, q.relevant, k_recall))
+                    mrrs.append(mrr(ranked, q.relevant))
+                n = max(len(queries), 1)
+                return {
+                    f"ndcg@{k_ndcg}": sum(ndcgs) / n,
+                    f"recall@{k_recall}": sum(recalls) / n,
+                    "mrr": sum(mrrs) / n,
+                }
+
+            lexical = _metrics("lexical")
+            hybrid = _metrics("hybrid")
+            lex_ndcg = lexical[f"ndcg@{k_ndcg}"]
+            hyb_ndcg = hybrid[f"ndcg@{k_ndcg}"]
+            if lex_ndcg <= 1e-9 and hyb_ndcg <= 1e-9:
+                relative = 0.0
+                passed = False
+            elif lex_ndcg <= 1e-9:
+                relative = float("inf")
+                passed = hyb_ndcg > 0
+            else:
+                relative = (hyb_ndcg - lex_ndcg) / lex_ndcg
+                passed = relative >= 0.10
+            result = {
+                "ok": True,
+                "private_queries": len(queries),
+                "embedder": embedder.model_id,
+                "lexical_ndcg": lexical.get("ndcg@10"),
+                "hybrid_ndcg": hybrid.get("ndcg@10"),
+                "hybrid_vs_lexical_ndcg_relative": relative,
+                "pass_hybrid_ge_lexical_plus_10pct": bool(passed),
+            }
         finally:
             repo.close()
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-    # Strip anything that could echo private query text.
-    return {
-        "ok": True,
-        "private_queries": len(queries),
-        "lexical_ndcg": metrics["lexical"].get("ndcg@10"),
-        "hybrid_ndcg": metrics["hybrid"].get("ndcg@10"),
-        "hybrid_vs_lexical_ndcg_relative": metrics["hybrid_vs_lexical_ndcg_relative"],
-        "pass_hybrid_ge_lexical_plus_10pct": metrics["pass_hybrid_ge_lexical_plus_10pct"],
-    }
+
+    return result

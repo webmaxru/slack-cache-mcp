@@ -36,27 +36,27 @@ def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     return True
 
 
-def _backfill_docs_vec_from_blobs(conn: sqlite3.Connection, *, dim: int) -> None:
-    """Copy portable ``doc_embeddings`` into ``docs_vec`` when the extension appears."""
+def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None:
+    """Keep ``docs_vec`` and ``doc_embeddings`` aligned for ``dim``."""
+    # Blobs missing from docs_vec (extension was down while embedding continued).
     try:
-        rows = conn.execute(
+        missing = conn.execute(
             """
             SELECT e.doc_id, e.embedding, d.workspace_key, d.channel_id, d.anchor_ts, d.kind
             FROM doc_embeddings e
             JOIN search_docs d ON d.doc_id = e.doc_id
             WHERE e.dim = ?
+              AND e.doc_id NOT IN (SELECT doc_id FROM docs_vec)
             """,
             (int(dim),),
         ).fetchall()
     except sqlite3.OperationalError:
-        return
-    for r in rows:
+        missing = []
+    for r in missing:
         ts_num = 0.0
         if r["anchor_ts"]:
             with contextlib.suppress(ValueError, TypeError):
                 ts_num = float(r["anchor_ts"])
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (int(r["doc_id"]),))
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(
                 """
@@ -72,6 +72,18 @@ def _backfill_docs_vec_from_blobs(conn: sqlite3.Connection, *, dim: int) -> None
                     r["kind"],
                 ),
             )
+    # Vector-only archives (no blobs): mark those docs pending so the worker
+    # re-embeds into both stores. sqlite-vec does not reliably expose blobs.
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            """
+            UPDATE search_docs
+            SET embedded_model=NULL, embedded_at=NULL
+            WHERE embedded_model IS NOT NULL
+              AND doc_id IN (SELECT doc_id FROM docs_vec)
+              AND doc_id NOT IN (SELECT doc_id FROM doc_embeddings)
+            """
+        )
 
 
 def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool:
@@ -85,25 +97,7 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         "SELECT value FROM meta WHERE key='embedding_dim'"
     ).fetchone()
     if row and meta_dim and int(meta_dim["value"]) == int(dim):
-        # Prefer docs_vec when populated; if empty but blobs exist, backfill so
-        # search does not prefer a hollow virtual table over portable vectors.
-        try:
-            vec_n = int(
-                conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[0]
-            )
-        except sqlite3.OperationalError:
-            vec_n = 0
-        try:
-            blob_n = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS c FROM doc_embeddings WHERE dim=?",
-                    (int(dim),),
-                ).fetchone()[0]
-            )
-        except sqlite3.OperationalError:
-            blob_n = 0
-        if vec_n == 0 and blob_n > 0:
-            _backfill_docs_vec_from_blobs(conn, dim=int(dim))
+        _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
         return True
     if row and (not meta_dim or int(meta_dim["value"]) != int(dim)):
         conn.execute("DROP TABLE IF EXISTS docs_vec")
@@ -132,7 +126,7 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         """,
         (str(int(dim)),),
     )
-    _backfill_docs_vec_from_blobs(conn, dim=int(dim))
+    _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
     return True
 
 
@@ -188,12 +182,15 @@ def knn_docs_numpy(
     conn: sqlite3.Connection,
     query_vec: np.ndarray,
     *,
-    k: int = 100,
+    k: int | None = 100,
     filters: dict[str, Any] | None = None,
     kinds: list[str] | None = None,
     model_id: str | None = None,
 ) -> list[tuple[int, float]]:
-    """Cosine KNN over ``doc_embeddings`` (no extension required)."""
+    """Cosine KNN over ``doc_embeddings`` (no extension required).
+
+    Pass ``k=None`` to rank the full filtered corpus (no artificial cap).
+    """
     from slack_cache_mcp.search.embedder import cosine_similarity
 
     filt = filters or {}
@@ -235,7 +232,9 @@ def knn_docs_numpy(
         # distance = 1 - cosine (matches docs_vec cosine distance convention)
         scored.append((int(r["doc_id"]), 1.0 - sim))
     scored.sort(key=lambda x: x[1])
-    return scored[:k]
+    if k is None:
+        return scored
+    return scored[: int(k)]
 
 
 def knn_docs(

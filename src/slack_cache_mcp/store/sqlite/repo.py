@@ -573,11 +573,15 @@ class SqliteRepository:
 
                         builder = SearchDocsBuilder(self)
                         builder.drop_message_doc(channel_id, ts)
+                        thread_root = row["thread_ts"] or ts
                         builder.refresh_aggregates(
-                            channel_id,
-                            row["thread_ts"] or ts,
-                            message_ts=ts,
+                            channel_id, thread_root, message_ts=ts
                         )
+                        # Root deletion must clear parent previews on reply docs.
+                        if thread_root == ts:
+                            builder.refresh_reply_docs_after_parent_change(
+                                channel_id, ts
+                            )
                     except Exception:
                         pass
         self._conn.commit()
@@ -1970,15 +1974,9 @@ class SqliteRepository:
             except sqlite3.OperationalError:
                 pass
 
-        # Expand the KNN pool until eligibility filters fill ``limit``.
-        # sqlite-vec caps k around 4096; beyond that fall through to numpy.
         out: list[dict[str, Any]] = []
         seen: set[int] = set()
         vec_k_max = 4096
-        k_pool = max(limit * 20, 200)
-        if use_vec:
-            k_pool = min(k_pool, vec_k_max)
-        max_pool = 50_000 if not use_vec else vec_k_max
 
         def _consume(pairs: list[tuple[int, float]]) -> None:
             for doc_id, distance in pairs:
@@ -2003,35 +2001,31 @@ class SqliteRepository:
                 if len(out) >= limit:
                     return
 
-        while True:
-            if use_vec:
+        if use_vec:
+            k_pool = min(max(limit * 20, 200), vec_k_max)
+            while True:
                 pairs = knn_docs(
-                    self._conn, query_vec, k=min(k_pool, vec_k_max), filters=filt
+                    self._conn, query_vec, k=k_pool, filters=filt
                 )
-            else:
-                pairs = knn_docs_numpy(
-                    self._conn,
-                    query_vec,
-                    k=k_pool,
-                    filters=filt,
-                    kinds=kinds,
-                    model_id=model_id,
-                )
-            before = len(out)
-            _consume(pairs)
+                _consume(pairs)
+                if len(out) >= limit:
+                    return out
+                if k_pool >= vec_k_max or len(pairs) < k_pool:
+                    break
+                k_pool = min(k_pool * 2, vec_k_max)
             if len(out) >= limit:
                 return out
-            if use_vec and (k_pool >= vec_k_max or len(pairs) < k_pool):
-                # Exhausted sqlite-vec; finish with portable numpy over blobs.
-                use_vec = False
-                k_pool = max(limit * 20, 200)
-                max_pool = 50_000
-                continue
-            if len(pairs) < k_pool or k_pool >= max_pool:
-                break
-            if len(out) == before and k_pool >= max_pool:
-                break
-            k_pool = min(k_pool * 2, max_pool)
+            # Exhausted sqlite-vec k; finish over the full portable blob corpus.
+        # Numpy ranks the entire filtered embedding set (no candidate cap).
+        pairs = knn_docs_numpy(
+            self._conn,
+            query_vec,
+            k=None,
+            filters=filt,
+            kinds=kinds,
+            model_id=model_id,
+        )
+        _consume(pairs)
         return out
 
     def _doc_to_search_hit(
@@ -2138,26 +2132,46 @@ class SqliteRepository:
         if not since:
             since = self._read_whats_new_cursor(meta_key, watermark_store)
         lim = min(limit, 200)
-        # Preferred cursor: integer ``rowid`` (stable insertion order).
-        # Legacy: ISO ``first_seen`` or ``first_seen|channel_id|ts``.
-        after_rowid = self._whats_new_after_rowid(since)
-        if after_rowid is not None:
+        use_rowid = since.startswith("rowid:") or since.isdigit()
+        if use_rowid:
+            after_rowid = 0
+            if since.startswith("rowid:"):
+                with contextlib.suppress(ValueError):
+                    after_rowid = int(since.split(":", 1)[1])
+            else:
+                after_rowid = int(since)
             sql = """
                 SELECT * FROM messages
                 WHERE deleted_state='none' AND rowid > ?
             """
             params: list[Any] = [after_rowid]
+            order = " ORDER BY rowid ASC LIMIT ?"
         else:
-            cur_fs = since.split("|", 1)[0]
-            sql = """
-                SELECT * FROM messages
-                WHERE first_seen >= ? AND deleted_state='none'
-            """
-            params = [cur_fs]
+            # Finish legacy first_seen|ch|ts pagination before switching to rowid.
+            parts = since.split("|", 2)
+            cur_fs = parts[0]
+            if len(parts) == 3:
+                sql = """
+                    SELECT * FROM messages
+                    WHERE deleted_state='none'
+                      AND (
+                        first_seen > ?
+                        OR (first_seen = ? AND channel_id > ?)
+                        OR (first_seen = ? AND channel_id = ? AND ts > ?)
+                      )
+                """
+                params = [cur_fs, cur_fs, parts[1], cur_fs, parts[1], parts[2]]
+            else:
+                sql = """
+                    SELECT * FROM messages
+                    WHERE first_seen >= ? AND deleted_state='none'
+                """
+                params = [cur_fs]
+            order = " ORDER BY first_seen ASC, channel_id ASC, ts ASC LIMIT ?"
         if workspace:
             sql += " AND workspace_key=?"
             params.append(workspace)
-        sql += " ORDER BY rowid ASC LIMIT ?"
+        sql += order
         params.append(lim + 1)
         raw = list(self._conn.execute(sql, params).fetchall())
         has_more = len(raw) > lim
@@ -2167,12 +2181,20 @@ class SqliteRepository:
         for r in rows:
             grouped.setdefault(r["channel_id"], []).append(r)
         if page:
-            new_mark = f"rowid:{int(page[-1]['rowid'])}"
+            last = page[-1]
+            if use_rowid:
+                new_mark = f"rowid:{int(last['rowid'])}"
+            elif has_more:
+                # Stay on legacy order until this watermark is fully drained.
+                new_mark = f"{last['first_seen']}|{last['channel_id']}|{last['ts']}"
+            else:
+                # Legacy page exhausted — switch to insertion-ordered cursor.
+                new_mark = f"rowid:{int(last['rowid'])}"
         else:
-            new_mark = since if since.startswith("rowid:") else (
-                f"rowid:{after_rowid}" if after_rowid is not None else since
+            new_mark = since if use_rowid else (
+                f"rowid:{self._max_message_rowid()}"
             )
-        if rows:
+        if rows or (not use_rowid and not page):
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
             "since": since,
@@ -2182,37 +2204,9 @@ class SqliteRepository:
             "by_channel": grouped,
         }
 
-    def _whats_new_after_rowid(self, since: str) -> int | None:
-        if since.startswith("rowid:"):
-            with contextlib.suppress(ValueError):
-                return int(since.split(":", 1)[1])
-            return 0
-        if since.isdigit():
-            return int(since)
-        # Legacy first_seen / first_seen|ch|ts → map to last rowid at-or-before
-        # that page so the next call is insertion-ordered and cannot skip
-        # concurrently inserted rows that share the same first_seen.
-        parts = since.split("|", 2)
-        cur_fs = parts[0]
-        if len(parts) == 3:
-            row = self._conn.execute(
-                """
-                SELECT rowid FROM messages
-                WHERE first_seen=? AND channel_id=? AND ts=?
-                """,
-                (parts[0], parts[1], parts[2]),
-            ).fetchone()
-            if row:
-                return int(row["rowid"])
-        row = self._conn.execute(
-            """
-            SELECT MAX(rowid) AS r FROM messages WHERE first_seen < ?
-            """,
-            (cur_fs,),
-        ).fetchone()
-        if row and row["r"] is not None:
-            return int(row["r"])
-        return None
+    def _max_message_rowid(self) -> int:
+        row = self._conn.execute("SELECT MAX(rowid) AS r FROM messages").fetchone()
+        return int(row["r"] or 0)
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
         default = "1970-01-01T00:00:00Z"

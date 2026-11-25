@@ -356,7 +356,9 @@ def eval_cmd(
 
         path = P(os.environ.get("LOCALAPPDATA", "")) / "slackcache" / "eval" / "private.jsonl"
         # Metrics only — never print query text or expected refs.
-        result = run_private_eval(settings.archive_db, path)
+        result = run_private_eval(
+            settings.archive_db, path, models_dir=settings.models_dir
+        )
         typer.echo(json.dumps(result, indent=2, default=str))
         if not result.get("ok"):
             raise typer.Exit(1)
