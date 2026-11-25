@@ -399,12 +399,26 @@ def run_private_eval(archive_db: Any, private_path: Any) -> dict[str, Any]:
         return {"ok": False, "error": "no labelled queries", "private_queries": 0}
     if not Path(archive_db).exists():
         return {"ok": False, "error": "archive.db missing", "private_queries": len(queries)}
-    # Writable: run_eval rebuilds search_docs and writes embeddings.
-    repo = SqliteRepository(Path(archive_db), read_only=False)
+    # Isolated copy so HashingEmbedder eval never overwrites the live index.
+    import shutil
+    import tempfile
+
+    src = Path(archive_db)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="slackcache-private-eval-"))
+    tmp_db = tmp_dir / "archive.db"
     try:
-        metrics = run_eval(repo, queries=queries)
+        shutil.copy2(src, tmp_db)
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(src) + suffix)
+            if side.exists():
+                shutil.copy2(side, Path(str(tmp_db) + suffix))
+        repo = SqliteRepository(tmp_db, read_only=False)
+        try:
+            metrics = run_eval(repo, queries=queries)
+        finally:
+            repo.close()
     finally:
-        repo.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     # Strip anything that could echo private query text.
     return {
         "ok": True,

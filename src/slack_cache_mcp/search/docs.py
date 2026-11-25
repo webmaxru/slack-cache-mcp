@@ -142,36 +142,79 @@ class SearchDocsBuilder:
             "DELETE FROM search_docs WHERE kind=?", (kind,)
         )
 
-    def invalidate_aggregates(self, channel_id: str, thread_ts: str) -> None:
-        """Drop thread/window docs for a channel/thread so rebuild refreshes them."""
+    def _delete_doc_ids(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with contextlib.suppress(Exception):
+            self.repo._conn.execute(  # noqa: SLF001
+                f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
+            )
+        with contextlib.suppress(Exception):
+            self.repo._conn.execute(  # noqa: SLF001
+                f"DELETE FROM doc_embeddings WHERE doc_id IN ({placeholders})", ids
+            )
+        self.repo._conn.execute(  # noqa: SLF001
+            f"DELETE FROM search_docs WHERE doc_id IN ({placeholders})", ids
+        )
+
+    def drop_message_doc(self, channel_id: str, ts: str) -> None:
         rows = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT doc_id FROM search_docs
-            WHERE channel_id=? AND kind IN ('thread', 'window')
-              AND (anchor_ts=? OR kind='window')
+            WHERE kind='message' AND channel_id=? AND anchor_ts=?
+            """,
+            (channel_id, ts),
+        ).fetchall()
+        self._delete_doc_ids([int(r["doc_id"]) for r in rows])
+
+    def invalidate_aggregates(self, channel_id: str, thread_ts: str) -> None:
+        """Drop the thread doc and windows that overlap ``thread_ts`` only."""
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id FROM search_docs
+            WHERE channel_id=? AND kind='thread' AND anchor_ts=?
             """,
             (channel_id, thread_ts),
         ).fetchall()
-        ids = [int(r["doc_id"]) for r in rows]
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
-            with contextlib.suppress(Exception):
-                self.repo._conn.execute(  # noqa: SLF001
-                    f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
-                )
-            with contextlib.suppress(Exception):
-                self.repo._conn.execute(  # noqa: SLF001
-                    f"DELETE FROM doc_embeddings WHERE doc_id IN ({placeholders})", ids
-                )
-            self.repo._conn.execute(  # noqa: SLF001
-                f"DELETE FROM search_docs WHERE doc_id IN ({placeholders})", ids
-            )
+        try:
+            ts_num = float(thread_ts)
+        except ValueError:
+            ts_num = 0.0
+        win_rows = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id FROM search_docs
+            WHERE channel_id=? AND kind='window'
+              AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
+            """,
+            (channel_id, ts_num, ts_num),
+        ).fetchall()
+        ids = [int(r["doc_id"]) for r in rows] + [int(r["doc_id"]) for r in win_rows]
+        self._delete_doc_ids(ids)
 
-    def refresh_aggregates(self, channel_id: str, thread_ts: str) -> None:
-        """Invalidate then rebuild thread + channel window docs (daemon path)."""
+    def refresh_aggregates(
+        self, channel_id: str, thread_ts: str, *, message_ts: str | None = None
+    ) -> None:
+        """Rebuild only the affected thread and overlapping window docs."""
+        focus_ts = message_ts or thread_ts
         self.invalidate_aggregates(channel_id, thread_ts)
+        # Also drop windows overlapping the observed message (may differ from root).
+        if message_ts and message_ts != thread_ts:
+            try:
+                ts_num = float(message_ts)
+            except ValueError:
+                ts_num = 0.0
+            win_rows = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT doc_id FROM search_docs
+                WHERE channel_id=? AND kind='window'
+                  AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
+                """,
+                (channel_id, ts_num, ts_num),
+            ).fetchall()
+            self._delete_doc_ids([int(r["doc_id"]) for r in win_rows])
         self._upsert_thread_doc(channel_id, thread_ts)
-        self._rebuild_windows_for_channel(channel_id)
+        self._rebuild_windows_around(channel_id, focus_ts)
 
     def _upsert_thread_doc(self, channel_id: str, thread_ts: str) -> None:
         msgs = self.repo._conn.execute(  # noqa: SLF001
@@ -203,7 +246,8 @@ class SearchDocsBuilder:
             text=text,
         )
 
-    def _rebuild_windows_for_channel(self, channel_id: str) -> None:
+    def _rebuild_windows_around(self, channel_id: str, focus_ts: str) -> None:
+        """Rebuild only the conversation window that contains ``focus_ts``."""
         ch = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT DISTINCT channel_id, workspace_key FROM messages
@@ -213,26 +257,10 @@ class SearchDocsBuilder:
         ).fetchone()
         if not ch:
             return
-        # Drop existing window docs for this channel (already done in invalidate
-        # when kind='window'; still clear any leftover).
-        rows = self.repo._conn.execute(  # noqa: SLF001
-            "SELECT doc_id FROM search_docs WHERE channel_id=? AND kind='window'",
-            (channel_id,),
-        ).fetchall()
-        ids = [int(r["doc_id"]) for r in rows]
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
-            with contextlib.suppress(Exception):
-                self.repo._conn.execute(  # noqa: SLF001
-                    f"DELETE FROM docs_vec WHERE doc_id IN ({placeholders})", ids
-                )
-            with contextlib.suppress(Exception):
-                self.repo._conn.execute(  # noqa: SLF001
-                    f"DELETE FROM doc_embeddings WHERE doc_id IN ({placeholders})", ids
-                )
-            self.repo._conn.execute(  # noqa: SLF001
-                f"DELETE FROM search_docs WHERE doc_id IN ({placeholders})", ids
-            )
+        try:
+            focus_num = float(focus_ts)
+        except ValueError:
+            return
         msgs = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT * FROM messages
@@ -242,6 +270,8 @@ class SearchDocsBuilder:
             """,
             (channel_id,),
         ).fetchall()
+        if not msgs:
+            return
         bucket: list[Any] = []
         for m in msgs:
             if bucket:
@@ -249,10 +279,12 @@ class SearchDocsBuilder:
                 gap = float(m["ts_num"]) - prev_ts
                 size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
                 if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
-                    self._flush_window(ch["workspace_key"], channel_id, bucket)
+                    if float(bucket[0]["ts_num"]) <= focus_num <= float(bucket[-1]["ts_num"]):
+                        self._flush_window(ch["workspace_key"], channel_id, bucket)
+                        return
                     bucket = []
             bucket.append(m)
-        if bucket:
+        if bucket and float(bucket[0]["ts_num"]) <= focus_num <= float(bucket[-1]["ts_num"]):
             self._flush_window(ch["workspace_key"], channel_id, bucket)
 
     def rebuild_thread_docs(self) -> int:

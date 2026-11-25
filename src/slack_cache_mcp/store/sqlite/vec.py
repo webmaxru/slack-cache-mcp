@@ -36,6 +36,44 @@ def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _backfill_docs_vec_from_blobs(conn: sqlite3.Connection, *, dim: int) -> None:
+    """Copy portable ``doc_embeddings`` into ``docs_vec`` when the extension appears."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT e.doc_id, e.embedding, d.workspace_key, d.channel_id, d.anchor_ts, d.kind
+            FROM doc_embeddings e
+            JOIN search_docs d ON d.doc_id = e.doc_id
+            WHERE e.dim = ?
+            """,
+            (int(dim),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    for r in rows:
+        ts_num = 0.0
+        if r["anchor_ts"]:
+            with contextlib.suppress(ValueError, TypeError):
+                ts_num = float(r["anchor_ts"])
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (int(r["doc_id"]),))
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(
+                """
+                INSERT INTO docs_vec(doc_id, embedding, workspace_key, channel_id, ts_num, kind)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(r["doc_id"]),
+                    r["embedding"],
+                    r["workspace_key"],
+                    r["channel_id"] or "",
+                    ts_num,
+                    r["kind"],
+                ),
+            )
+
+
 def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool:
     """Create or rebuild ``docs_vec`` for ``dim``. Returns True when usable."""
     if not try_load_sqlite_vec(conn):
@@ -47,6 +85,25 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         "SELECT value FROM meta WHERE key='embedding_dim'"
     ).fetchone()
     if row and meta_dim and int(meta_dim["value"]) == int(dim):
+        # Prefer docs_vec when populated; if empty but blobs exist, backfill so
+        # search does not prefer a hollow virtual table over portable vectors.
+        try:
+            vec_n = int(
+                conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            vec_n = 0
+        try:
+            blob_n = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS c FROM doc_embeddings WHERE dim=?",
+                    (int(dim),),
+                ).fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            blob_n = 0
+        if vec_n == 0 and blob_n > 0:
+            _backfill_docs_vec_from_blobs(conn, dim=int(dim))
         return True
     if row and (not meta_dim or int(meta_dim["value"]) != int(dim)):
         conn.execute("DROP TABLE IF EXISTS docs_vec")
@@ -75,6 +132,7 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         """,
         (str(int(dim)),),
     )
+    _backfill_docs_vec_from_blobs(conn, dim=int(dim))
     return True
 
 

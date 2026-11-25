@@ -128,6 +128,44 @@ def run_daemon(
                         if not hasattr(_run, "_embedder"):
                             _run._embedder = load_embedder(models_dir=settings.models_dir)  # type: ignore[attr-defined]
                         repo = SqliteRepository(settings.archive_db, read_only=False)
+                        # One-time backfill: upgraded archives may have empty
+                        # search_docs while messages already exist.
+                        try:
+                            n_docs = int(
+                                repo._conn.execute(  # noqa: SLF001
+                                    "SELECT COUNT(*) AS c FROM search_docs"
+                                ).fetchone()["c"]
+                            )
+                            n_msgs = int(
+                                repo._conn.execute(  # noqa: SLF001
+                                    "SELECT COUNT(*) AS c FROM messages"
+                                ).fetchone()["c"]
+                            )
+                            flag = repo._conn.execute(  # noqa: SLF001
+                                "SELECT value FROM meta WHERE key='search_docs_backfill'"
+                            ).fetchone()
+                            if n_msgs > 0 and (n_docs == 0 or not flag):
+                                from slack_cache_mcp.search.docs import SearchDocsBuilder
+
+                                counts = SearchDocsBuilder(repo).rebuild_all()
+                                repo._conn.execute(  # noqa: SLF001
+                                    """
+                                    INSERT INTO meta(key, value) VALUES ('search_docs_backfill', '1')
+                                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                                    """
+                                )
+                                repo._conn.commit()  # noqa: SLF001
+                                log_event(
+                                    logger,
+                                    "search_docs_backfill",
+                                    **{k: int(v) for k, v in counts.items()},
+                                )
+                        except Exception as bf_exc:
+                            log_event(
+                                logger,
+                                "search_docs_backfill_error",
+                                error=type(bf_exc).__name__,
+                            )
                         emb_result = embed_pending(
                             repo, _run._embedder, limit=2_048  # type: ignore[attr-defined]
                         )
