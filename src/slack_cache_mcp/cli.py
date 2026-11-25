@@ -261,7 +261,7 @@ def rebuild_cmd(
 
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db, read_only=False)
-    result: dict = {"ok": True}
+    result: dict[str, object] = {"ok": True}
     if all_derived or embeddings or fts or not (fts or embeddings or projection):
         counts = SearchDocsBuilder(repo).rebuild_all()
         result["search_docs"] = counts

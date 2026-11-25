@@ -104,6 +104,9 @@ module = [
     "ulid.*",
     "mcp",
     "mcp.*",
+    "sqlite_vec",
+    "fastembed",
+    "fastembed.*",
 ]
 ignore_missing_imports = true
 follow_imports = "skip"
