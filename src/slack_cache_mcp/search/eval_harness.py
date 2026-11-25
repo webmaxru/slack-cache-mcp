@@ -435,53 +435,92 @@ def run_private_eval(
 
         repo = SqliteRepository(tmp_db, read_only=False)
         try:
-            embedder = load_embedder(
-                models_dir=Path(models_dir) if models_dir else None
-            )
-            svc = SearchService(repo, embedder=embedder)
-            k_ndcg, k_recall = 10, 20
+            try:
+                embedder = load_embedder(
+                    models_dir=Path(models_dir) if models_dir else None
+                )
+                model_n = int(
+                    repo._conn.execute(  # noqa: SLF001
+                        """
+                        SELECT COUNT(*) AS c FROM search_docs
+                        WHERE embedded_model=?
+                        """,
+                        (embedder.model_id,),
+                    ).fetchone()["c"]
+                )
+                coverage = repo.embedding_coverage()
+                incomplete = model_n == 0
+                svc = SearchService(repo, embedder=embedder)
+                k_ndcg, k_recall = 10, 20
 
-            def _metrics(mode: str) -> dict[str, float]:
-                ndcgs: list[float] = []
-                recalls: list[float] = []
-                mrrs: list[float] = []
-                for q in queries:
-                    hits = svc.search_messages(
-                        query=q.query, mode=mode, limit=max(k_recall, k_ndcg)
-                    )
-                    ranked = [(h["channel_id"], h["ts"]) for h in hits["results"]]
-                    ndcgs.append(ndcg_at_k(ranked, q.relevant, k_ndcg))
-                    recalls.append(recall_at_k(ranked, q.relevant, k_recall))
-                    mrrs.append(mrr(ranked, q.relevant))
-                n = max(len(queries), 1)
-                return {
-                    f"ndcg@{k_ndcg}": sum(ndcgs) / n,
-                    f"recall@{k_recall}": sum(recalls) / n,
-                    "mrr": sum(mrrs) / n,
+                def _metrics(mode: str) -> dict[str, float]:
+                    ndcgs: list[float] = []
+                    recalls: list[float] = []
+                    mrrs: list[float] = []
+                    for q in queries:
+                        hits = svc.search_messages(
+                            query=q.query, mode=mode, limit=max(k_recall, k_ndcg)
+                        )
+                        ranked = [(h["channel_id"], h["ts"]) for h in hits["results"]]
+                        ndcgs.append(ndcg_at_k(ranked, q.relevant, k_ndcg))
+                        recalls.append(recall_at_k(ranked, q.relevant, k_recall))
+                        mrrs.append(mrr(ranked, q.relevant))
+                    n = max(len(queries), 1)
+                    return {
+                        f"ndcg@{k_ndcg}": sum(ndcgs) / n,
+                        f"recall@{k_recall}": sum(recalls) / n,
+                        "mrr": sum(mrrs) / n,
+                    }
+
+                lexical = _metrics("lexical")
+                if incomplete:
+                    result = {
+                        "ok": True,
+                        "incomplete": True,
+                        "private_queries": len(queries),
+                        "embedder": embedder.model_id,
+                        "coverage_note": (
+                            f"no embeddings for model {embedder.model_id}; "
+                            "hybrid metrics omitted"
+                        ),
+                        "embedded_for_model": model_n,
+                        "pending": coverage.get("pending"),
+                        "lexical_ndcg": lexical.get("ndcg@10"),
+                        "hybrid_ndcg": None,
+                        "hybrid_vs_lexical_ndcg_relative": None,
+                        "pass_hybrid_ge_lexical_plus_10pct": False,
+                    }
+                else:
+                    hybrid = _metrics("hybrid")
+                    lex_ndcg = lexical[f"ndcg@{k_ndcg}"]
+                    hyb_ndcg = hybrid[f"ndcg@{k_ndcg}"]
+                    if lex_ndcg <= 1e-9 and hyb_ndcg <= 1e-9:
+                        relative = 0.0
+                        passed = False
+                    elif lex_ndcg <= 1e-9:
+                        relative = float("inf")
+                        passed = hyb_ndcg > 0
+                    else:
+                        relative = (hyb_ndcg - lex_ndcg) / lex_ndcg
+                        passed = relative >= 0.10
+                    result = {
+                        "ok": True,
+                        "incomplete": False,
+                        "private_queries": len(queries),
+                        "embedder": embedder.model_id,
+                        "embedded_for_model": model_n,
+                        "lexical_ndcg": lexical.get("ndcg@10"),
+                        "hybrid_ndcg": hybrid.get("ndcg@10"),
+                        "hybrid_vs_lexical_ndcg_relative": relative,
+                        "pass_hybrid_ge_lexical_plus_10pct": bool(passed),
+                    }
+            except Exception as exc:
+                # Never surface query-derived exception text to the CLI.
+                result = {
+                    "ok": False,
+                    "error": type(exc).__name__,
+                    "private_queries": len(queries),
                 }
-
-            lexical = _metrics("lexical")
-            hybrid = _metrics("hybrid")
-            lex_ndcg = lexical[f"ndcg@{k_ndcg}"]
-            hyb_ndcg = hybrid[f"ndcg@{k_ndcg}"]
-            if lex_ndcg <= 1e-9 and hyb_ndcg <= 1e-9:
-                relative = 0.0
-                passed = False
-            elif lex_ndcg <= 1e-9:
-                relative = float("inf")
-                passed = hyb_ndcg > 0
-            else:
-                relative = (hyb_ndcg - lex_ndcg) / lex_ndcg
-                passed = relative >= 0.10
-            result = {
-                "ok": True,
-                "private_queries": len(queries),
-                "embedder": embedder.model_id,
-                "lexical_ndcg": lexical.get("ndcg@10"),
-                "hybrid_ndcg": hybrid.get("ndcg@10"),
-                "hybrid_vs_lexical_ndcg_relative": relative,
-                "pass_hybrid_ge_lexical_plus_10pct": bool(passed),
-            }
         finally:
             repo.close()
     finally:

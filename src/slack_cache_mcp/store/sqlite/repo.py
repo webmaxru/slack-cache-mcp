@@ -1012,13 +1012,19 @@ class SqliteRepository:
             builder = SearchDocsBuilder(self)
             thread_root = chosen.thread_ts or ts
             is_root = thread_root == ts
+            text_changed = True
             if deleted != "none":
                 builder.drop_message_doc(channel_id, ts)
             else:
-                builder.upsert_message_doc(channel_id, ts)
-            builder.refresh_aggregates(channel_id, thread_root, message_ts=ts)
+                _doc_id, text_changed = builder.upsert_message_doc(channel_id, ts)
+            builder.refresh_aggregates(
+                channel_id,
+                thread_root,
+                message_ts=ts,
+                text_changed=text_changed or deleted != "none",
+            )
             # Root edit / delete / restore must refresh reply parent previews.
-            if is_root:
+            if is_root and (text_changed or deleted != "none"):
                 builder.refresh_reply_docs_after_parent_change(channel_id, ts)
             self._conn.commit()
         except Exception:
@@ -1963,76 +1969,62 @@ class SqliteRepository:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
         ).fetchone()
         use_vec = bool(has_vec and try_load_sqlite_vec(self._conn))
-        # Prefer the complete portable blob index when docs_vec is partial/hollow.
-        if use_vec:
-            try:
-                vec_n = int(
-                    self._conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[
-                        "c"
-                    ]
-                )
-                blob_n = int(
-                    self._conn.execute(
-                        "SELECT COUNT(*) AS c FROM doc_embeddings"
-                    ).fetchone()["c"]
-                )
-                if blob_n > vec_n:
-                    use_vec = False
-            except sqlite3.OperationalError:
-                pass
-
-        out: list[dict[str, Any]] = []
-        seen: set[int] = set()
-        vec_k_max = 4096
-
-        def _consume(pairs: list[tuple[int, float]]) -> None:
-            for doc_id, distance in pairs:
-                if doc_id in seen:
-                    continue
-                seen.add(doc_id)
-                doc = self._conn.execute(
-                    "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+        has_blobs = False
+        with contextlib.suppress(sqlite3.OperationalError):
+            has_blobs = bool(
+                self._conn.execute(
+                    "SELECT 1 FROM doc_embeddings LIMIT 1"
                 ).fetchone()
-                if not doc:
-                    continue
-                if model_id and doc["embedded_model"] != model_id:
-                    continue
-                hit = self._doc_to_search_hit(dict(doc), distance=distance)
-                if hit is None:
-                    continue
-                if not self._hit_passes_filters(
-                    hit, filt, kinds=kinds, doc_kind=doc["kind"]
-                ):
-                    continue
-                out.append(hit)
-                if len(out) >= limit:
-                    return
+            )
 
+        # Merge vec + blob rankings by doc_id (min distance) so neither source
+        # can hide documents the other holds.
+        merged: dict[int, float] = {}
+        vec_k_max = 4096
         if use_vec:
             k_pool = min(max(limit * 20, 200), vec_k_max)
             while True:
-                pairs = knn_docs(
-                    self._conn, query_vec, k=k_pool, filters=filt
-                )
-                _consume(pairs)
-                if len(out) >= limit:
-                    return out
+                pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
+                for doc_id, distance in pairs:
+                    prev = merged.get(doc_id)
+                    if prev is None or distance < prev:
+                        merged[doc_id] = distance
                 if k_pool >= vec_k_max or len(pairs) < k_pool:
                     break
                 k_pool = min(k_pool * 2, vec_k_max)
+        if has_blobs or not use_vec:
+            for doc_id, distance in knn_docs_numpy(
+                self._conn,
+                query_vec,
+                k=None,
+                filters=filt,
+                kinds=kinds,
+                model_id=model_id,
+            ):
+                prev = merged.get(doc_id)
+                if prev is None or distance < prev:
+                    merged[doc_id] = distance
+
+        ranked = sorted(merged.items(), key=lambda x: x[1])
+        out: list[dict[str, Any]] = []
+        for doc_id, distance in ranked:
+            doc = self._conn.execute(
+                "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+            ).fetchone()
+            if not doc:
+                continue
+            if model_id and doc["embedded_model"] != model_id:
+                continue
+            hit = self._doc_to_search_hit(dict(doc), distance=distance)
+            if hit is None:
+                continue
+            if not self._hit_passes_filters(
+                hit, filt, kinds=kinds, doc_kind=doc["kind"]
+            ):
+                continue
+            out.append(hit)
             if len(out) >= limit:
-                return out
-            # Exhausted sqlite-vec k; finish over the full portable blob corpus.
-        # Numpy ranks the entire filtered embedding set (no candidate cap).
-        pairs = knn_docs_numpy(
-            self._conn,
-            query_vec,
-            k=None,
-            filters=filt,
-            kinds=kinds,
-            model_id=model_id,
-        )
-        _consume(pairs)
+                break
         return out
 
     def _doc_to_search_hit(
@@ -2139,7 +2131,11 @@ class SqliteRepository:
         if not since:
             since = self._read_whats_new_cursor(meta_key, watermark_store)
         lim = min(limit, 200)
+        # Formats: ``rowid:N``, bare digits, ``legacy:fs|ch|ts|seenmax``, or
+        # plain legacy ``fs`` / ``fs|ch|ts``.
         use_rowid = since.startswith("rowid:") or since.isdigit()
+        seen_max = 0
+        legacy_parts: list[str] = []
         if use_rowid:
             after_rowid = 0
             if since.startswith("rowid:"):
@@ -2154,10 +2150,19 @@ class SqliteRepository:
             params: list[Any] = [after_rowid]
             order = " ORDER BY rowid ASC LIMIT ?"
         else:
-            # Finish legacy first_seen|ch|ts pagination before switching to rowid.
-            parts = since.split("|", 2)
-            cur_fs = parts[0]
-            if len(parts) == 3:
+            body = since[7:] if since.startswith("legacy:") else since
+            chunks = body.split("|")
+            # legacy:fs|ch|ts|seenmax  or  fs|ch|ts  or  fs
+            if len(chunks) >= 4:
+                legacy_parts = chunks[:3]
+                with contextlib.suppress(ValueError):
+                    seen_max = int(chunks[3])
+            elif len(chunks) == 3:
+                legacy_parts = chunks
+            else:
+                legacy_parts = [chunks[0]]
+            cur_fs = legacy_parts[0]
+            if len(legacy_parts) == 3:
                 sql = """
                     SELECT * FROM messages
                     WHERE deleted_state='none'
@@ -2167,7 +2172,14 @@ class SqliteRepository:
                         OR (first_seen = ? AND channel_id = ? AND ts > ?)
                       )
                 """
-                params = [cur_fs, cur_fs, parts[1], cur_fs, parts[1], parts[2]]
+                params = [
+                    cur_fs,
+                    cur_fs,
+                    legacy_parts[1],
+                    cur_fs,
+                    legacy_parts[1],
+                    legacy_parts[2],
+                ]
             else:
                 sql = """
                     SELECT * FROM messages
@@ -2187,22 +2199,23 @@ class SqliteRepository:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             grouped.setdefault(r["channel_id"], []).append(r)
+        page_max = max((int(r["rowid"]) for r in page), default=0)
+        delivered_max = max(seen_max, page_max)
         if page:
             last = page[-1]
             if use_rowid:
                 new_mark = f"rowid:{int(last['rowid'])}"
             elif has_more:
-                # Stay on legacy order until this watermark is fully drained.
-                new_mark = f"{last['first_seen']}|{last['channel_id']}|{last['ts']}"
+                # Carry running max rowid across legacy pages to avoid replay.
+                new_mark = (
+                    f"legacy:{last['first_seen']}|{last['channel_id']}|"
+                    f"{last['ts']}|{delivered_max}"
+                )
             else:
-                # Legacy page exhausted — switch to max rowid delivered (not
-                # legacy-last, which can be a smaller rowid and replay others).
-                max_rid = max(int(r["rowid"]) for r in page)
-                new_mark = f"rowid:{max_rid}"
+                new_mark = f"rowid:{delivered_max}"
         else:
-            new_mark = since if use_rowid else (
-                f"rowid:{self._max_message_rowid()}"
-            )
+            # Empty legacy page: advance to tracked max only (no live MAX race).
+            new_mark = since if use_rowid else f"rowid:{seen_max}"
         if rows or (not use_rowid and not page):
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {

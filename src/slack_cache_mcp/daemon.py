@@ -125,8 +125,15 @@ def run_daemon(
                         from slack_cache_mcp.search.worker import embed_pending
                         from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
-                        if not hasattr(_run, "_embedder"):
-                            _run._embedder = load_embedder(models_dir=settings.models_dir)  # type: ignore[attr-defined]
+                        # Reload each full pass so a newly fetched FastEmbed
+                        # model replaces a cached HashingEmbedder.
+                        fresh = load_embedder(models_dir=settings.models_dir)
+                        prev = getattr(_run, "_embedder", None)
+                        if (
+                            prev is None
+                            or getattr(prev, "model_id", None) != fresh.model_id
+                        ):
+                            _run._embedder = fresh  # type: ignore[attr-defined]
                         repo = SqliteRepository(settings.archive_db, read_only=False)
                         # One-time backfill: upgraded archives may have empty
                         # search_docs while messages already exist.

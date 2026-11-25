@@ -26,9 +26,6 @@ def embed_pending(
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Embed search_docs rows pending for the active model."""
-    # Prefer sqlite-vec when available; reconcile once per run (not per doc).
-    ensure_docs_vec(repo._conn, dim=embedder.dim, reconcile=True)  # noqa: SLF001
-
     prev = repo._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='embedding_model'"
     ).fetchone()
@@ -46,6 +43,23 @@ def embed_pending(
         with contextlib.suppress(sqlite3.OperationalError):
             repo._conn.execute("DELETE FROM doc_embeddings")  # noqa: SLF001
         repo._conn.commit()  # noqa: SLF001
+
+    # Reconcile only when counts diverge (or vec missing); commit before inference.
+    need_reconcile = True
+    with contextlib.suppress(sqlite3.OperationalError):
+        vec_n = int(
+            repo._conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[0]  # noqa: SLF001
+        )
+        blob_n = int(
+            repo._conn.execute(  # noqa: SLF001
+                "SELECT COUNT(*) AS c FROM doc_embeddings"
+            ).fetchone()[0]
+        )
+        need_reconcile = vec_n != blob_n
+    ensure_docs_vec(  # noqa: SLF001
+        repo._conn, dim=embedder.dim, reconcile=need_reconcile
+    )
+    repo._conn.commit()  # noqa: SLF001
 
     sql = """
         SELECT doc_id, kind, workspace_key, channel_id, anchor_ts, text, text_sha256

@@ -60,13 +60,14 @@ class SearchDocsBuilder:
         }
         return counts
 
-    def upsert_message_doc(self, channel_id: str, ts: str) -> int | None:
+    def upsert_message_doc(self, channel_id: str, ts: str) -> tuple[int | None, bool]:
+        """Upsert message retrieval doc. Returns ``(doc_id, text_changed)``."""
         row = self.repo._conn.execute(  # noqa: SLF001
             "SELECT * FROM messages WHERE channel_id=? AND ts=?",
             (channel_id, ts),
         ).fetchone()
         if row is None:
-            return None
+            return None, False
         return self._upsert_from_message_row(dict(row))
 
     def rebuild_message_docs(self) -> int:
@@ -75,12 +76,13 @@ class SearchDocsBuilder:
         ).fetchall()
         n = 0
         for r in rows:
-            if self._upsert_from_message_row(dict(r)) is not None:
+            doc_id, _changed = self._upsert_from_message_row(dict(r))
+            if doc_id is not None:
                 n += 1
         self.repo._conn.commit()  # noqa: SLF001
         return n
 
-    def _upsert_from_message_row(self, m: dict[str, Any]) -> int | None:
+    def _upsert_from_message_row(self, m: dict[str, Any]) -> tuple[int | None, bool]:
         channel_id = m["channel_id"]
         ts = m["ts"]
         chan = self.repo._conn.execute(  # noqa: SLF001
@@ -115,7 +117,17 @@ class SearchDocsBuilder:
             text=m.get("search_text") or m.get("text") or "",
             thread_parent_preview=parent_preview,
         )
-        return self.repo.upsert_search_doc(
+        text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        existing = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id, text_sha256 FROM search_docs
+            WHERE kind='message' AND workspace_key=? AND channel_id IS ?
+              AND anchor_ts IS ? AND start_ts IS ? AND end_ts IS ?
+            """,
+            (m["workspace_key"], channel_id, ts, ts, ts),
+        ).fetchone()
+        changed = existing is None or existing["text_sha256"] != text_sha
+        doc_id = self.repo.upsert_search_doc(
             kind="message",
             workspace_key=m["workspace_key"],
             channel_id=channel_id,
@@ -125,6 +137,7 @@ class SearchDocsBuilder:
             text=text,
             message_rowid=m.get("rowid"),
         )
+        return doc_id, changed
 
     def _delete_kind(self, kind: str) -> None:
         rows = self.repo._conn.execute(  # noqa: SLF001
@@ -183,14 +196,19 @@ class SearchDocsBuilder:
         self._delete_doc_ids([int(r["doc_id"]) for r in rows])
 
     def refresh_aggregates(
-        self, channel_id: str, thread_ts: str, *, message_ts: str | None = None
+        self,
+        channel_id: str,
+        thread_ts: str,
+        *,
+        message_ts: str | None = None,
+        text_changed: bool = True,
     ) -> None:
-        """Rebuild the affected thread; refresh windows only for top-level msgs."""
+        """Rebuild the affected thread; refresh windows only when needed."""
         self.invalidate_aggregates(channel_id, thread_ts)
         self._upsert_thread_doc(channel_id, thread_ts)
-        # Windows index only top-level messages; replies must not touch them.
+        # Windows index only top-level messages; skip unchanged observations.
         top_level = message_ts is None or message_ts == thread_ts
-        if top_level:
+        if top_level and text_changed:
             self._rebuild_windows_around(channel_id, message_ts or thread_ts)
 
     def refresh_reply_docs_after_parent_change(
@@ -205,7 +223,7 @@ class SearchDocsBuilder:
             (channel_id, parent_ts, parent_ts),
         ).fetchall()
         for r in replies:
-            self.upsert_message_doc(channel_id, r["ts"])
+            self.upsert_message_doc(channel_id, r["ts"])  # ignore changed flag
 
     def _upsert_thread_doc(self, channel_id: str, thread_ts: str) -> None:
         msgs = self.repo._conn.execute(  # noqa: SLF001
@@ -238,22 +256,25 @@ class SearchDocsBuilder:
         )
 
     def _rebuild_windows_around(self, channel_id: str, focus_ts: str) -> None:
-        """Rebuild natural windows overlapping ``focus_ts`` (full buckets only)."""
+        """Rebuild natural windows overlapping deleted ranges (full buckets)."""
         try:
             focus_num = float(focus_ts)
         except ValueError:
             return
-        # Invalidate near-focus windows first — even when the channel is now empty
-        # (last live message deleted must not leave a stale window).
+        # Capture windows we invalidate; rebuild targets = their ranges ∪ focus.
         win_rows = self.repo._conn.execute(  # noqa: SLF001
             """
-            SELECT doc_id FROM search_docs
+            SELECT doc_id, start_ts, end_ts FROM search_docs
             WHERE channel_id=? AND kind='window'
               AND CAST(start_ts AS REAL) <= ?
               AND CAST(end_ts AS REAL) >= ?
             """,
             (channel_id, focus_num + WINDOW_GAP_S, focus_num - WINDOW_GAP_S),
         ).fetchall()
+        ranges: list[tuple[float, float]] = [(focus_num, focus_num)]
+        for w in win_rows:
+            with contextlib.suppress(TypeError, ValueError):
+                ranges.append((float(w["start_ts"]), float(w["end_ts"])))
         self._delete_doc_ids([int(w["doc_id"]) for w in win_rows])
 
         ch = self.repo._conn.execute(  # noqa: SLF001
@@ -265,7 +286,6 @@ class SearchDocsBuilder:
             (channel_id,),
         ).fetchone()
         if not ch:
-            # Also drop any remaining window that still covers focus exactly.
             leftover = self.repo._conn.execute(  # noqa: SLF001
                 """
                 SELECT doc_id FROM search_docs
@@ -277,7 +297,6 @@ class SearchDocsBuilder:
             self._delete_doc_ids([int(w["doc_id"]) for w in leftover])
             return
 
-        # Full-channel natural buckets; flush only those overlapping focus±gap.
         all_msgs = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT * FROM messages
@@ -289,17 +308,23 @@ class SearchDocsBuilder:
         ).fetchall()
         if not all_msgs:
             return
-        target_lo = focus_num - WINDOW_GAP_S
-        target_hi = focus_num + WINDOW_GAP_S
+
+        def _overlaps_targets(b_lo: float, b_hi: float) -> bool:
+            # Size-split replacements may land outside focus±gap but must
+            # still cover the deleted window's former span.
+            return any(
+                b_hi >= lo - WINDOW_GAP_S and b_lo <= hi + WINDOW_GAP_S
+                for lo, hi in ranges
+            )
+
         bucket: list[Any] = []
 
         def _flush_if_affected(buf: list[Any]) -> None:
             if not buf:
                 return
             b_lo, b_hi = float(buf[0]["ts_num"]), float(buf[-1]["ts_num"])
-            if b_hi < target_lo or b_lo > target_hi:
+            if not _overlaps_targets(b_lo, b_hi):
                 return
-            # Drop any leftover window overlapping this full bucket before insert.
             overlap = self.repo._conn.execute(  # noqa: SLF001
                 """
                 SELECT doc_id FROM search_docs
