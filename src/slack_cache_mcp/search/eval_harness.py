@@ -448,8 +448,15 @@ def run_private_eval(
                         (embedder.model_id,),
                     ).fetchone()["c"]
                 )
+                total_docs = int(
+                    repo._conn.execute(  # noqa: SLF001
+                        "SELECT COUNT(*) AS c FROM search_docs"
+                    ).fetchone()["c"]
+                )
                 coverage = repo.embedding_coverage()
-                incomplete = model_n == 0
+                pending = int(coverage.get("pending") or 0)
+                # Complete only when every search_doc is embedded for this model.
+                incomplete = model_n == 0 or pending > 0 or model_n < total_docs
                 svc = SearchService(repo, embedder=embedder)
                 k_ndcg, k_recall = 10, 20
 
@@ -480,11 +487,12 @@ def run_private_eval(
                         "private_queries": len(queries),
                         "embedder": embedder.model_id,
                         "coverage_note": (
-                            f"no embeddings for model {embedder.model_id}; "
+                            f"incomplete embeddings for model {embedder.model_id} "
+                            f"({model_n}/{total_docs}, pending={pending}); "
                             "hybrid metrics omitted"
                         ),
                         "embedded_for_model": model_n,
-                        "pending": coverage.get("pending"),
+                        "pending": pending,
                         "lexical_ndcg": lexical.get("ndcg@10"),
                         "hybrid_ndcg": None,
                         "hybrid_vs_lexical_ndcg_relative": None,

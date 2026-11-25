@@ -145,11 +145,28 @@ class SearchService:
             return "semantic index unavailable; hybrid fell back to lexical-only fusion"
         pending = int(status.get("pending") or 0)
         embedded = int(status.get("embedded") or 0)
+        notes: list[str] = []
+        # Coordinate with daemon: archive may have switched models while this
+        # long-lived MCP process kept its startup embedder.
+        try:
+            row = self.repo._conn.execute(  # noqa: SLF001
+                "SELECT value FROM meta WHERE key='embedding_model'"
+            ).fetchone()
+            archive_model = str(row["value"]) if row else None
+            if archive_model and archive_model != self.embedder.model_id:
+                notes.append(
+                    f"reader embedder {self.embedder.model_id} differs from "
+                    f"archive index {archive_model}; restart MCP to pick up the new model"
+                )
+        except Exception:
+            pass
         if embedded == 0:
-            return "no documents embedded yet; semantic leg empty"
-        if pending > 0:
-            return f"partial semantic coverage: {embedded} embedded, {pending} pending"
-        return None
+            notes.append("no documents embedded yet; semantic leg empty")
+        elif pending > 0:
+            notes.append(
+                f"partial semantic coverage: {embedded} embedded, {pending} pending"
+            )
+        return "; ".join(notes) if notes else None
 
     def search_messages(
         self,

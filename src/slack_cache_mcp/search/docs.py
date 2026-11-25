@@ -202,14 +202,88 @@ class SearchDocsBuilder:
         *,
         message_ts: str | None = None,
         text_changed: bool = True,
+        previous_thread_ts: str | None = None,
     ) -> None:
-        """Rebuild the affected thread; refresh windows only when needed."""
-        self.invalidate_aggregates(channel_id, thread_ts)
-        self._upsert_thread_doc(channel_id, thread_ts)
-        # Windows index only top-level messages; skip unchanged observations.
+        """Rebuild affected thread docs; mark windows dirty (deferred rebuild)."""
+        # When a standalone message becomes a reply, drop its old thread doc.
+        if (
+            previous_thread_ts is not None
+            and previous_thread_ts != thread_ts
+            and previous_thread_ts == (message_ts or thread_ts)
+        ):
+            self.invalidate_aggregates(channel_id, previous_thread_ts)
+        if text_changed:
+            self.invalidate_aggregates(channel_id, thread_ts)
+            self._upsert_thread_doc(channel_id, thread_ts)
+        else:
+            # Ensure thread doc exists without discarding embeddings.
+            exists = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT 1 FROM search_docs
+                WHERE channel_id=? AND kind='thread' AND anchor_ts=?
+                """,
+                (channel_id, thread_ts),
+            ).fetchone()
+            if not exists:
+                self._upsert_thread_doc(channel_id, thread_ts)
+        # Defer channel window rebuilds to the daemon (avoids O(n²) ingest scans
+        # and size-split coverage holes from partial rebuilds).
         top_level = message_ts is None or message_ts == thread_ts
-        if top_level and text_changed:
-            self._rebuild_windows_around(channel_id, message_ts or thread_ts)
+        membership_changed = (
+            previous_thread_ts is not None and previous_thread_ts != thread_ts
+        )
+        if (top_level and text_changed) or membership_changed:
+            self.repo.mark_windows_dirty(channel_id)
+
+    def rebuild_dirty_windows(self) -> dict[str, int]:
+        """Rebuild window docs for channels marked dirty; returns per-channel counts."""
+        channels = self.repo.take_dirty_window_channels()
+        out: dict[str, int] = {}
+        for channel_id in channels:
+            out[channel_id] = self._rebuild_windows_for_channel(channel_id)
+        return out
+
+    def _rebuild_windows_for_channel(self, channel_id: str) -> int:
+        """Full window rebuild for one channel (correct size-split coverage)."""
+        ch = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT workspace_key FROM messages
+            WHERE channel_id=? AND deleted_state='none' LIMIT 1
+            """,
+            (channel_id,),
+        ).fetchone()
+        rows = self.repo._conn.execute(  # noqa: SLF001
+            "SELECT doc_id FROM search_docs WHERE channel_id=? AND kind='window'",
+            (channel_id,),
+        ).fetchall()
+        self._delete_doc_ids([int(r["doc_id"]) for r in rows])
+        if not ch:
+            return 0
+        msgs = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT * FROM messages
+            WHERE channel_id=? AND deleted_state='none'
+              AND (thread_ts IS NULL OR thread_ts=ts)
+            ORDER BY ts_num ASC
+            """,
+            (channel_id,),
+        ).fetchall()
+        n = 0
+        bucket: list[Any] = []
+        for m in msgs:
+            if bucket:
+                prev_ts = float(bucket[-1]["ts_num"])
+                gap = float(m["ts_num"]) - prev_ts
+                size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
+                if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
+                    self._flush_window(ch["workspace_key"], channel_id, bucket)
+                    n += 1
+                    bucket = []
+            bucket.append(m)
+        if bucket:
+            self._flush_window(ch["workspace_key"], channel_id, bucket)
+            n += 1
+        return n
 
     def refresh_reply_docs_after_parent_change(
         self, channel_id: str, parent_ts: str
@@ -254,98 +328,6 @@ class SearchDocsBuilder:
             end_ts=msgs[-1]["ts"],
             text=text,
         )
-
-    def _rebuild_windows_around(self, channel_id: str, focus_ts: str) -> None:
-        """Rebuild natural windows overlapping deleted ranges (full buckets)."""
-        try:
-            focus_num = float(focus_ts)
-        except ValueError:
-            return
-        # Capture windows we invalidate; rebuild targets = their ranges ∪ focus.
-        win_rows = self.repo._conn.execute(  # noqa: SLF001
-            """
-            SELECT doc_id, start_ts, end_ts FROM search_docs
-            WHERE channel_id=? AND kind='window'
-              AND CAST(start_ts AS REAL) <= ?
-              AND CAST(end_ts AS REAL) >= ?
-            """,
-            (channel_id, focus_num + WINDOW_GAP_S, focus_num - WINDOW_GAP_S),
-        ).fetchall()
-        ranges: list[tuple[float, float]] = [(focus_num, focus_num)]
-        for w in win_rows:
-            with contextlib.suppress(TypeError, ValueError):
-                ranges.append((float(w["start_ts"]), float(w["end_ts"])))
-        self._delete_doc_ids([int(w["doc_id"]) for w in win_rows])
-
-        ch = self.repo._conn.execute(  # noqa: SLF001
-            """
-            SELECT workspace_key FROM messages
-            WHERE channel_id=? AND deleted_state='none'
-            LIMIT 1
-            """,
-            (channel_id,),
-        ).fetchone()
-        if not ch:
-            leftover = self.repo._conn.execute(  # noqa: SLF001
-                """
-                SELECT doc_id FROM search_docs
-                WHERE channel_id=? AND kind='window'
-                  AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
-                """,
-                (channel_id, focus_num, focus_num),
-            ).fetchall()
-            self._delete_doc_ids([int(w["doc_id"]) for w in leftover])
-            return
-
-        all_msgs = self.repo._conn.execute(  # noqa: SLF001
-            """
-            SELECT * FROM messages
-            WHERE channel_id=? AND deleted_state='none'
-              AND (thread_ts IS NULL OR thread_ts=ts)
-            ORDER BY ts_num ASC
-            """,
-            (channel_id,),
-        ).fetchall()
-        if not all_msgs:
-            return
-
-        def _overlaps_targets(b_lo: float, b_hi: float) -> bool:
-            # Size-split replacements may land outside focus±gap but must
-            # still cover the deleted window's former span.
-            return any(
-                b_hi >= lo - WINDOW_GAP_S and b_lo <= hi + WINDOW_GAP_S
-                for lo, hi in ranges
-            )
-
-        bucket: list[Any] = []
-
-        def _flush_if_affected(buf: list[Any]) -> None:
-            if not buf:
-                return
-            b_lo, b_hi = float(buf[0]["ts_num"]), float(buf[-1]["ts_num"])
-            if not _overlaps_targets(b_lo, b_hi):
-                return
-            overlap = self.repo._conn.execute(  # noqa: SLF001
-                """
-                SELECT doc_id FROM search_docs
-                WHERE channel_id=? AND kind='window'
-                  AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
-                """,
-                (channel_id, b_hi, b_lo),
-            ).fetchall()
-            self._delete_doc_ids([int(w["doc_id"]) for w in overlap])
-            self._flush_window(ch["workspace_key"], channel_id, buf)
-
-        for m in all_msgs:
-            if bucket:
-                prev_ts = float(bucket[-1]["ts_num"])
-                gap = float(m["ts_num"]) - prev_ts
-                size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
-                if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
-                    _flush_if_affected(bucket)
-                    bucket = []
-            bucket.append(m)
-        _flush_if_affected(bucket)
 
     def rebuild_thread_docs(self) -> int:
         self._delete_kind("thread")

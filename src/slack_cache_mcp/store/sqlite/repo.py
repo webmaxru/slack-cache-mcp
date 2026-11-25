@@ -914,11 +914,13 @@ class SqliteRepository:
         except (TypeError, KeyError, json.JSONDecodeError):
             has_files = 0
         # Upsert messages
+        previous_thread_ts: str | None = None
         existing = self._conn.execute(
-            "SELECT rowid FROM messages WHERE channel_id=? AND ts=?",
+            "SELECT rowid, thread_ts FROM messages WHERE channel_id=? AND ts=?",
             (channel_id, ts),
         ).fetchone()
         if existing:
+            previous_thread_ts = existing["thread_ts"]
             rowid = existing["rowid"]
             self._conn.execute("DELETE FROM messages_fts WHERE rowid=?", (rowid,))
             self._conn.execute("DELETE FROM messages_trigram WHERE rowid=?", (rowid,))
@@ -1022,9 +1024,11 @@ class SqliteRepository:
                 thread_root,
                 message_ts=ts,
                 text_changed=text_changed or deleted != "none",
+                previous_thread_ts=previous_thread_ts,
             )
-            # Root edit / delete / restore must refresh reply parent previews.
-            if is_root and (text_changed or deleted != "none"):
+            # Always refresh reply previews on root reprojection: raw parent text
+            # can change even when normalized search-doc text does not.
+            if is_root:
                 builder.refresh_reply_docs_after_parent_change(channel_id, ts)
             self._conn.commit()
         except Exception:
@@ -1969,30 +1973,36 @@ class SqliteRepository:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
         ).fetchone()
         use_vec = bool(has_vec and try_load_sqlite_vec(self._conn))
-        has_blobs = False
+        vec_n = blob_n = 0
         with contextlib.suppress(sqlite3.OperationalError):
-            has_blobs = bool(
+            if use_vec:
+                vec_n = int(
+                    self._conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[
+                        "c"
+                    ]
+                )
+            blob_n = int(
                 self._conn.execute(
-                    "SELECT 1 FROM doc_embeddings LIMIT 1"
-                ).fetchone()
+                    "SELECT COUNT(*) AS c FROM doc_embeddings"
+                ).fetchone()["c"]
             )
 
-        # Merge vec + blob rankings by doc_id (min distance) so neither source
-        # can hide documents the other holds.
         merged: dict[int, float] = {}
         vec_k_max = 4096
-        if use_vec:
+        # Fast path: healthy sqlite-vec covering all blobs — no full Python scan.
+        # When blobs outnumber vec rows, prefer authoritative numpy over blobs.
+        # When counts match, still prefer blob distances for overlapping IDs by
+        # only adding vec hits for doc_ids absent from blobs (vec-only leftovers).
+        if use_vec and vec_n > 0 and blob_n <= vec_n:
             k_pool = min(max(limit * 20, 200), vec_k_max)
             while True:
                 pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
                 for doc_id, distance in pairs:
-                    prev = merged.get(doc_id)
-                    if prev is None or distance < prev:
-                        merged[doc_id] = distance
+                    merged[doc_id] = distance
                 if k_pool >= vec_k_max or len(pairs) < k_pool:
                     break
                 k_pool = min(k_pool * 2, vec_k_max)
-        if has_blobs or not use_vec:
+        elif blob_n > 0:
             for doc_id, distance in knn_docs_numpy(
                 self._conn,
                 query_vec,
@@ -2001,9 +2011,23 @@ class SqliteRepository:
                 kinds=kinds,
                 model_id=model_id,
             ):
-                prev = merged.get(doc_id)
-                if prev is None or distance < prev:
+                merged[doc_id] = distance
+            # Vec-only leftovers (no blob) — rare; pull a bounded KNN.
+            if use_vec and vec_n > blob_n:
+                for doc_id, distance in knn_docs(
+                    self._conn, query_vec, k=min(max(limit * 20, 200), vec_k_max), filters=filt
+                ):
+                    if doc_id not in merged:
+                        merged[doc_id] = distance
+        elif use_vec:
+            k_pool = min(max(limit * 20, 200), vec_k_max)
+            while True:
+                pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
+                for doc_id, distance in pairs:
                     merged[doc_id] = distance
+                if k_pool >= vec_k_max or len(pairs) < k_pool:
+                    break
+                k_pool = min(k_pool * 2, vec_k_max)
 
         ranked = sorted(merged.items(), key=lambda x: x[1])
         out: list[dict[str, Any]] = []
@@ -2131,66 +2155,19 @@ class SqliteRepository:
         if not since:
             since = self._read_whats_new_cursor(meta_key, watermark_store)
         lim = min(limit, 200)
-        # Formats: ``rowid:N``, bare digits, ``legacy:fs|ch|ts|seenmax``, or
-        # plain legacy ``fs`` / ``fs|ch|ts``.
-        use_rowid = since.startswith("rowid:") or since.isdigit()
-        seen_max = 0
-        legacy_parts: list[str] = []
-        if use_rowid:
-            after_rowid = 0
-            if since.startswith("rowid:"):
-                with contextlib.suppress(ValueError):
-                    after_rowid = int(since.split(":", 1)[1])
-            else:
-                after_rowid = int(since)
-            sql = """
-                SELECT * FROM messages
-                WHERE deleted_state='none' AND rowid > ?
-            """
-            params: list[Any] = [after_rowid]
-            order = " ORDER BY rowid ASC LIMIT ?"
-        else:
-            body = since[7:] if since.startswith("legacy:") else since
-            chunks = body.split("|")
-            # legacy:fs|ch|ts|seenmax  or  fs|ch|ts  or  fs
-            if len(chunks) >= 4:
-                legacy_parts = chunks[:3]
-                with contextlib.suppress(ValueError):
-                    seen_max = int(chunks[3])
-            elif len(chunks) == 3:
-                legacy_parts = chunks
-            else:
-                legacy_parts = [chunks[0]]
-            cur_fs = legacy_parts[0]
-            if len(legacy_parts) == 3:
-                sql = """
-                    SELECT * FROM messages
-                    WHERE deleted_state='none'
-                      AND (
-                        first_seen > ?
-                        OR (first_seen = ? AND channel_id > ?)
-                        OR (first_seen = ? AND channel_id = ? AND ts > ?)
-                      )
-                """
-                params = [
-                    cur_fs,
-                    cur_fs,
-                    legacy_parts[1],
-                    cur_fs,
-                    legacy_parts[1],
-                    legacy_parts[2],
-                ]
-            else:
-                sql = """
-                    SELECT * FROM messages
-                    WHERE first_seen >= ? AND deleted_state='none'
-                """
-                params = [cur_fs]
-            order = " ORDER BY first_seen ASC, channel_id ASC, ts ASC LIMIT ?"
+        # Always paginate by rowid. Legacy ISO / fs|ch|ts cursors convert once:
+        # seed after_rowid from max rowid with first_seen < bound, then continue
+        # insertion-ordered (no multi-page legacy order, no concurrent skips).
+        after_rowid, converted = self._whats_new_seed_rowid(since)
+        sql = """
+            SELECT * FROM messages
+            WHERE deleted_state='none' AND rowid > ?
+        """
+        params: list[Any] = [after_rowid]
         if workspace:
             sql += " AND workspace_key=?"
             params.append(workspace)
-        sql += order
+        sql += " ORDER BY rowid ASC LIMIT ?"
         params.append(lim + 1)
         raw = list(self._conn.execute(sql, params).fetchall())
         has_more = len(raw) > lim
@@ -2199,24 +2176,10 @@ class SqliteRepository:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             grouped.setdefault(r["channel_id"], []).append(r)
-        page_max = max((int(r["rowid"]) for r in page), default=0)
-        delivered_max = max(seen_max, page_max)
-        if page:
-            last = page[-1]
-            if use_rowid:
-                new_mark = f"rowid:{int(last['rowid'])}"
-            elif has_more:
-                # Carry running max rowid across legacy pages to avoid replay.
-                new_mark = (
-                    f"legacy:{last['first_seen']}|{last['channel_id']}|"
-                    f"{last['ts']}|{delivered_max}"
-                )
-            else:
-                new_mark = f"rowid:{delivered_max}"
-        else:
-            # Empty legacy page: advance to tracked max only (no live MAX race).
-            new_mark = since if use_rowid else f"rowid:{seen_max}"
-        if rows or (not use_rowid and not page):
+        new_mark = (
+            f"rowid:{int(page[-1]['rowid'])}" if page else f"rowid:{after_rowid}"
+        )
+        if rows or converted or not since.startswith("rowid:"):
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
             "since": since,
@@ -2226,9 +2189,69 @@ class SqliteRepository:
             "by_channel": grouped,
         }
 
+    def _whats_new_seed_rowid(self, since: str) -> tuple[int, bool]:
+        """Return ``(after_rowid, converted_from_legacy)``."""
+        if since.startswith("rowid:"):
+            with contextlib.suppress(ValueError):
+                return int(since.split(":", 1)[1]), False
+            return 0, False
+        if since.isdigit():
+            return int(since), False
+        body = since[7:] if since.startswith("legacy:") else since
+        cur_fs = body.split("|", 1)[0]
+        row = self._conn.execute(
+            "SELECT MAX(rowid) AS r FROM messages WHERE first_seen < ?",
+            (cur_fs,),
+        ).fetchone()
+        return int(row["r"] or 0), True
+
     def _max_message_rowid(self) -> int:
         row = self._conn.execute("SELECT MAX(rowid) AS r FROM messages").fetchone()
         return int(row["r"] or 0)
+
+    def mark_windows_dirty(self, channel_id: str) -> None:
+        """Queue a channel for deferred window-doc rebuild."""
+        key = "window_dirty_channels"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        channels: list[str] = []
+        if row:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                parsed = json.loads(row["value"])
+                if isinstance(parsed, list):
+                    channels = [str(c) for c in parsed]
+        if channel_id not in channels:
+            channels.append(channel_id)
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, json.dumps(channels)),
+        )
+
+    def take_dirty_window_channels(self) -> list[str]:
+        """Return and clear the deferred window-rebuild channel list."""
+        key = "window_dirty_channels"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        channels: list[str] = []
+        if row:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                parsed = json.loads(row["value"])
+                if isinstance(parsed, list):
+                    channels = [str(c) for c in parsed]
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, '[]')
+            ON CONFLICT(key) DO UPDATE SET value='[]'
+            """,
+            (key,),
+        )
+        self._conn.commit()
+        return channels
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
         default = "1970-01-01T00:00:00Z"

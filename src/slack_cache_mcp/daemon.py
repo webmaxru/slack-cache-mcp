@@ -126,15 +126,37 @@ def run_daemon(
                         from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
                         # Reload each full pass so a newly fetched FastEmbed
-                        # model replaces a cached HashingEmbedder.
+                        # model replaces hashing — but never demote a working
+                        # non-hashing model to hashing (would clear the index).
                         fresh = load_embedder(models_dir=settings.models_dir)
                         prev = getattr(_run, "_embedder", None)
-                        if (
-                            prev is None
-                            or getattr(prev, "model_id", None) != fresh.model_id
-                        ):
-                            _run._embedder = fresh  # type: ignore[attr-defined]
+                        demote = (
+                            prev is not None
+                            and not str(getattr(prev, "model_id", "")).startswith(
+                                "hashing"
+                            )
+                            and str(fresh.model_id).startswith("hashing")
+                        )
+                        _run._embedder = prev if demote else fresh  # type: ignore[attr-defined]
                         repo = SqliteRepository(settings.archive_db, read_only=False)
+                        # Drain deferred channel window rebuilds (ingest marks dirty).
+                        try:
+                            from slack_cache_mcp.search.docs import SearchDocsBuilder
+
+                            rebuilt = SearchDocsBuilder(repo).rebuild_dirty_windows()
+                            if rebuilt:
+                                log_event(
+                                    logger,
+                                    "window_docs_rebuild",
+                                    channels=len(rebuilt),
+                                    windows=sum(rebuilt.values()),
+                                )
+                        except Exception as win_exc:
+                            log_event(
+                                logger,
+                                "window_docs_rebuild_error",
+                                error=type(win_exc).__name__,
+                            )
                         # One-time backfill: upgraded archives may have empty
                         # search_docs while messages already exist.
                         try:
