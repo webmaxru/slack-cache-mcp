@@ -37,26 +37,30 @@ def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
 
 
 def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None:
-    """Keep ``docs_vec`` and ``doc_embeddings`` aligned for ``dim``."""
-    # Blobs missing from docs_vec (extension was down while embedding continued).
+    """Keep ``docs_vec`` and ``doc_embeddings`` aligned for ``dim``.
+
+    Overwrites every blob into docs_vec (content may have changed under the same
+    doc_id) and marks vector-only rows pending so they re-embed into both stores.
+    """
     try:
-        missing = conn.execute(
+        rows = conn.execute(
             """
             SELECT e.doc_id, e.embedding, d.workspace_key, d.channel_id, d.anchor_ts, d.kind
             FROM doc_embeddings e
             JOIN search_docs d ON d.doc_id = e.doc_id
             WHERE e.dim = ?
-              AND e.doc_id NOT IN (SELECT doc_id FROM docs_vec)
             """,
             (int(dim),),
         ).fetchall()
     except sqlite3.OperationalError:
-        missing = []
-    for r in missing:
+        rows = []
+    for r in rows:
         ts_num = 0.0
         if r["anchor_ts"]:
             with contextlib.suppress(ValueError, TypeError):
                 ts_num = float(r["anchor_ts"])
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (int(r["doc_id"]),))
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(
                 """
@@ -86,8 +90,17 @@ def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None
         )
 
 
-def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool:
-    """Create or rebuild ``docs_vec`` for ``dim``. Returns True when usable."""
+def ensure_docs_vec(
+    conn: sqlite3.Connection,
+    *,
+    dim: int = DEFAULT_DIM,
+    reconcile: bool = True,
+) -> bool:
+    """Create or rebuild ``docs_vec`` for ``dim``. Returns True when usable.
+
+    Pass ``reconcile=False`` during per-document upserts; call once per batch
+    or startup with ``reconcile=True``.
+    """
     if not try_load_sqlite_vec(conn):
         return False
     row = conn.execute(
@@ -97,7 +110,8 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         "SELECT value FROM meta WHERE key='embedding_dim'"
     ).fetchone()
     if row and meta_dim and int(meta_dim["value"]) == int(dim):
-        _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
+        if reconcile:
+            _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
         return True
     if row and (not meta_dim or int(meta_dim["value"]) != int(dim)):
         conn.execute("DROP TABLE IF EXISTS docs_vec")
@@ -126,7 +140,8 @@ def ensure_docs_vec(conn: sqlite3.Connection, *, dim: int = DEFAULT_DIM) -> bool
         """,
         (str(int(dim)),),
     )
-    _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
+    if reconcile:
+        _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
     return True
 
 
@@ -157,7 +172,8 @@ def upsert_doc_embedding(
     )
     if not try_load_sqlite_vec(conn):
         return
-    if not ensure_docs_vec(conn, dim=dim):
+    # Create table if needed, but do not full-reconcile on every document.
+    if not ensure_docs_vec(conn, dim=dim, reconcile=False):
         return
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))

@@ -26,8 +26,8 @@ def embed_pending(
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Embed search_docs rows pending for the active model."""
-    # Prefer sqlite-vec when available; always have doc_embeddings fallback.
-    ensure_docs_vec(repo._conn, dim=embedder.dim)  # noqa: SLF001
+    # Prefer sqlite-vec when available; reconcile once per run (not per doc).
+    ensure_docs_vec(repo._conn, dim=embedder.dim, reconcile=True)  # noqa: SLF001
 
     prev = repo._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='embedding_model'"

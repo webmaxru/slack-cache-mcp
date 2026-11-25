@@ -238,99 +238,89 @@ class SearchDocsBuilder:
         )
 
     def _rebuild_windows_around(self, channel_id: str, focus_ts: str) -> None:
-        """Rebuild windows overlapping ``focus_ts`` and adjacent boundary buckets."""
-        ch = self.repo._conn.execute(  # noqa: SLF001
-            """
-            SELECT DISTINCT channel_id, workspace_key FROM messages
-            WHERE channel_id=? AND deleted_state='none'
-            """,
-            (channel_id,),
-        ).fetchone()
-        if not ch:
-            return
+        """Rebuild natural windows overlapping ``focus_ts`` (full buckets only)."""
         try:
             focus_num = float(focus_ts)
         except ValueError:
             return
-        # Drop windows that overlap focus or sit within one gap (boundary merges).
+        # Invalidate near-focus windows first — even when the channel is now empty
+        # (last live message deleted must not leave a stale window).
         win_rows = self.repo._conn.execute(  # noqa: SLF001
             """
-            SELECT doc_id, start_ts, end_ts FROM search_docs
+            SELECT doc_id FROM search_docs
             WHERE channel_id=? AND kind='window'
               AND CAST(start_ts AS REAL) <= ?
               AND CAST(end_ts AS REAL) >= ?
             """,
             (channel_id, focus_num + WINDOW_GAP_S, focus_num - WINDOW_GAP_S),
         ).fetchall()
-        range_lo = focus_num
-        range_hi = focus_num
-        for w in win_rows:
-            with contextlib.suppress(TypeError, ValueError):
-                range_lo = min(range_lo, float(w["start_ts"]))
-                range_hi = max(range_hi, float(w["end_ts"]))
         self._delete_doc_ids([int(w["doc_id"]) for w in win_rows])
-        msgs = self.repo._conn.execute(  # noqa: SLF001
+
+        ch = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT workspace_key FROM messages
+            WHERE channel_id=? AND deleted_state='none'
+            LIMIT 1
+            """,
+            (channel_id,),
+        ).fetchone()
+        if not ch:
+            # Also drop any remaining window that still covers focus exactly.
+            leftover = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT doc_id FROM search_docs
+                WHERE channel_id=? AND kind='window'
+                  AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
+                """,
+                (channel_id, focus_num, focus_num),
+            ).fetchall()
+            self._delete_doc_ids([int(w["doc_id"]) for w in leftover])
+            return
+
+        # Full-channel natural buckets; flush only those overlapping focus±gap.
+        all_msgs = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT * FROM messages
             WHERE channel_id=? AND deleted_state='none'
               AND (thread_ts IS NULL OR thread_ts=ts)
-              AND ts_num >= ? AND ts_num <= ?
             ORDER BY ts_num ASC
             """,
-            (channel_id, range_lo - WINDOW_GAP_S, range_hi + WINDOW_GAP_S),
+            (channel_id,),
         ).fetchall()
-        if not msgs:
+        if not all_msgs:
             return
-        # Extend to full adjacent buckets by including neighbors within gap of range.
+        target_lo = focus_num - WINDOW_GAP_S
+        target_hi = focus_num + WINDOW_GAP_S
         bucket: list[Any] = []
-        flushed_any = False
-        for m in msgs:
+
+        def _flush_if_affected(buf: list[Any]) -> None:
+            if not buf:
+                return
+            b_lo, b_hi = float(buf[0]["ts_num"]), float(buf[-1]["ts_num"])
+            if b_hi < target_lo or b_lo > target_hi:
+                return
+            # Drop any leftover window overlapping this full bucket before insert.
+            overlap = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT doc_id FROM search_docs
+                WHERE channel_id=? AND kind='window'
+                  AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
+                """,
+                (channel_id, b_hi, b_lo),
+            ).fetchall()
+            self._delete_doc_ids([int(w["doc_id"]) for w in overlap])
+            self._flush_window(ch["workspace_key"], channel_id, buf)
+
+        for m in all_msgs:
             if bucket:
                 prev_ts = float(bucket[-1]["ts_num"])
                 gap = float(m["ts_num"]) - prev_ts
                 size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
                 if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
-                    b_lo, b_hi = float(bucket[0]["ts_num"]), float(bucket[-1]["ts_num"])
-                    if b_hi >= range_lo - WINDOW_GAP_S and b_lo <= range_hi + WINDOW_GAP_S:
-                        self._flush_window(ch["workspace_key"], channel_id, bucket)
-                        flushed_any = True
+                    _flush_if_affected(bucket)
                     bucket = []
             bucket.append(m)
-        if bucket:
-            b_lo, b_hi = float(bucket[0]["ts_num"]), float(bucket[-1]["ts_num"])
-            if b_hi >= range_lo - WINDOW_GAP_S and b_lo <= range_hi + WINDOW_GAP_S:
-                self._flush_window(ch["workspace_key"], channel_id, bucket)
-                flushed_any = True
-        # Message with no prior window still needs a bucket (endpoint delete / first msg).
-        if not flushed_any and msgs:
-            # Find the natural bucket containing focus among full channel scan.
-            all_msgs = self.repo._conn.execute(  # noqa: SLF001
-                """
-                SELECT * FROM messages
-                WHERE channel_id=? AND deleted_state='none'
-                  AND (thread_ts IS NULL OR thread_ts=ts)
-                ORDER BY ts_num ASC
-                """,
-                (channel_id,),
-            ).fetchall()
-            bucket = []
-            for m in all_msgs:
-                if bucket:
-                    prev_ts = float(bucket[-1]["ts_num"])
-                    gap = float(m["ts_num"]) - prev_ts
-                    size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
-                    if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
-                        if float(bucket[0]["ts_num"]) <= focus_num <= float(
-                            bucket[-1]["ts_num"]
-                        ):
-                            self._flush_window(ch["workspace_key"], channel_id, bucket)
-                            return
-                        bucket = []
-                bucket.append(m)
-            if bucket and float(bucket[0]["ts_num"]) <= focus_num <= float(
-                bucket[-1]["ts_num"]
-            ):
-                self._flush_window(ch["workspace_key"], channel_id, bucket)
+        _flush_if_affected(bucket)
 
     def rebuild_thread_docs(self) -> int:
         self._delete_kind("thread")

@@ -1010,9 +1010,16 @@ class SqliteRepository:
             from slack_cache_mcp.search.docs import SearchDocsBuilder
 
             builder = SearchDocsBuilder(self)
-            builder.upsert_message_doc(channel_id, ts)
             thread_root = chosen.thread_ts or ts
+            is_root = thread_root == ts
+            if deleted != "none":
+                builder.drop_message_doc(channel_id, ts)
+            else:
+                builder.upsert_message_doc(channel_id, ts)
             builder.refresh_aggregates(channel_id, thread_root, message_ts=ts)
+            # Root edit / delete / restore must refresh reply parent previews.
+            if is_root:
+                builder.refresh_reply_docs_after_parent_change(channel_id, ts)
             self._conn.commit()
         except Exception:
             pass
@@ -1956,7 +1963,7 @@ class SqliteRepository:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
         ).fetchone()
         use_vec = bool(has_vec and try_load_sqlite_vec(self._conn))
-        # Prefer numpy when docs_vec is hollow but portable blobs exist.
+        # Prefer the complete portable blob index when docs_vec is partial/hollow.
         if use_vec:
             try:
                 vec_n = int(
@@ -1969,7 +1976,7 @@ class SqliteRepository:
                         "SELECT COUNT(*) AS c FROM doc_embeddings"
                     ).fetchone()["c"]
                 )
-                if vec_n == 0 and blob_n > 0:
+                if blob_n > vec_n:
                     use_vec = False
             except sqlite3.OperationalError:
                 pass
@@ -2188,8 +2195,10 @@ class SqliteRepository:
                 # Stay on legacy order until this watermark is fully drained.
                 new_mark = f"{last['first_seen']}|{last['channel_id']}|{last['ts']}"
             else:
-                # Legacy page exhausted — switch to insertion-ordered cursor.
-                new_mark = f"rowid:{int(last['rowid'])}"
+                # Legacy page exhausted — switch to max rowid delivered (not
+                # legacy-last, which can be a smaller rowid and replay others).
+                max_rid = max(int(r["rowid"]) for r in page)
+                new_mark = f"rowid:{max_rid}"
         else:
             new_mark = since if use_rowid else (
                 f"rowid:{self._max_message_rowid()}"
