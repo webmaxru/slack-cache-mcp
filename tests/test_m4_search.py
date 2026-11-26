@@ -181,13 +181,32 @@ def test_dirty_generation_upgrade_no_collision(archive: SqliteRepository) -> Non
         "DELETE FROM meta WHERE key='window_dirty_seq'"
     )
     archive._conn.commit()  # noqa: SLF001
+    # Peek seeds the sequence before any ack can race a new mark.
+    peeked = dict(archive.peek_dirty_window_channels())
+    assert peeked["C_OLD"] == 1
+    archive.ack_dirty_window_channel("C_OLD", 1)
     archive.mark_windows_dirty("C_NEW")
     pending = dict(archive.peek_dirty_window_channels())
-    assert pending["C_OLD"] == 1
     assert pending["C_NEW"] > 1
-    # Ack of the old gen must not clear the new channel's work.
+    # Stale ack of gen 1 must not clear the new channel's work.
     archive.ack_dirty_window_channel("C_NEW", 1)
     assert "C_NEW" in dict(archive.peek_dirty_window_channels())
+
+
+def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
+    from slack_cache_mcp.search.embedder import HashingEmbedder
+    from slack_cache_mcp.search.worker import embed_pending
+
+    archive._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO meta(key, value) VALUES ('embedding_model', 'onnx-prod-model')
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """
+    )
+    archive._conn.commit()  # noqa: SLF001
+    result = embed_pending(archive, HashingEmbedder(), limit=10)
+    assert result["ok"] is False
+    assert result.get("error") == "refuse_hashing_demotion"
 
 
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:

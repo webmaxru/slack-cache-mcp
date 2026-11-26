@@ -32,6 +32,20 @@ def embed_pending(
     prev_dim = repo._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='embedding_dim'"
     ).fetchone()
+    # Never auto-demote a persisted non-hashing index to hashing (daemon
+    # restart / temporary ONNX load failure would wipe the production index).
+    if (
+        prev
+        and not str(prev["value"]).startswith("hashing")
+        and str(embedder.model_id).startswith("hashing")
+    ):
+        return {
+            "ok": False,
+            "embedded": 0,
+            "model_id": embedder.model_id,
+            "error": "refuse_hashing_demotion",
+            "persisted_model": str(prev["value"]),
+        }
     if (prev and prev["value"] != embedder.model_id) or (
         prev_dim and int(prev_dim["value"]) != int(embedder.dim)
     ):

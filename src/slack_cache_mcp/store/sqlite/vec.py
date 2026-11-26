@@ -36,6 +36,53 @@ def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     return True
 
 
+_DIVERGENCE_META = "docs_vec_divergence_ids"
+
+
+def mark_docs_vec_divergent(conn: sqlite3.Connection, doc_id: int) -> None:
+    """Record that ``doc_id``'s blob was updated while docs_vec could not be."""
+    import json
+
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (_DIVERGENCE_META,)
+    ).fetchone()
+    ids: list[int] = []
+    if row:
+        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+            parsed = json.loads(row["value"])
+            if isinstance(parsed, list):
+                ids = [int(x) for x in parsed]
+    if int(doc_id) not in ids:
+        ids.append(int(doc_id))
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (_DIVERGENCE_META, json.dumps(ids)),
+    )
+
+
+def docs_vec_divergence_ids(conn: sqlite3.Connection) -> list[int]:
+    """Return doc_ids whose blobs may diverge from docs_vec."""
+    import json
+
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (_DIVERGENCE_META,)
+    ).fetchone()
+    if not row:
+        return []
+    with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+        parsed = json.loads(row["value"])
+        if isinstance(parsed, list):
+            return [int(x) for x in parsed]
+    return []
+
+
+def clear_docs_vec_divergence(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM meta WHERE key=?", (_DIVERGENCE_META,))
+
+
 def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None:
     """Keep ``docs_vec`` and ``doc_embeddings`` aligned for ``dim``.
 
@@ -88,6 +135,7 @@ def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None
               AND doc_id NOT IN (SELECT doc_id FROM doc_embeddings)
             """
         )
+    clear_docs_vec_divergence(conn)
 
 
 def ensure_docs_vec(
@@ -110,7 +158,9 @@ def ensure_docs_vec(
         "SELECT value FROM meta WHERE key='embedding_dim'"
     ).fetchone()
     if row and meta_dim and int(meta_dim["value"]) == int(dim):
-        if reconcile:
+        # Reconcile on request, or whenever a divergence marker is pending
+        # (equal row counts alone must not skip stale-vector repair).
+        if reconcile or docs_vec_divergence_ids(conn):
             _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
         return True
     if row and (not meta_dim or int(meta_dim["value"]) != int(dim)):
@@ -171,19 +221,25 @@ def upsert_doc_embedding(
         (doc_id, dim, blob, model_id or ""),
     )
     if not try_load_sqlite_vec(conn):
-        # Blob updated but vec unavailable — drop any stale vec row so search
-        # treats this doc as blob-only rather than serving divergent content.
+        # Blob updated but vec unavailable — DELETE on vec0 fails without the
+        # module, so persist a divergence marker for reconcile on recovery.
+        mark_docs_vec_divergent(conn, doc_id)
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))
         return
     # Create table if needed, but do not full-reconcile on every document.
     if not ensure_docs_vec(conn, dim=dim, reconcile=False):
+        mark_docs_vec_divergent(conn, doc_id)
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))
         return
+    # Force reconcile when prior divergence markers exist (equal counts alone
+    # would skip and leave stale vectors hiding updated blobs).
+    if docs_vec_divergence_ids(conn):
+        ensure_docs_vec(conn, dim=dim, reconcile=True)
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))
-    with contextlib.suppress(sqlite3.OperationalError):
+    try:
         conn.execute(
             """
             INSERT INTO docs_vec(doc_id, embedding, workspace_key, channel_id, ts_num, kind)
@@ -198,6 +254,8 @@ def upsert_doc_embedding(
                 kind,
             ),
         )
+    except sqlite3.OperationalError:
+        mark_docs_vec_divergent(conn, doc_id)
 
 
 def knn_docs_numpy(

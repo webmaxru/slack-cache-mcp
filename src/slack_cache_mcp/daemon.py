@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from pathlib import Path
@@ -128,17 +129,43 @@ def run_daemon(
                         # Reload each full pass so a newly fetched FastEmbed
                         # model replaces hashing — but never demote a working
                         # non-hashing model to hashing (would clear the index).
+                        # Also check the *persisted* archive model so a daemon
+                        # restart with a temporary ONNX load failure cannot wipe
+                        # the production index.
+                        repo = SqliteRepository(settings.archive_db, read_only=False)
+                        persisted_model = None
+                        with contextlib.suppress(Exception):
+                            prow = repo._conn.execute(  # noqa: SLF001
+                                "SELECT value FROM meta WHERE key='embedding_model'"
+                            ).fetchone()
+                            if prow:
+                                persisted_model = str(prow["value"])
                         fresh = load_embedder(models_dir=settings.models_dir)
                         prev = getattr(_run, "_embedder", None)
-                        demote = (
+                        demote_mem = (
                             prev is not None
                             and not str(getattr(prev, "model_id", "")).startswith(
                                 "hashing"
                             )
                             and str(fresh.model_id).startswith("hashing")
                         )
-                        _run._embedder = prev if demote else fresh  # type: ignore[attr-defined]
-                        repo = SqliteRepository(settings.archive_db, read_only=False)
+                        demote_disk = (
+                            persisted_model is not None
+                            and not persisted_model.startswith("hashing")
+                            and str(fresh.model_id).startswith("hashing")
+                        )
+                        if demote_mem:
+                            _run._embedder = prev  # type: ignore[attr-defined]
+                        elif demote_disk:
+                            # Skip embedding this pass; keep trying next cycle.
+                            _run._embedder = None  # type: ignore[attr-defined]
+                            log_event(
+                                logger,
+                                "embed_skip_hashing_demotion",
+                                persisted_model=persisted_model,
+                            )
+                        else:
+                            _run._embedder = fresh  # type: ignore[attr-defined]
                         # Drain deferred channel window rebuilds (ingest marks dirty).
                         try:
                             from slack_cache_mcp.search.docs import SearchDocsBuilder
@@ -195,9 +222,17 @@ def run_daemon(
                                 "search_docs_backfill_error",
                                 error=type(bf_exc).__name__,
                             )
-                        emb_result = embed_pending(
-                            repo, _run._embedder, limit=2_048  # type: ignore[attr-defined]
-                        )
+                        active = getattr(_run, "_embedder", None)
+                        if active is None:
+                            emb_result = {
+                                "ok": False,
+                                "embedded": 0,
+                                "error": "embedder_unavailable",
+                            }
+                        else:
+                            emb_result = embed_pending(
+                                repo, active, limit=2_048
+                            )
                         log_event(
                             logger,
                             "embed_batch",

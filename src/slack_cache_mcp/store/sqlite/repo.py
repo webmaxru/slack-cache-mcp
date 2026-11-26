@@ -2086,8 +2086,11 @@ class SqliteRepository:
 
         # Blob scan when vec is unavailable, blob-only/divergent docs exist, or
         # vec+filters still cannot fill the limit. Expand until eligible hits
-        # satisfy ``limit`` (author/date filters apply after distance rank).
+        # satisfy ``limit`` (author/date/has:* filters apply after distance rank).
+        from slack_cache_mcp.store.sqlite.vec import docs_vec_divergence_ids
+
         need_blob_scan = False
+        divergent_ids: list[int] = []
         if blob_n > 0:
             if not use_vec:
                 need_blob_scan = True
@@ -2104,17 +2107,30 @@ class SqliteRepository:
                             """
                         ).fetchone()["c"]
                     )
-                if blob_only > 0 or _eligible_count(best, need=limit) < limit:
+                divergent_ids = docs_vec_divergence_ids(self._conn)
+                if (
+                    blob_only > 0
+                    or divergent_ids
+                    or _eligible_count(best, need=limit) < limit
+                ):
                     need_blob_scan = True
         if need_blob_scan:
-            post_filter = bool(
-                filt.get("user_ids")
-                or filt.get("after") is not None
-                or filt.get("before") is not None
+            # Any predicate not pushed into knn SQL can hide nearer blobs.
+            sql_keys = {
+                "workspace_key",
+                "channel_ids",
+                "kind",
+                "model_id",
+                "deleted_mode",
+                "include_deleted",
+            }
+            post_filter = any(
+                k not in sql_keys and v not in (None, False, [], "")
+                for k, v in filt.items()
             )
-            # Unrestricted when no vec or post-SQL filters can hide matches;
+            # Unrestricted when no vec, post-filters, or known divergence;
             # otherwise expand a bounded pool until eligible hits fill.
-            if not use_vec or post_filter:
+            if not use_vec or post_filter or divergent_ids:
                 pairs = knn_docs_numpy(
                     self._conn,
                     query_vec,
@@ -2410,12 +2426,26 @@ class SqliteRepository:
             (key, json.dumps(data)),
         )
 
-    def _next_dirty_generation(self) -> int:
-        """Monotonic generation that never restarts after acknowledgements.
+    def _ensure_dirty_seq_initialized(self) -> None:
+        """Seed ``window_dirty_seq`` above legacy map gens before any ack/mark."""
+        key = "window_dirty_seq"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        if row:
+            return
+        existing_max = max(self._dirty_window_map().values(), default=0)
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, str(existing_max)),
+        )
 
-        On upgrade, initialize above any generation already present in the
-        dirty map so a stale ack cannot collide with a freshly assigned 1.
-        """
+    def _next_dirty_generation(self) -> int:
+        """Monotonic generation that never restarts after acknowledgements."""
+        self._ensure_dirty_seq_initialized()
         key = "window_dirty_seq"
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)
@@ -2434,24 +2464,40 @@ class SqliteRepository:
 
     def mark_windows_dirty(self, channel_id: str) -> None:
         """Queue a channel for deferred window-doc rebuild (bump generation)."""
-        data = self._dirty_window_map()
-        data[channel_id] = self._next_dirty_generation()
-        self._write_dirty_window_map(data)
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            data = self._dirty_window_map()
+            data[channel_id] = self._next_dirty_generation()
+            self._write_dirty_window_map(data)
+            self._conn.commit()
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.rollback()
+            raise
 
     def peek_dirty_window_channels(self) -> list[tuple[str, int]]:
         """Return (channel_id, generation) without clearing."""
+        self._ensure_dirty_seq_initialized()
+        self._conn.commit()
         return list(self._dirty_window_map().items())
 
     def ack_dirty_window_channel(self, channel_id: str, generation: int) -> None:
         """Ack only if ``generation`` still matches (newer marks stay dirty)."""
-        data = self._dirty_window_map()
-        cur = data.get(channel_id)
-        if cur is None:
-            return
-        if int(cur) == int(generation):
-            del data[channel_id]
-            self._write_dirty_window_map(data)
-        self._conn.commit()
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._ensure_dirty_seq_initialized()
+            data = self._dirty_window_map()
+            cur = data.get(channel_id)
+            if cur is not None and int(cur) == int(generation):
+                del data[channel_id]
+                self._write_dirty_window_map(data)
+            self._conn.commit()
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.rollback()
+            raise
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
         default = "1970-01-01T00:00:00Z"
