@@ -331,43 +331,76 @@ class SearchDocsBuilder:
         if not ch:
             return
 
-        lo = min(r[0] for r in ranges) - WINDOW_GAP_S
-        hi = max(r[1] for r in ranges) + WINDOW_GAP_S
-        # Local slice only (bounded); pad so gap detection closes buckets.
-        msgs = self.repo._conn.execute(  # noqa: SLF001
-            """
-            SELECT * FROM messages
-            WHERE channel_id=? AND deleted_state='none'
-              AND (thread_ts IS NULL OR thread_ts=ts)
-              AND ts_num >= ? AND ts_num <= ?
-            ORDER BY ts_num ASC
-            """,
-            (channel_id, lo, hi),
-        ).fetchall()
-        if not msgs:
-            return
+        # Iteratively expand when new buckets overlap surviving neighbors
+        # (size-splits can shift spans past the original focus neighborhood).
+        for _ in range(4):
+            lo = min(r[0] for r in ranges) - WINDOW_GAP_S
+            hi = max(r[1] for r in ranges) + WINDOW_GAP_S
+            msgs = self.repo._conn.execute(  # noqa: SLF001
+                """
+                SELECT * FROM messages
+                WHERE channel_id=? AND deleted_state='none'
+                  AND (thread_ts IS NULL OR thread_ts=ts)
+                  AND ts_num >= ? AND ts_num <= ?
+                ORDER BY ts_num ASC
+                """,
+                (channel_id, lo, hi),
+            ).fetchall()
+            if not msgs:
+                return
 
-        def _overlaps_affected(b0: float, b1: float) -> bool:
-            return any(b0 <= a1 and b1 >= a0 for a0, a1 in ranges)
+            def _overlaps_affected(b0: float, b1: float) -> bool:
+                return any(b0 <= a1 and b1 >= a0 for a0, a1 in ranges)
 
-        bucket: list[Any] = []
-        for m in msgs:
+            to_flush: list[list[Any]] = []
+            bucket: list[Any] = []
+            for m in msgs:
+                if bucket:
+                    prev_ts = float(bucket[-1]["ts_num"])
+                    gap = float(m["ts_num"]) - prev_ts
+                    size = sum(
+                        len(x["search_text"] or x["text"] or "") for x in bucket
+                    )
+                    if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
+                        b0 = float(bucket[0]["ts_num"])
+                        b1 = float(bucket[-1]["ts_num"])
+                        if _overlaps_affected(b0, b1):
+                            to_flush.append(list(bucket))
+                        bucket = []
+                bucket.append(m)
             if bucket:
-                prev_ts = float(bucket[-1]["ts_num"])
-                gap = float(m["ts_num"]) - prev_ts
-                size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
-                if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
-                    b0 = float(bucket[0]["ts_num"])
-                    b1 = float(bucket[-1]["ts_num"])
-                    if _overlaps_affected(b0, b1):
-                        self._flush_window(ch["workspace_key"], channel_id, bucket)
-                    bucket = []
-            bucket.append(m)
-        if bucket:
-            b0 = float(bucket[0]["ts_num"])
-            b1 = float(bucket[-1]["ts_num"])
-            if _overlaps_affected(b0, b1):
-                self._flush_window(ch["workspace_key"], channel_id, bucket)
+                b0 = float(bucket[0]["ts_num"])
+                b1 = float(bucket[-1]["ts_num"])
+                if _overlaps_affected(b0, b1):
+                    to_flush.append(list(bucket))
+
+            # Drop any surviving window that overlaps a bucket we are about to
+            # write — otherwise size-shifted neighbors leave durable overlaps.
+            expanded = False
+            for nb in to_flush:
+                nb0 = float(nb[0]["ts_num"])
+                nb1 = float(nb[-1]["ts_num"])
+                overlap = self.repo._conn.execute(  # noqa: SLF001
+                    """
+                    SELECT doc_id, start_ts, end_ts FROM search_docs
+                    WHERE channel_id=? AND kind='window'
+                      AND CAST(start_ts AS REAL) <= ? AND CAST(end_ts AS REAL) >= ?
+                    """,
+                    (channel_id, nb1, nb0),
+                ).fetchall()
+                if overlap:
+                    for w in overlap:
+                        try:
+                            ranges.append((float(w["start_ts"]), float(w["end_ts"])))
+                        except (TypeError, ValueError):
+                            continue
+                    self._delete_doc_ids([int(w["doc_id"]) for w in overlap])
+                    expanded = True
+            if expanded:
+                continue
+            for nb in to_flush:
+                self._flush_window(ch["workspace_key"], channel_id, nb)
+            break
 
     def _rebuild_windows_for_channel(self, channel_id: str) -> int:
         """Full window rebuild for one channel; preserve unchanged embeddings."""

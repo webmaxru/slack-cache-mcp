@@ -53,10 +53,8 @@ class SearchService:
             fresh = load_embedder(
                 models_dir=self.models_dir, model_id=archive_model
             )
-            if fresh.model_id == archive_model or (
-                archive_model.startswith("hashing")
-                and fresh.model_id.startswith("hashing")
-            ):
+            # Strict id match only (legacy hashing spaces are not interchangeable).
+            if fresh.model_id == archive_model:
                 self.embedder = fresh
         except Exception:
             pass

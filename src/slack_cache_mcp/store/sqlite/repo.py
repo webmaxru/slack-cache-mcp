@@ -2028,8 +2028,28 @@ class SqliteRepository:
                 if len(out) >= limit:
                     return
 
-        # Merge vec + blob candidates by best distance. Never return after vec
-        # alone when blobs exist — a closer blob-only doc must still compete.
+        def _eligible_count(candidates: dict[int, float], *, need: int) -> int:
+            n = 0
+            for doc_id, distance in sorted(candidates.items(), key=lambda x: x[1]):
+                doc = self._conn.execute(
+                    "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+                ).fetchone()
+                if not doc:
+                    continue
+                if model_id and doc["embedded_model"] != model_id:
+                    continue
+                hit = self._doc_to_search_hit(dict(doc), distance=distance)
+                if hit is None:
+                    continue
+                if not self._hit_passes_filters(
+                    hit, filt, kinds=kinds, doc_kind=doc["kind"]
+                ):
+                    continue
+                n += 1
+                if n >= need:
+                    return n
+            return n
+
         best: dict[int, float] = {}
         vec_k_max = 4096
         if use_vec:
@@ -2040,17 +2060,58 @@ class SqliteRepository:
                     prev = best.get(doc_id)
                     if prev is None or distance < prev:
                         best[doc_id] = distance
-                if k_pool >= vec_k_max or len(pairs) < k_pool:
-                    break
-                # Expand while filters may still hide eligible hits in a larger pool.
-                if len(best) >= limit * 5:
+                # Expand until enough *eligible* hits (post author/date filters).
+                if (
+                    _eligible_count(best, need=limit) >= limit
+                    or k_pool >= vec_k_max
+                    or len(pairs) < k_pool
+                ):
                     break
                 k_pool = min(k_pool * 2, vec_k_max)
+            # Rescore vec candidates with authoritative blob distance (O(k)).
+            if blob_n > 0 and best:
+                import numpy as np
+
+                from slack_cache_mcp.search.embedder import cosine_similarity
+
+                q = np.asarray(query_vec, dtype=np.float32)
+                for doc_id in list(best):
+                    brow = self._conn.execute(
+                        "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()
+                    if brow is not None:
+                        emb = np.frombuffer(brow["embedding"], dtype=np.float32)
+                        best[doc_id] = 1.0 - float(cosine_similarity(q, emb))
+
+        # Full blob scan only when vec is unavailable, or blob-only docs exist,
+        # or vec+filters still cannot fill the limit.
+        need_blob_scan = False
         if blob_n > 0:
+            if not use_vec:
+                need_blob_scan = True
+            else:
+                blob_only = 0
+                with contextlib.suppress(sqlite3.OperationalError):
+                    blob_only = int(
+                        self._conn.execute(
+                            """
+                            SELECT COUNT(*) AS c FROM doc_embeddings e
+                            WHERE NOT EXISTS (
+                              SELECT 1 FROM docs_vec v WHERE v.doc_id = e.doc_id
+                            )
+                            """
+                        ).fetchone()["c"]
+                    )
+                if blob_only > 0 or _eligible_count(best, need=limit) < limit:
+                    need_blob_scan = True
+        if need_blob_scan:
+            # Bound k when filling gaps; unrestricted only for blob-only archives.
+            blob_k: int | None = None if not use_vec else max(limit * 20, 200)
             pairs = knn_docs_numpy(
                 self._conn,
                 query_vec,
-                k=None,
+                k=blob_k,
                 filters=filt,
                 kinds=kinds,
                 model_id=model_id,
@@ -2059,20 +2120,6 @@ class SqliteRepository:
                 prev = best.get(doc_id)
                 if prev is None or distance < prev:
                     best[doc_id] = distance
-            # Prefer authoritative blob distance for docs that have a blob.
-            import numpy as np
-
-            from slack_cache_mcp.search.embedder import cosine_similarity
-
-            q = np.asarray(query_vec, dtype=np.float32)
-            for doc_id in list(best):
-                brow = self._conn.execute(
-                    "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
-                    (doc_id,),
-                ).fetchone()
-                if brow is not None:
-                    emb = np.frombuffer(brow["embedding"], dtype=np.float32)
-                    best[doc_id] = 1.0 - float(cosine_similarity(q, emb))
         out: list[dict[str, Any]] = []
         seen: set[int] = set()
         ranked = sorted(best.items(), key=lambda x: x[1])
@@ -2212,23 +2259,34 @@ class SqliteRepository:
                 insert_bound = self._max_message_rowid()
             chunks = body_main.split("|")
             cur_fs = chunks[0]
+            # Restrict legacy pages to the insertion boundary so concurrent
+            # inserts (rowid > bound) are not returned twice after the switch.
             if len(chunks) >= 3:
                 sql = """
                     SELECT * FROM messages
                     WHERE deleted_state='none'
+                      AND rowid <= ?
                       AND (
                         first_seen > ?
                         OR (first_seen = ? AND channel_id > ?)
                         OR (first_seen = ? AND channel_id = ? AND ts > ?)
                       )
                 """
-                params = [cur_fs, cur_fs, chunks[1], cur_fs, chunks[1], chunks[2]]
+                params = [
+                    insert_bound,
+                    cur_fs,
+                    cur_fs,
+                    chunks[1],
+                    cur_fs,
+                    chunks[1],
+                    chunks[2],
+                ]
             else:
                 sql = """
                     SELECT * FROM messages
-                    WHERE first_seen >= ? AND deleted_state='none'
+                    WHERE first_seen >= ? AND deleted_state='none' AND rowid <= ?
                 """
-                params = [cur_fs]
+                params = [cur_fs, insert_bound]
             order = " ORDER BY first_seen ASC, channel_id ASC, ts ASC LIMIT ?"
         if workspace:
             sql += " AND workspace_key=?"
@@ -2301,10 +2359,26 @@ class SqliteRepository:
             (key, json.dumps(data)),
         )
 
+    def _next_dirty_generation(self) -> int:
+        """Monotonic generation that never restarts after acknowledgements."""
+        key = "window_dirty_seq"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        n = int(row["value"]) + 1 if row else 1
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, str(n)),
+        )
+        return n
+
     def mark_windows_dirty(self, channel_id: str) -> None:
         """Queue a channel for deferred window-doc rebuild (bump generation)."""
         data = self._dirty_window_map()
-        data[channel_id] = int(data.get(channel_id, 0)) + 1
+        data[channel_id] = self._next_dirty_generation()
         self._write_dirty_window_map(data)
 
     def peek_dirty_window_channels(self) -> list[tuple[str, int]]:

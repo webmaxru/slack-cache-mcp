@@ -6,7 +6,11 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from slack_cache_mcp.search.embedder import DEFAULT_DIM, HashingEmbedder
+from slack_cache_mcp.search.embedder import (
+    DEFAULT_DIM,
+    DEFAULT_MODEL_ID,
+    HashingEmbedder,
+)
 
 if TYPE_CHECKING:
     from slack_cache_mcp.search.embedder import Embedder
@@ -25,7 +29,14 @@ def load_embedder(
     return the best available. Never contacts the network.
     """
     if model_id and model_id.startswith("hashing"):
-        return HashingEmbedder(dim=DEFAULT_DIM, model_id=model_id)
+        # Only the current hashing implementation exists; never label v2
+        # vectors with a legacy id (would falsely appear model-compatible).
+        if model_id != DEFAULT_MODEL_ID:
+            raise ValueError(
+                f"unsupported hashing model_id {model_id!r}; "
+                f"reindex with {DEFAULT_MODEL_ID!r}"
+            )
+        return HashingEmbedder(dim=DEFAULT_DIM, model_id=DEFAULT_MODEL_ID)
 
     if force_hashing or os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing":
         return HashingEmbedder(dim=DEFAULT_DIM)
@@ -46,5 +57,5 @@ def load_embedder(
         if model_id and not model_id.startswith("hashing"):
             # Exact ONNX model requested but unavailable — do not silently
             # substitute a different model space.
-            return HashingEmbedder(dim=DEFAULT_DIM)
+            raise ValueError(f"embedder model unavailable: {model_id}")
     return HashingEmbedder(dim=DEFAULT_DIM)

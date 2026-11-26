@@ -141,20 +141,30 @@ def test_load_embedder_exact_archive_model(tmp_path: Path) -> None:
 
     emb = load_embedder(models_dir=tmp_path / "models", model_id=DEFAULT_MODEL_ID)
     assert emb.model_id == DEFAULT_MODEL_ID
+    with pytest.raises(ValueError, match="unsupported hashing"):
+        load_embedder(models_dir=tmp_path / "models", model_id="hashing-trigram-v1")
 
 
 def test_dirty_window_generation_ack(archive: SqliteRepository) -> None:
     archive.mark_windows_dirty("C_TEST")
-    pending = archive.peek_dirty_window_channels()
-    assert ("C_TEST", 1) in pending
+    pending = dict(archive.peek_dirty_window_channels())
+    g1 = pending["C_TEST"]
     archive.mark_windows_dirty("C_TEST")
     pending = dict(archive.peek_dirty_window_channels())
-    assert pending["C_TEST"] == 2
-    archive.ack_dirty_window_channel("C_TEST", 1)
+    g2 = pending["C_TEST"]
+    assert g2 > g1
+    archive.ack_dirty_window_channel("C_TEST", g1)
     pending = dict(archive.peek_dirty_window_channels())
-    assert pending["C_TEST"] == 2
-    archive.ack_dirty_window_channel("C_TEST", 2)
+    assert pending["C_TEST"] == g2
+    archive.ack_dirty_window_channel("C_TEST", g2)
     assert "C_TEST" not in dict(archive.peek_dirty_window_channels())
+    # Generations remain monotonic across acknowledgements.
+    archive.mark_windows_dirty("C_TEST")
+    pending = dict(archive.peek_dirty_window_channels())
+    assert pending["C_TEST"] > g2
+    # Stale ack of an old generation must not clear newer work.
+    archive.ack_dirty_window_channel("C_TEST", g1)
+    assert "C_TEST" in dict(archive.peek_dirty_window_channels())
 
 
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:
