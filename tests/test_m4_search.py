@@ -133,3 +133,73 @@ def test_embeddings_offline_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert emb.model_id.startswith("hashing")
     vec = emb.embed_query("ping")
     assert vec.shape[0] == emb.dim
+
+
+def test_load_embedder_exact_archive_model(tmp_path: Path) -> None:
+    from slack_cache_mcp.embeddings.factory import load_embedder
+    from slack_cache_mcp.search.embedder import DEFAULT_MODEL_ID
+
+    emb = load_embedder(models_dir=tmp_path / "models", model_id=DEFAULT_MODEL_ID)
+    assert emb.model_id == DEFAULT_MODEL_ID
+
+
+def test_dirty_window_generation_ack(archive: SqliteRepository) -> None:
+    archive.mark_windows_dirty("C_TEST")
+    pending = archive.peek_dirty_window_channels()
+    assert ("C_TEST", 1) in pending
+    archive.mark_windows_dirty("C_TEST")
+    pending = dict(archive.peek_dirty_window_channels())
+    assert pending["C_TEST"] == 2
+    archive.ack_dirty_window_channel("C_TEST", 1)
+    pending = dict(archive.peek_dirty_window_channels())
+    assert pending["C_TEST"] == 2
+    archive.ack_dirty_window_channel("C_TEST", 2)
+    assert "C_TEST" not in dict(archive.peek_dirty_window_channels())
+
+
+def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:
+    """Legacy finish pins to insertion boundary, not max first_seen rowid."""
+    store = Path(archive.path).parent / "client_state.json"
+    first = archive.whats_new(since="1970-01-01T00:00:00Z", limit=1, watermark_store=store)
+    assert first["has_more"] or first["watermark"].startswith("rowid:")
+    if first["has_more"]:
+        assert "#rowbound:" in first["watermark"]
+        # Drain legacy pages
+        mark = first["watermark"]
+        for _ in range(50):
+            page = archive.whats_new(since=mark, limit=5, watermark_store=store)
+            mark = page["watermark"]
+            if not page["has_more"]:
+                break
+        assert mark.startswith("rowid:")
+
+
+def test_new_reply_no_phantom_thread_doc(archive: SqliteRepository) -> None:
+    from slack_cache_mcp.search.docs import SearchDocsBuilder
+
+    builder = SearchDocsBuilder(archive)
+    # Pick an existing root and simulate a brand-new reply refresh.
+    root = archive._conn.execute(  # noqa: SLF001
+        """
+        SELECT channel_id, ts FROM messages
+        WHERE deleted_state='none' AND (thread_ts IS NULL OR thread_ts=ts)
+        LIMIT 1
+        """
+    ).fetchone()
+    assert root is not None
+    reply_ts = f"{float(root['ts']) + 0.001:.6f}"
+    builder.refresh_aggregates(
+        root["channel_id"],
+        root["ts"],
+        message_ts=reply_ts,
+        text_changed=True,
+        is_new=True,
+    )
+    phantom = archive._conn.execute(  # noqa: SLF001
+        """
+        SELECT 1 FROM search_docs
+        WHERE kind='thread' AND channel_id=? AND anchor_ts=?
+        """,
+        (root["channel_id"], reply_ts),
+    ).fetchone()
+    assert phantom is None

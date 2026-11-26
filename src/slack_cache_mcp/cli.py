@@ -276,10 +276,12 @@ def rebuild_cmd(
     if do_all or embeddings or fts:
         # --fts alone still refreshes search_docs text; embeddings only when asked/all.
         builder = SearchDocsBuilder(repo)
+        # Snapshot dirty generations before rebuild; ack only those so marks
+        # committed during/after rebuild_all remain queued.
+        dirty_before = repo.peek_dirty_window_channels()
         counts = builder.rebuild_all()
-        # Full rebuild supersedes any deferred dirty-channel window work.
-        for ch in repo.peek_dirty_window_channels():
-            repo.ack_dirty_window_channel(ch)
+        for ch, gen in dirty_before:
+            repo.ack_dirty_window_channel(ch, gen)
         result["search_docs"] = counts
     if do_all or embeddings:
         emb = load_embedder(models_dir=settings.models_dir)

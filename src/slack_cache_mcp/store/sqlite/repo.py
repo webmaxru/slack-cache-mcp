@@ -575,7 +575,10 @@ class SqliteRepository:
                         builder.drop_message_doc(channel_id, ts)
                         thread_root = row["thread_ts"] or ts
                         builder.refresh_aggregates(
-                            channel_id, thread_root, message_ts=ts
+                            channel_id,
+                            thread_root,
+                            message_ts=ts,
+                            previous_thread_ts=row["thread_ts"],
                         )
                         # Root deletion must clear parent previews on reply docs.
                         if thread_root == ts:
@@ -1014,6 +1017,7 @@ class SqliteRepository:
             builder = SearchDocsBuilder(self)
             thread_root = chosen.thread_ts or ts
             is_root = thread_root == ts
+            is_new_msg = existing is None
             text_changed = True
             if deleted != "none":
                 builder.drop_message_doc(channel_id, ts)
@@ -1025,6 +1029,7 @@ class SqliteRepository:
                 message_ts=ts,
                 text_changed=text_changed or deleted != "none",
                 previous_thread_ts=previous_thread_ts,
+                is_new=is_new_msg,
             )
             # Always refresh reply previews on root reprojection: raw parent text
             # can change even when normalized search-doc text does not.
@@ -2023,50 +2028,25 @@ class SqliteRepository:
                 if len(out) >= limit:
                     return
 
-        out: list[dict[str, Any]] = []
-        seen: set[int] = set()
+        # Merge vec + blob candidates by best distance. Never return after vec
+        # alone when blobs exist — a closer blob-only doc must still compete.
+        best: dict[int, float] = {}
         vec_k_max = 4096
         if use_vec:
             k_pool = min(max(limit * 20, 200), vec_k_max)
             while True:
                 pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
-                # Re-rank this pool by blob distance when available.
-                rescored = list(pairs)
-                if blob_n > 0:
-                    import numpy as np
-
-                    from slack_cache_mcp.search.embedder import cosine_similarity
-
-                    q = np.asarray(query_vec, dtype=np.float32)
-                    tmp: list[tuple[int, float]] = []
-                    for doc_id, distance in pairs:
-                        brow = self._conn.execute(
-                            "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
-                            (doc_id,),
-                        ).fetchone()
-                        if brow is not None:
-                            emb = np.frombuffer(brow["embedding"], dtype=np.float32)
-                            distance = 1.0 - float(cosine_similarity(q, emb))
-                        tmp.append((doc_id, distance))
-                    rescored = sorted(tmp, key=lambda x: x[1])
-                _consume(rescored, out=out, seen=seen)
-                if len(out) >= limit:
-                    return out
+                for doc_id, distance in pairs:
+                    prev = best.get(doc_id)
+                    if prev is None or distance < prev:
+                        best[doc_id] = distance
                 if k_pool >= vec_k_max or len(pairs) < k_pool:
                     break
+                # Expand while filters may still hide eligible hits in a larger pool.
+                if len(best) >= limit * 5:
+                    break
                 k_pool = min(k_pool * 2, vec_k_max)
-            # Filters may have exhausted the 4096 cap with no fill — complete search.
-            if len(out) < limit and blob_n > 0:
-                pairs = knn_docs_numpy(
-                    self._conn,
-                    query_vec,
-                    k=None,
-                    filters=filt,
-                    kinds=kinds,
-                    model_id=model_id,
-                )
-                _consume(pairs, out=out, seen=seen)
-        elif blob_n > 0:
+        if blob_n > 0:
             pairs = knn_docs_numpy(
                 self._conn,
                 query_vec,
@@ -2075,7 +2055,28 @@ class SqliteRepository:
                 kinds=kinds,
                 model_id=model_id,
             )
-            _consume(pairs, out=out, seen=seen)
+            for doc_id, distance in pairs:
+                prev = best.get(doc_id)
+                if prev is None or distance < prev:
+                    best[doc_id] = distance
+            # Prefer authoritative blob distance for docs that have a blob.
+            import numpy as np
+
+            from slack_cache_mcp.search.embedder import cosine_similarity
+
+            q = np.asarray(query_vec, dtype=np.float32)
+            for doc_id in list(best):
+                brow = self._conn.execute(
+                    "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchone()
+                if brow is not None:
+                    emb = np.frombuffer(brow["embedding"], dtype=np.float32)
+                    best[doc_id] = 1.0 - float(cosine_similarity(q, emb))
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        ranked = sorted(best.items(), key=lambda x: x[1])
+        _consume(ranked, out=out, seen=seen)
         return out
 
     def _doc_to_search_hit(
@@ -2183,6 +2184,7 @@ class SqliteRepository:
             since = self._read_whats_new_cursor(meta_key, watermark_store)
         lim = min(limit, 200)
         use_rowid = since.startswith("rowid:") or since.isdigit()
+        insert_bound: int | None = None
         if use_rowid:
             after_rowid = 0
             if since.startswith("rowid:"):
@@ -2198,8 +2200,17 @@ class SqliteRepository:
             order = " ORDER BY rowid ASC LIMIT ?"
         else:
             # Finish legacy first_seen order (with ch/ts tie-break) before rowid.
+            # Carry an insertion boundary so concurrent inserts behind the cursor
+            # are drained via rowid after legacy completes (not skipped).
             body = since[7:] if since.startswith("legacy:") else since
-            chunks = body.split("|")
+            bound_parts = body.split("#rowbound:")
+            body_main = bound_parts[0]
+            if len(bound_parts) == 2:
+                with contextlib.suppress(ValueError):
+                    insert_bound = int(bound_parts[1])
+            if insert_bound is None:
+                insert_bound = self._max_message_rowid()
+            chunks = body_main.split("|")
             cur_fs = chunks[0]
             if len(chunks) >= 3:
                 sql = """
@@ -2238,32 +2249,14 @@ class SqliteRepository:
             elif has_more:
                 new_mark = (
                     f"legacy:{last['first_seen']}|{last['channel_id']}|{last['ts']}"
+                    f"#rowbound:{insert_bound}"
                 )
             else:
-                # Legacy drained: pin to max rowid among delivered pages' rows
-                # AND all messages already past the legacy bound (same txn view).
-                max_rid = max(int(r["rowid"]) for r in page)
-                bound = last["first_seen"]
-                older = self._conn.execute(
-                    "SELECT MAX(rowid) AS r FROM messages WHERE first_seen <= ?",
-                    (bound,),
-                ).fetchone()
-                if older and older["r"] is not None:
-                    max_rid = max(max_rid, int(older["r"]))
-                new_mark = f"rowid:{max_rid}"
+                # Legacy drained: resume from the insertion boundary captured when
+                # legacy pagination began so later inserts are not skipped.
+                new_mark = f"rowid:{int(insert_bound or 0)}"
         else:
-            if use_rowid:
-                new_mark = since
-            else:
-                # No messages at/after legacy bound — pin to max rowid at-or-before.
-                cur_fs = (since[7:] if since.startswith("legacy:") else since).split(
-                    "|", 1
-                )[0]
-                older = self._conn.execute(
-                    "SELECT MAX(rowid) AS r FROM messages WHERE first_seen < ?",
-                    (cur_fs,),
-                ).fetchone()
-                new_mark = f"rowid:{int(older['r'] or 0)}"
+            new_mark = since if use_rowid else f"rowid:{int(insert_bound or 0)}"
         if rows or not use_rowid:
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
@@ -2278,53 +2271,55 @@ class SqliteRepository:
         row = self._conn.execute("SELECT MAX(rowid) AS r FROM messages").fetchone()
         return int(row["r"] or 0)
 
-    def mark_windows_dirty(self, channel_id: str) -> None:
-        """Queue a channel for deferred window-doc rebuild."""
-        key = "window_dirty_channels"
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key=?", (key,)
-        ).fetchone()
-        channels: list[str] = []
-        if row:
-            with contextlib.suppress(json.JSONDecodeError, TypeError):
-                parsed = json.loads(row["value"])
-                if isinstance(parsed, list):
-                    channels = [str(c) for c in parsed]
-        if channel_id not in channels:
-            channels.append(channel_id)
-        self._conn.execute(
-            """
-            INSERT INTO meta(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
-            (key, json.dumps(channels)),
-        )
-
-    def peek_dirty_window_channels(self) -> list[str]:
-        """Return dirty channels without clearing (ack after successful rebuild)."""
+    def _dirty_window_map(self) -> dict[str, int]:
+        """channel_id -> dirty generation (list form treated as generation 1)."""
         key = "window_dirty_channels"
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)
         ).fetchone()
         if not row:
-            return []
+            return {}
         with contextlib.suppress(json.JSONDecodeError, TypeError):
             parsed = json.loads(row["value"])
+            if isinstance(parsed, dict):
+                out: dict[str, int] = {}
+                for k, v in parsed.items():
+                    with contextlib.suppress(TypeError, ValueError):
+                        out[str(k)] = int(v)
+                return out
             if isinstance(parsed, list):
-                return [str(c) for c in parsed]
-        return []
+                return {str(c): 1 for c in parsed}
+        return {}
 
-    def ack_dirty_window_channel(self, channel_id: str) -> None:
-        """Remove one channel from the dirty queue after a successful rebuild."""
+    def _write_dirty_window_map(self, data: dict[str, int]) -> None:
         key = "window_dirty_channels"
-        channels = [c for c in self.peek_dirty_window_channels() if c != channel_id]
         self._conn.execute(
             """
             INSERT INTO meta(key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """,
-            (key, json.dumps(channels)),
+            (key, json.dumps(data)),
         )
+
+    def mark_windows_dirty(self, channel_id: str) -> None:
+        """Queue a channel for deferred window-doc rebuild (bump generation)."""
+        data = self._dirty_window_map()
+        data[channel_id] = int(data.get(channel_id, 0)) + 1
+        self._write_dirty_window_map(data)
+
+    def peek_dirty_window_channels(self) -> list[tuple[str, int]]:
+        """Return (channel_id, generation) without clearing."""
+        return list(self._dirty_window_map().items())
+
+    def ack_dirty_window_channel(self, channel_id: str, generation: int) -> None:
+        """Ack only if ``generation`` still matches (newer marks stay dirty)."""
+        data = self._dirty_window_map()
+        cur = data.get(channel_id)
+        if cur is None:
+            return
+        if int(cur) == int(generation):
+            del data[channel_id]
+            self._write_dirty_window_map(data)
         self._conn.commit()
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:

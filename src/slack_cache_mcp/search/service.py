@@ -48,8 +48,11 @@ class SearchService:
         try:
             from slack_cache_mcp.embeddings.factory import load_embedder
 
-            fresh = load_embedder(models_dir=self.models_dir)
-            # Prefer a model matching the archive index when available.
+            # Load the archive's exact model — not "best available" (ONNX files
+            # must not override an archive that switched to hashing).
+            fresh = load_embedder(
+                models_dir=self.models_dir, model_id=archive_model
+            )
             if fresh.model_id == archive_model or (
                 archive_model.startswith("hashing")
                 and fresh.model_id.startswith("hashing")

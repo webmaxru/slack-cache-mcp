@@ -17,23 +17,34 @@ def load_embedder(
     models_dir: Path | None = None,
     prefer_fastembed: bool = True,
     force_hashing: bool = False,
+    model_id: str | None = None,
 ) -> Embedder:
-    """Return the best available offline embedder.
+    """Return an offline embedder.
 
-    Never contacts the network. Fastembed is used only when model files are
-    already present under ``models_dir`` (or the library's cache) and
-    ``HF_HUB_OFFLINE`` / local files allow load. Otherwise HashingEmbedder.
+    When ``model_id`` is set, load that exact model (hashing or ONNX). Otherwise
+    return the best available. Never contacts the network.
     """
+    if model_id and model_id.startswith("hashing"):
+        return HashingEmbedder(dim=DEFAULT_DIM, model_id=model_id)
+
     if force_hashing or os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing":
         return HashingEmbedder(dim=DEFAULT_DIM)
 
-    if prefer_fastembed:
+    if model_id or prefer_fastembed:
         try:
             from slack_cache_mcp.embeddings.fastembed_backend import try_load_fastembed
 
-            emb = try_load_fastembed(models_dir=models_dir)
+            kwargs: dict[str, object] = {"models_dir": models_dir}
+            if model_id:
+                kwargs["model_id"] = model_id
+            emb = try_load_fastembed(**kwargs)  # type: ignore[arg-type]
             if emb is not None:
-                return emb
+                if model_id is None or emb.model_id == model_id:
+                    return emb
         except Exception:
             pass
+        if model_id and not model_id.startswith("hashing"):
+            # Exact ONNX model requested but unavailable — do not silently
+            # substitute a different model space.
+            return HashingEmbedder(dim=DEFAULT_DIM)
     return HashingEmbedder(dim=DEFAULT_DIM)
