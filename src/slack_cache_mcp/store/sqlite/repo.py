@@ -2087,10 +2087,10 @@ class SqliteRepository:
         # Blob scan when vec is unavailable, blob-only/divergent docs exist, or
         # vec+filters still cannot fill the limit. Expand until eligible hits
         # satisfy ``limit`` (author/date/has:* filters apply after distance rank).
-        from slack_cache_mcp.store.sqlite.vec import docs_vec_divergence_ids
+        from slack_cache_mcp.store.sqlite.vec import docs_vec_needs_reconcile
 
         need_blob_scan = False
-        divergent_ids: list[int] = []
+        divergent = False
         if blob_n > 0:
             if not use_vec:
                 need_blob_scan = True
@@ -2107,10 +2107,10 @@ class SqliteRepository:
                             """
                         ).fetchone()["c"]
                     )
-                divergent_ids = docs_vec_divergence_ids(self._conn)
+                divergent = docs_vec_needs_reconcile(self._conn)
                 if (
                     blob_only > 0
-                    or divergent_ids
+                    or divergent
                     or _eligible_count(best, need=limit) < limit
                 ):
                     need_blob_scan = True
@@ -2130,7 +2130,7 @@ class SqliteRepository:
             )
             # Unrestricted when no vec, post-filters, or known divergence;
             # otherwise expand a bounded pool until eligible hits fill.
-            if not use_vec or post_filter or divergent_ids:
+            if not use_vec or post_filter or divergent:
                 pairs = knn_docs_numpy(
                     self._conn,
                     query_vec,
@@ -2426,8 +2426,21 @@ class SqliteRepository:
             (key, json.dumps(data)),
         )
 
+    def _begin_immediate(self) -> bool:
+        """Start BEGIN IMMEDIATE. True if we opened it (caller may commit).
+
+        Only treats 'within a transaction' as already-locked; lock timeouts raise.
+        """
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            return True
+        except sqlite3.OperationalError as exc:
+            if "within a transaction" in str(exc).lower():
+                return False
+            raise
+
     def _ensure_dirty_seq_initialized(self) -> None:
-        """Seed ``window_dirty_seq`` above legacy map gens before any ack/mark."""
+        """Seed ``window_dirty_seq`` above legacy map gens; never overwrite."""
         key = "window_dirty_seq"
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)
@@ -2435,11 +2448,10 @@ class SqliteRepository:
         if row:
             return
         existing_max = max(self._dirty_window_map().values(), default=0)
+        # INSERT OR IGNORE — a concurrent mark must not be clobbered by a
+        # stale legacy seed computed before that mark committed.
         self._conn.execute(
-            """
-            INSERT INTO meta(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
+            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
             (key, str(existing_max)),
         )
 
@@ -2464,28 +2476,37 @@ class SqliteRepository:
 
     def mark_windows_dirty(self, channel_id: str) -> None:
         """Queue a channel for deferred window-doc rebuild (bump generation)."""
-        with contextlib.suppress(sqlite3.OperationalError):
-            self._conn.execute("BEGIN IMMEDIATE")
+        started = self._begin_immediate()
         try:
             data = self._dirty_window_map()
             data[channel_id] = self._next_dirty_generation()
             self._write_dirty_window_map(data)
-            self._conn.commit()
+            if started:
+                self._conn.commit()
         except Exception:
-            with contextlib.suppress(sqlite3.Error):
-                self._conn.rollback()
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
             raise
 
     def peek_dirty_window_channels(self) -> list[tuple[str, int]]:
         """Return (channel_id, generation) without clearing."""
-        self._ensure_dirty_seq_initialized()
-        self._conn.commit()
-        return list(self._dirty_window_map().items())
+        started = self._begin_immediate()
+        try:
+            self._ensure_dirty_seq_initialized()
+            out = list(self._dirty_window_map().items())
+            if started:
+                self._conn.commit()
+            return out
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
 
     def ack_dirty_window_channel(self, channel_id: str, generation: int) -> None:
         """Ack only if ``generation`` still matches (newer marks stay dirty)."""
-        with contextlib.suppress(sqlite3.OperationalError):
-            self._conn.execute("BEGIN IMMEDIATE")
+        started = self._begin_immediate()
         try:
             self._ensure_dirty_seq_initialized()
             data = self._dirty_window_map()
@@ -2493,10 +2514,12 @@ class SqliteRepository:
             if cur is not None and int(cur) == int(generation):
                 del data[channel_id]
                 self._write_dirty_window_map(data)
-            self._conn.commit()
+            if started:
+                self._conn.commit()
         except Exception:
-            with contextlib.suppress(sqlite3.Error):
-                self._conn.rollback()
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
             raise
 
     def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:

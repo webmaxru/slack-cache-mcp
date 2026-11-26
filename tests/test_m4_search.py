@@ -207,6 +207,11 @@ def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
     result = embed_pending(archive, HashingEmbedder(), limit=10)
     assert result["ok"] is False
     assert result.get("error") == "refuse_hashing_demotion"
+    # Explicit rebuild may allow the demotion.
+    allowed = embed_pending(
+        archive, HashingEmbedder(), limit=10, allow_hashing_demotion=True
+    )
+    assert allowed.get("error") != "refuse_hashing_demotion"
 
 
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:

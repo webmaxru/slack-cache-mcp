@@ -36,51 +36,66 @@ def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     return True
 
 
-_DIVERGENCE_META = "docs_vec_divergence_ids"
+_DIVERGENCE_META = "docs_vec_needs_reconcile"
+_LEGACY_DIVERGENCE_META = "docs_vec_divergence_ids"
+_RECONCILED_META = "docs_vec_blob_reconciled"
 
 
-def mark_docs_vec_divergent(conn: sqlite3.Connection, doc_id: int) -> None:
-    """Record that ``doc_id``'s blob was updated while docs_vec could not be."""
-    import json
-
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key=?", (_DIVERGENCE_META,)
-    ).fetchone()
-    ids: list[int] = []
-    if row:
-        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
-            parsed = json.loads(row["value"])
-            if isinstance(parsed, list):
-                ids = [int(x) for x in parsed]
-    if int(doc_id) not in ids:
-        ids.append(int(doc_id))
+def mark_docs_vec_divergent(
+    conn: sqlite3.Connection, doc_id: int | None = None
+) -> None:
+    """Mark that blobs may diverge from docs_vec (O(1) flag, not per-id list)."""
+    del doc_id  # retained for call-site compatibility; tracking is global
     conn.execute(
         """
-        INSERT INTO meta(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        INSERT INTO meta(key, value) VALUES (?, '1')
+        ON CONFLICT(key) DO UPDATE SET value='1'
         """,
-        (_DIVERGENCE_META, json.dumps(ids)),
+        (_DIVERGENCE_META,),
     )
 
 
-def docs_vec_divergence_ids(conn: sqlite3.Connection) -> list[int]:
-    """Return doc_ids whose blobs may diverge from docs_vec."""
-    import json
-
+def docs_vec_needs_reconcile(conn: sqlite3.Connection) -> bool:
+    """True when a divergence flag or legacy per-id list is pending."""
     row = conn.execute(
-        "SELECT value FROM meta WHERE key=?", (_DIVERGENCE_META,)
+        "SELECT 1 FROM meta WHERE key=? OR key=?",
+        (_DIVERGENCE_META, _LEGACY_DIVERGENCE_META),
     ).fetchone()
-    if not row:
-        return []
-    with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
-        parsed = json.loads(row["value"])
-        if isinstance(parsed, list):
-            return [int(x) for x in parsed]
-    return []
+    return row is not None
 
 
 def clear_docs_vec_divergence(conn: sqlite3.Connection) -> None:
-    conn.execute("DELETE FROM meta WHERE key=?", (_DIVERGENCE_META,))
+    conn.execute(
+        "DELETE FROM meta WHERE key=? OR key=?",
+        (_DIVERGENCE_META, _LEGACY_DIVERGENCE_META),
+    )
+
+
+def _needs_migration_reconcile(conn: sqlite3.Connection) -> bool:
+    """One-time repair for archives divergent before the marker existed."""
+    done = conn.execute(
+        "SELECT 1 FROM meta WHERE key=?", (_RECONCILED_META,)
+    ).fetchone()
+    if done:
+        return False
+    try:
+        blob_n = int(
+            conn.execute("SELECT COUNT(*) AS c FROM doc_embeddings").fetchone()["c"]
+        )
+        vec_n = int(conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()["c"])
+    except sqlite3.OperationalError:
+        return False
+    return blob_n > 0 and vec_n > 0
+
+
+def _mark_migration_reconciled(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, '1')
+        ON CONFLICT(key) DO UPDATE SET value='1'
+        """,
+        (_RECONCILED_META,),
+    )
 
 
 def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None:
@@ -136,6 +151,7 @@ def _reconcile_docs_vec_and_blobs(conn: sqlite3.Connection, *, dim: int) -> None
             """
         )
     clear_docs_vec_divergence(conn)
+    _mark_migration_reconciled(conn)
 
 
 def ensure_docs_vec(
@@ -158,9 +174,13 @@ def ensure_docs_vec(
         "SELECT value FROM meta WHERE key='embedding_dim'"
     ).fetchone()
     if row and meta_dim and int(meta_dim["value"]) == int(dim):
-        # Reconcile on request, or whenever a divergence marker is pending
+        # Reconcile on request, pending divergence, or one-time upgrade repair
         # (equal row counts alone must not skip stale-vector repair).
-        if reconcile or docs_vec_divergence_ids(conn):
+        if (
+            reconcile
+            or docs_vec_needs_reconcile(conn)
+            or _needs_migration_reconcile(conn)
+        ):
             _reconcile_docs_vec_and_blobs(conn, dim=int(dim))
         return True
     if row and (not meta_dim or int(meta_dim["value"]) != int(dim)):
@@ -235,7 +255,7 @@ def upsert_doc_embedding(
         return
     # Force reconcile when prior divergence markers exist (equal counts alone
     # would skip and leave stale vectors hiding updated blobs).
-    if docs_vec_divergence_ids(conn):
+    if docs_vec_needs_reconcile(conn) or _needs_migration_reconcile(conn):
         ensure_docs_vec(conn, dim=dim, reconcile=True)
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))

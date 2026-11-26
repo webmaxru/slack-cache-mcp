@@ -24,8 +24,14 @@ def embed_pending(
     *,
     batch_size: int = 64,
     limit: int | None = None,
+    allow_hashing_demotion: bool = False,
 ) -> dict[str, Any]:
-    """Embed search_docs rows pending for the active model."""
+    """Embed search_docs rows pending for the active model.
+
+    ``allow_hashing_demotion`` must be True for an intentional rebuild that
+    switches a persisted ONNX index to hashing (e.g. CLI ``rebuild --embeddings``
+    with ``SLACKCACHE_EMBEDDER=hashing``). Daemon auto-fallback leaves it False.
+    """
     prev = repo._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='embedding_model'"
     ).fetchone()
@@ -35,7 +41,8 @@ def embed_pending(
     # Never auto-demote a persisted non-hashing index to hashing (daemon
     # restart / temporary ONNX load failure would wipe the production index).
     if (
-        prev
+        not allow_hashing_demotion
+        and prev
         and not str(prev["value"]).startswith("hashing")
         and str(embedder.model_id).startswith("hashing")
     ):
