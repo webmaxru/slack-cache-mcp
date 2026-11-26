@@ -171,9 +171,15 @@ def upsert_doc_embedding(
         (doc_id, dim, blob, model_id or ""),
     )
     if not try_load_sqlite_vec(conn):
+        # Blob updated but vec unavailable — drop any stale vec row so search
+        # treats this doc as blob-only rather than serving divergent content.
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))
         return
     # Create table if needed, but do not full-reconcile on every document.
     if not ensure_docs_vec(conn, dim=dim, reconcile=False):
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))
         return
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("DELETE FROM docs_vec WHERE doc_id = ?", (doc_id,))

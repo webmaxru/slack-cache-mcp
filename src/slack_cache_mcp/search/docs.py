@@ -333,7 +333,9 @@ class SearchDocsBuilder:
 
         # Iteratively expand when new buckets overlap surviving neighbors
         # (size-splits can shift spans past the original focus neighborhood).
-        for _ in range(4):
+        # Fall back to a full channel rebuild if expansion does not converge.
+        max_passes = 8
+        for pass_i in range(max_passes):
             lo = min(r[0] for r in ranges) - WINDOW_GAP_S
             hi = max(r[1] for r in ranges) + WINDOW_GAP_S
             msgs = self.repo._conn.execute(  # noqa: SLF001
@@ -397,6 +399,10 @@ class SearchDocsBuilder:
                     self._delete_doc_ids([int(w["doc_id"]) for w in overlap])
                     expanded = True
             if expanded:
+                if pass_i == max_passes - 1:
+                    # Still expanding on the last pass — full rebuild for coverage.
+                    self._rebuild_windows_for_channel(channel_id)
+                    return
                 continue
             for nb in to_flush:
                 self._flush_window(ch["workspace_key"], channel_id, nb)

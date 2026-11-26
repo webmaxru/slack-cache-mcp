@@ -2084,8 +2084,9 @@ class SqliteRepository:
                         emb = np.frombuffer(brow["embedding"], dtype=np.float32)
                         best[doc_id] = 1.0 - float(cosine_similarity(q, emb))
 
-        # Full blob scan only when vec is unavailable, or blob-only docs exist,
-        # or vec+filters still cannot fill the limit.
+        # Blob scan when vec is unavailable, blob-only/divergent docs exist, or
+        # vec+filters still cannot fill the limit. Expand until eligible hits
+        # satisfy ``limit`` (author/date filters apply after distance rank).
         need_blob_scan = False
         if blob_n > 0:
             if not use_vec:
@@ -2106,20 +2107,48 @@ class SqliteRepository:
                 if blob_only > 0 or _eligible_count(best, need=limit) < limit:
                     need_blob_scan = True
         if need_blob_scan:
-            # Bound k when filling gaps; unrestricted only for blob-only archives.
-            blob_k: int | None = None if not use_vec else max(limit * 20, 200)
-            pairs = knn_docs_numpy(
-                self._conn,
-                query_vec,
-                k=blob_k,
-                filters=filt,
-                kinds=kinds,
-                model_id=model_id,
+            post_filter = bool(
+                filt.get("user_ids")
+                or filt.get("after") is not None
+                or filt.get("before") is not None
             )
-            for doc_id, distance in pairs:
-                prev = best.get(doc_id)
-                if prev is None or distance < prev:
-                    best[doc_id] = distance
+            # Unrestricted when no vec or post-SQL filters can hide matches;
+            # otherwise expand a bounded pool until eligible hits fill.
+            if not use_vec or post_filter:
+                pairs = knn_docs_numpy(
+                    self._conn,
+                    query_vec,
+                    k=None,
+                    filters=filt,
+                    kinds=kinds,
+                    model_id=model_id,
+                )
+                for doc_id, distance in pairs:
+                    prev = best.get(doc_id)
+                    if prev is None or distance < prev:
+                        best[doc_id] = distance
+            else:
+                blob_k = max(limit * 20, 200)
+                while True:
+                    pairs = knn_docs_numpy(
+                        self._conn,
+                        query_vec,
+                        k=blob_k,
+                        filters=filt,
+                        kinds=kinds,
+                        model_id=model_id,
+                    )
+                    for doc_id, distance in pairs:
+                        prev = best.get(doc_id)
+                        if prev is None or distance < prev:
+                            best[doc_id] = distance
+                    if (
+                        _eligible_count(best, need=limit) >= limit
+                        or blob_k >= blob_n
+                        or len(pairs) < blob_k
+                    ):
+                        break
+                    blob_k = min(blob_k * 2, blob_n)
         out: list[dict[str, Any]] = []
         seen: set[int] = set()
         ranked = sorted(best.items(), key=lambda x: x[1])
@@ -2313,8 +2342,30 @@ class SqliteRepository:
                 # Legacy drained: resume from the insertion boundary captured when
                 # legacy pagination began so later inserts are not skipped.
                 new_mark = f"rowid:{int(insert_bound or 0)}"
+                # Clients that stop on has_more=false must be told more rows wait.
+                post_sql = (
+                    "SELECT 1 FROM messages WHERE deleted_state='none' AND rowid > ?"
+                )
+                post_params: list[Any] = [insert_bound]
+                if workspace:
+                    post_sql += " AND workspace_key=?"
+                    post_params.append(workspace)
+                post_sql += " LIMIT 1"
+                if self._conn.execute(post_sql, post_params).fetchone():
+                    has_more = True
         else:
             new_mark = since if use_rowid else f"rowid:{int(insert_bound or 0)}"
+            if not use_rowid and insert_bound is not None:
+                post_sql = (
+                    "SELECT 1 FROM messages WHERE deleted_state='none' AND rowid > ?"
+                )
+                post_params = [insert_bound]
+                if workspace:
+                    post_sql += " AND workspace_key=?"
+                    post_params.append(workspace)
+                post_sql += " LIMIT 1"
+                if self._conn.execute(post_sql, post_params).fetchone():
+                    has_more = True
         if rows or not use_rowid:
             self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
         return {
@@ -2360,12 +2411,18 @@ class SqliteRepository:
         )
 
     def _next_dirty_generation(self) -> int:
-        """Monotonic generation that never restarts after acknowledgements."""
+        """Monotonic generation that never restarts after acknowledgements.
+
+        On upgrade, initialize above any generation already present in the
+        dirty map so a stale ack cannot collide with a freshly assigned 1.
+        """
         key = "window_dirty_seq"
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)
         ).fetchone()
-        n = int(row["value"]) + 1 if row else 1
+        current = int(row["value"]) if row else 0
+        existing_max = max(self._dirty_window_map().values(), default=0)
+        n = max(current, existing_max) + 1
         self._conn.execute(
             """
             INSERT INTO meta(key, value) VALUES (?, ?)
