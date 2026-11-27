@@ -32,7 +32,7 @@ from slack_cache_mcp.ingest.projection import (
     max_merge_thread_meta,
 )
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 _XOX_RE = re.compile(rb"xox[a-z]-", re.I)
@@ -47,6 +47,92 @@ def _ts_num(ts: str) -> float:
         return float(ts)
     except ValueError:
         return 0.0
+
+
+# Sentinel field clock for migrated values with unknown provenance. Stable across
+# later unrelated row-HLC bumps; remote observations never overwrite it.
+_UNKNOWN_FIELD_HLC = "*"
+# Bumped by directory clock repair; peers with a lower epoch have their field
+# clocks ignored, and a higher epoch force-applies values (receiver-side repair).
+_DIRECTORY_CLOCK_EPOCH_META = "directory_clock_epoch"
+_DIRECTORY_CLOCK_EPOCH_REPAIR = 1
+# Internal field-map key: last winning clock_repair HLC (not a Slack field).
+_REPAIR_HLC_KEY = "_repair_hlc"
+
+
+def _hlc_dominates(incoming: str, existing: str | None) -> bool:
+    """True when ``incoming`` should win field-level LWW (tie → device_id lex)."""
+    if not existing:
+        return True
+    if existing == _UNKNOWN_FIELD_HLC or incoming == _UNKNOWN_FIELD_HLC:
+        return False
+    from slack_cache_mcp.ingest.hlc import parse_hlc
+
+    try:
+        return parse_hlc(incoming) >= parse_hlc(existing)
+    except ValueError:
+        return incoming >= existing
+
+
+def _load_field_hlcs(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in data.items():
+        if isinstance(key, str) and isinstance(value, str):
+            out[key] = value
+    return out
+
+
+def _dump_field_hlcs(field_hlcs: dict[str, str]) -> str:
+    return json.dumps(field_hlcs, sort_keys=True, separators=(",", ":"))
+
+
+def _real_field_hlc(clock: str | None) -> str | None:
+    """Return ``clock`` when it is a trustworthy (non-sentinel) field HLC."""
+    if not clock or clock == _UNKNOWN_FIELD_HLC:
+        return None
+    return clock
+
+
+def _merge_sparse_field(
+    existing_val: Any,
+    existing_field_hlc: str | None,
+    incoming_val: Any,
+    incoming_hlc: str | None,
+    *,
+    replace_unknown: bool = False,
+) -> tuple[Any, str | None]:
+    """Per-field LWW: null incoming is a no-op; non-null keeps its own clock.
+
+    ``incoming_hlc is None`` = unknown incoming (sparse-fill nulls only).
+    ``*`` = stable unknown local provenance; remotes cannot overwrite; local
+    writes pass ``replace_unknown=True`` to set a real clock.
+    """
+    if incoming_val is None:
+        return existing_val, existing_field_hlc
+    if existing_val is None:
+        return incoming_val, incoming_hlc if incoming_hlc is not None else _UNKNOWN_FIELD_HLC
+    pinned = existing_field_hlc if existing_field_hlc is not None else _UNKNOWN_FIELD_HLC
+    if pinned == _UNKNOWN_FIELD_HLC:
+        # Convergent: any real HLC wins over unknown (local or peer). Two unknowns
+        # pick the lexicographically greater value for order-independence.
+        if incoming_hlc and incoming_hlc != _UNKNOWN_FIELD_HLC:
+            return incoming_val, incoming_hlc
+        if str(incoming_val) > str(existing_val):
+            return incoming_val, _UNKNOWN_FIELD_HLC
+        return existing_val, _UNKNOWN_FIELD_HLC
+    if incoming_hlc is None or incoming_hlc == _UNKNOWN_FIELD_HLC:
+        return existing_val, pinned
+    if _hlc_dominates(incoming_hlc, pinned):
+        return incoming_val, incoming_hlc
+    return existing_val, pinned
 
 
 def _filter_clause(filters: dict[str, Any], *, alias: str = "m") -> tuple[str, list[Any]]:
@@ -300,18 +386,869 @@ class SqliteRepository:
               ON search_docs(channel_id, anchor_ts)
             """
         )
+        # M5 sync cursors (additive)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_cursors (
+              peer TEXT NOT NULL,
+              direction TEXT NOT NULL,
+              cursor TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (peer, direction)
+            ) STRICT
+            """
+        )
+        # Per-field HLC maps for sparse directory LWW (additive).
+        for table in ("workspaces", "channels", "users"):
+            cols = {
+                row[1] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if cols and "field_hlcs_json" not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN field_hlcs_json TEXT NOT NULL DEFAULT '{{}}'"
+                )
+        self._pin_unknown_directory_field_hlcs()
 
-    def upsert_device(self, device_id: str, label: str) -> None:
+    def directory_clock_epoch(self) -> int:
+        raw = self.get_meta(_DIRECTORY_CLOCK_EPOCH_META)
+        if raw is None:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def set_directory_clock_epoch(self, epoch: int, *, commit: bool = False) -> None:
+        self.set_meta(_DIRECTORY_CLOCK_EPOCH_META, str(int(epoch)), commit=commit)
+
+    def invalidate_directory_field_clocks(self, *, commit: bool = False) -> None:
+        """Pin every non-null directory field to ``*`` (epoch repair)."""
+        specs: list[tuple[str, str, tuple[str, ...]]] = [
+            (
+                "workspaces",
+                "workspace_key",
+                ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
+            ),
+            (
+                "channels",
+                "channel_id",
+                ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
+            ),
+            (
+                "users",
+                "user_id",
+                ("team_id", "name", "real_name", "display_name", "title", "tz"),
+            ),
+        ]
+        for table, pk, fields in specs:
+            for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
+                repaired = {
+                    field: _UNKNOWN_FIELD_HLC for field in fields if row[field] is not None
+                }
+                self._conn.execute(
+                    f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                    (_dump_field_hlcs(repaired), row[pk]),
+                )
+        if commit:
+            self._conn.commit()
+
+    def _pin_unknown_directory_field_hlcs(self) -> None:
+        """Repair directory provenance via value recovery, then epoch bump.
+
+        1. Restore each field's value from the dominating ``(value, clock)`` pair
+           in ``change_log`` (value and clock stay paired for selection only).
+        2. Pin every non-null field clock to ``*`` — historical clocks are not
+           trusted as provenance (they may be fabricated).
+        3. Bump ``directory_clock_epoch`` and mark ``v8-pending-outbox-purge`` so
+           the next export rebuilds local directory outbox with ``clock_repair``.
+        """
+        policy = self.get_meta("field_hlcs_policy")
+        if policy in (
+            "v8-epoch-repair",
+            "v8-pending-outbox-purge",
+        ):
+            return
+        specs: list[tuple[str, str, str, tuple[str, ...]]] = [
+            (
+                "workspaces",
+                "workspace",
+                "workspace_key",
+                ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
+            ),
+            (
+                "channels",
+                "channel",
+                "channel_id",
+                ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
+            ),
+            (
+                "users",
+                "user",
+                "user_id",
+                ("team_id", "name", "real_name", "display_name", "title", "tz"),
+            ),
+        ]
+        # Best (value, clock) per field from outbox history — clock and value stay paired.
+        # Prefer pairs that already match the current table value (applied state).
+        recovered: dict[tuple[str, str, str], tuple[Any, str]] = {}
+        for entity in ("workspace", "channel", "user"):
+            for row in self._conn.execute(
+                "SELECT entity_key, payload_json FROM change_log WHERE entity=?",
+                (entity,),
+            ).fetchall():
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                field_hlcs = payload.get("field_hlcs")
+                if not isinstance(field_hlcs, dict):
+                    continue
+                for field, clock in field_hlcs.items():
+                    if not isinstance(field, str) or not isinstance(clock, str):
+                        continue
+                    real = _real_field_hlc(clock)
+                    if real is None:
+                        continue
+                    value = payload.get(field)
+                    if value is None:
+                        continue
+                    key = (entity, str(row["entity_key"]), field)
+                    prev = recovered.get(key)
+                    if prev is None or _hlc_dominates(real, prev[1]):
+                        recovered[key] = (value, real)
+
+        for table, entity, pk, fields in specs:
+            for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
+                repaired: dict[str, str] = {}
+                updates: dict[str, Any] = {}
+                for field in fields:
+                    table_val = row[field]
+                    pair = recovered.get((entity, str(row[pk]), field))
+                    if pair is not None:
+                        value, _clock = pair
+                        if table_val != value:
+                            updates[field] = value
+                            table_val = value
+                    if table_val is not None:
+                        # Never re-export historical clocks as trusted provenance.
+                        repaired[field] = _UNKNOWN_FIELD_HLC
+                if updates:
+                    assignments = ", ".join(f"{col}=?" for col in updates)
+                    self._conn.execute(
+                        f"UPDATE {table} SET {assignments}, field_hlcs_json=? WHERE {pk}=?",
+                        (*updates.values(), _dump_field_hlcs(repaired), row[pk]),
+                    )
+                else:
+                    self._conn.execute(
+                        f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                        (_dump_field_hlcs(repaired), row[pk]),
+                    )
+        current_epoch = self.directory_clock_epoch()
+        if current_epoch < _DIRECTORY_CLOCK_EPOCH_REPAIR:
+            self.set_directory_clock_epoch(_DIRECTORY_CLOCK_EPOCH_REPAIR, commit=False)
+        self.set_meta("field_hlcs_policy", "v8-pending-outbox-purge", commit=False)
+
+    def upsert_device(
+        self, device_id: str, label: str, *, public_key: str | None = None
+    ) -> None:
         now = _utc_now()
         self._conn.execute(
             """
-            INSERT INTO devices(device_id, label, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET label=excluded.label
+            INSERT INTO devices(device_id, label, public_key, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+              label=excluded.label,
+              public_key=COALESCE(excluded.public_key, devices.public_key)
             """,
-            (device_id, label, now),
+            (device_id, label, public_key, now),
         )
         self._conn.commit()
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT device_id, label, public_key, created_at FROM devices ORDER BY device_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_sync_cursor(self, peer: str, direction: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT cursor FROM sync_cursors WHERE peer=? AND direction=?",
+            (peer, direction),
+        ).fetchone()
+        return str(row["cursor"]) if row else None
+
+    def set_sync_cursor(self, peer: str, direction: str, cursor: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(peer, direction) DO UPDATE SET
+              cursor=excluded.cursor,
+              updated_at=excluded.updated_at
+            """,
+            (peer, direction, cursor, _utc_now()),
+        )
+        self._conn.commit()
+
+    def reset_push_cursors(self) -> int:
+        """Reset every push cursor so the next export re-sends full history."""
+        cur = self._conn.execute(
+            """
+            UPDATE sync_cursors SET cursor='0', updated_at=?
+            WHERE direction='push'
+            """,
+            (_utc_now(),),
+        )
+        # Ensure the default folder peer exists even if never exported.
+        self._conn.execute(
+            """
+            INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+            VALUES ('folder', 'push', '0', ?)
+            ON CONFLICT(peer, direction) DO UPDATE SET
+              cursor='0', updated_at=excluded.updated_at
+            """,
+            (_utc_now(),),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
+    def change_log_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) AS c FROM change_log").fetchone()["c"])
+
+    def max_local_hlc(self, device_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT hlc FROM change_log WHERE device_id=? ORDER BY seq DESC LIMIT 1",
+            (device_id,),
+        ).fetchone()
+        return str(row["hlc"]) if row else None
+
+    def has_change_log(
+        self,
+        *,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        payload_sha256: str,
+    ) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM change_log
+            WHERE device_id=? AND entity=? AND entity_key=? AND payload_sha256=?
+            """,
+            (device_id, entity, entity_key, payload_sha256),
+        ).fetchone()
+        return row is not None
+
+    def insert_change_log_row(
+        self,
+        *,
+        hlc: str,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        op: str,
+        payload: dict[str, Any],
+        payload_sha256: str,
+        commit: bool = True,
+    ) -> bool:
+        """Insert outbox row. Returns True if a new row was written."""
+        from slack_cache_mcp.desktop.sanitize import sanitize
+
+        clean = sanitize(payload)
+        if not isinstance(clean, dict):
+            raise TypeError("change_log payload must sanitize to a dict")
+        payload_json = json.dumps(clean, sort_keys=True, ensure_ascii=False)
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO change_log(
+              hlc, device_id, entity, entity_key, op, payload_json, payload_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (hlc, device_id, entity, entity_key, op, payload_json, payload_sha256),
+        )
+        if commit:
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_device(self, device_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT device_id, label, public_key, created_at FROM devices WHERE device_id=?",
+            (device_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_meta(self, key: str, value: str, *, commit: bool = True) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        if commit:
+            self._conn.commit()
+
+    def get_hlc_watermark(self) -> str | None:
+        return self.get_meta("hlc_watermark")
+
+    def set_hlc_watermark(self, hlc: str, *, commit: bool = True) -> None:
+        """Monotonic HLC watermark with an atomic compare-and-swap.
+
+        ``BEGIN IMMEDIATE`` serializes concurrent snapshot/import writers on
+        separate connections so a stale read cannot overwrite a newer watermark.
+        """
+        from slack_cache_mcp.ingest.hlc import parse_hlc
+
+        own_tx = commit
+        started = False
+        if own_tx and not self._conn.in_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+            started = True
+        try:
+            current = self.get_hlc_watermark()
+            if current is not None:
+                try:
+                    if parse_hlc(hlc) <= parse_hlc(current):
+                        if started:
+                            self._conn.commit()
+                        return
+                except ValueError:
+                    pass
+            self.set_meta("hlc_watermark", hlc, commit=False)
+            if started or own_tx:
+                self._conn.commit()
+        except Exception:
+            if started or own_tx:
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+            raise
+
+    def delete_incomplete_local_message_outbox(self, device_id: str) -> int:
+        """Drop legacy stub message_version outbox rows missing full content fields."""
+        rows = self._conn.execute(
+            """
+            SELECT seq, payload_json FROM change_log
+            WHERE device_id=? AND entity='message_version'
+            """,
+            (device_id,),
+        ).fetchall()
+        deleted = 0
+        for r in rows:
+            try:
+                payload = json.loads(r["payload_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if "text" in payload and "raw" in payload and "workspace_key" in payload:
+                continue
+            self._conn.execute("DELETE FROM change_log WHERE seq=?", (r["seq"],))
+            deleted += 1
+        if deleted:
+            self._conn.commit()
+        return deleted
+
+    def _has_entity_outbox(self, device_id: str, entity: str, entity_key: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM change_log
+            WHERE device_id=? AND entity=? AND entity_key=?
+            LIMIT 1
+            """,
+            (device_id, entity, entity_key),
+        ).fetchone()
+        return row is not None
+
+    def _outbox_covers_fields(
+        self,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        required: dict[str, Any],
+    ) -> bool:
+        """True when union of outbox payloads already carries every non-null required field."""
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM change_log
+            WHERE device_id=? AND entity=? AND entity_key=?
+            """,
+            (device_id, entity, entity_key),
+        ).fetchall()
+        if not rows:
+            return False
+        merged: dict[str, Any] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for key, value in payload.items():
+                if value is not None:
+                    merged[key] = value
+        for key, value in required.items():
+            if value is not None and merged.get(key) is None:
+                return False
+        return True
+
+    def backfill_outbox(self, *, device_id: str, hlc: str) -> dict[str, int]:
+        """Write missing sanitized outbox facts from archive tables (M4→M5 upgrade).
+
+        Preserves each row's original ``updated_hlc`` (falling back to ``hlc`` only
+        when absent) so backfill cannot reauthor stale directory facts ahead of
+        peer observations. Skips entity keys that already have any outbox row.
+        """
+        from slack_cache_mcp.domain.models import Channel, User, Workspace
+
+        policy = self.get_meta("field_hlcs_policy")
+        emit_clock_repair = policy in (
+            "v8-pending-outbox-purge",
+            "v7-pending-outbox-purge",
+            "v6-pending-outbox-purge",
+            "v5-pending-outbox-purge",
+        )
+        if emit_clock_repair:
+            # Drop fabricated local directory facts; peer markers stay for idempotency.
+            # Keep policy as *-pending until rebuild finishes so a crash retries with
+            # clock_repair authority instead of ordinary backfill.
+            self._conn.execute(
+                """
+                DELETE FROM change_log
+                WHERE device_id=? AND entity IN ('workspace', 'channel', 'user')
+                """,
+                (device_id,),
+            )
+            self._conn.execute(
+                """
+                UPDATE sync_cursors SET cursor='0', updated_at=?
+                WHERE direction='push'
+                """,
+                (_utc_now(),),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                VALUES ('folder', 'push', '0', ?)
+                ON CONFLICT(peer, direction) DO UPDATE SET
+                  cursor='0', updated_at=excluded.updated_at
+                """,
+                (_utc_now(),),
+            )
+            self._conn.commit()
+
+        self.delete_incomplete_local_message_outbox(device_id)
+        counts = {
+            "workspaces": 0,
+            "channels": 0,
+            "users": 0,
+            "message_versions": 0,
+            "sightings": 0,
+        }
+
+        def _row_hlc(row: Any, fallback: str) -> str:
+            try:
+                value = row["updated_hlc"]
+            except (KeyError, IndexError, TypeError):
+                value = None
+            return str(value) if value else fallback
+
+        for r in self._conn.execute("SELECT * FROM workspaces").fetchall():
+            required = {
+                "team_id": r["team_id"],
+                "enterprise_id": r["enterprise_id"],
+                "name": r["name"],
+                "domain": r["domain"],
+                "self_user_id": r["self_user_id"],
+            }
+            if self._outbox_covers_fields(
+                device_id, "workspace", r["workspace_key"], required
+            ):
+                continue
+            ws = Workspace(
+                workspace_key=r["workspace_key"],
+                team_id=r["team_id"],
+                enterprise_id=r["enterprise_id"],
+                name=r["name"],
+                domain=r["domain"],
+                self_user_id=r["self_user_id"],
+                self_is_guest=bool(r["self_is_guest"]),
+                raw=json.loads(r["raw_json"] or "{}"),
+            )
+            # Export only known clocks — never invent row HLC for unclocked fields.
+            field_hlcs = {
+                k: v
+                for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
+                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+            }
+            if self.append_entity_change(
+                hlc=_row_hlc(r, hlc),
+                device_id=device_id,
+                entity="workspace",
+                entity_key=ws.workspace_key,
+                payload={
+                    "workspace_key": ws.workspace_key,
+                    "team_id": ws.team_id,
+                    "enterprise_id": ws.enterprise_id,
+                    "name": ws.name,
+                    "domain": ws.domain,
+                    "self_user_id": ws.self_user_id,
+                    "self_is_guest": ws.self_is_guest,
+                    "raw": ws.raw,
+                    "first_seen": r["first_seen"],
+                    "last_seen": r["last_seen"],
+                    "field_hlcs": field_hlcs,
+                    "clock_epoch": self.directory_clock_epoch(),
+                    **({"clock_repair": True} if emit_clock_repair else {}),
+                },
+            ):
+                counts["workspaces"] += 1
+        for r in self._conn.execute("SELECT * FROM channels").fetchall():
+            required = {
+                "workspace_key": r["workspace_key"],
+                "context_team_id": r["context_team_id"],
+                "name": r["name"],
+                "topic": r["topic"],
+                "purpose": r["purpose"],
+                "im_user_id": r["im_user_id"],
+            }
+            ws_keys = [
+                row["workspace_key"]
+                for row in self._conn.execute(
+                    "SELECT workspace_key FROM channel_workspaces WHERE channel_id=?",
+                    (r["channel_id"],),
+                ).fetchall()
+            ]
+            alias_rows = self._conn.execute(
+                "SELECT name, first_seen FROM channel_aliases WHERE channel_id=?",
+                (r["channel_id"],),
+            ).fetchall()
+            aliases = [
+                {"name": row["name"], "first_seen": row["first_seen"]} for row in alias_rows
+            ]
+            # Union coverage: every workspace/alias (with earliest first_seen) must appear.
+            covered_ws: set[str] = set()
+            covered_alias_seen: dict[str, str] = {}
+            for prow in self._conn.execute(
+                """
+                SELECT payload_json FROM change_log
+                WHERE device_id=? AND entity='channel' AND entity_key=?
+                """,
+                (device_id, r["channel_id"]),
+            ).fetchall():
+                try:
+                    payload = json.loads(prow["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if isinstance(payload.get("workspace_key"), str):
+                    covered_ws.add(payload["workspace_key"])
+                for wk in payload.get("workspace_keys") or []:
+                    if isinstance(wk, str):
+                        covered_ws.add(wk)
+                for alias in payload.get("alias_records") or []:
+                    if isinstance(alias, dict) and isinstance(alias.get("name"), str):
+                        name = alias["name"]
+                        seen = str(alias.get("first_seen") or "")
+                        prev = covered_alias_seen.get(name)
+                        if prev is None or (seen and (not prev or seen < prev)):
+                            covered_alias_seen[name] = seen
+            # Dual-format coverage: require string aliases list AND earliest first_seen.
+            has_string_aliases = False
+            for prow2 in self._conn.execute(
+                """
+                SELECT payload_json FROM change_log
+                WHERE device_id=? AND entity='channel' AND entity_key=?
+                """,
+                (device_id, r["channel_id"]),
+            ).fetchall():
+                try:
+                    p2 = json.loads(prow2["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(p2, dict):
+                    continue
+                if any(isinstance(a, str) for a in (p2.get("aliases") or [])):
+                    has_string_aliases = True
+                    break
+            aliases_covered = has_string_aliases or not aliases
+            for alias in aliases:
+                name = alias["name"]
+                want = str(alias["first_seen"] or "")
+                got = covered_alias_seen.get(name)
+                if got is None or (want and (not got or got > want)):
+                    aliases_covered = False
+                    break
+            if (
+                self._outbox_covers_fields(device_id, "channel", r["channel_id"], required)
+                and set(ws_keys).issubset(covered_ws)
+                and aliases_covered
+            ):
+                continue
+            ch = Channel(
+                channel_id=r["channel_id"],
+                workspace_key=r["workspace_key"],
+                context_team_id=r["context_team_id"],
+                name=r["name"],
+                kind=r["kind"],
+                is_ext_shared=bool(r["is_ext_shared"]),
+                is_archived=bool(r["is_archived"]),
+                is_member=bool(r["is_member"]),
+                topic=r["topic"],
+                purpose=r["purpose"],
+                im_user_id=r["im_user_id"],
+                raw=json.loads(r["raw_json"] or "{}"),
+            )
+            field_hlcs = {
+                k: v
+                for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
+                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+            }
+            if self.append_entity_change(
+                hlc=_row_hlc(r, hlc),
+                device_id=device_id,
+                entity="channel",
+                entity_key=ch.channel_id,
+                payload={
+                    "channel_id": ch.channel_id,
+                    "workspace_key": ch.workspace_key,
+                    "workspace_keys": ws_keys,
+                    "aliases": [a["name"] for a in aliases],
+                    "alias_records": aliases,
+                    "context_team_id": ch.context_team_id,
+                    "name": ch.name,
+                    "kind": ch.kind,
+                    "is_ext_shared": ch.is_ext_shared,
+                    "is_archived": ch.is_archived,
+                    "is_member": ch.is_member,
+                    "topic": ch.topic,
+                    "purpose": ch.purpose,
+                    "im_user_id": ch.im_user_id,
+                    "raw": ch.raw,
+                    "first_seen": r["first_seen"],
+                    "last_seen": r["last_seen"],
+                    "field_hlcs": field_hlcs,
+                    "clock_epoch": self.directory_clock_epoch(),
+                    **({"clock_repair": True} if emit_clock_repair else {}),
+                },
+            ):
+                counts["channels"] += 1
+        for r in self._conn.execute("SELECT * FROM users").fetchall():
+            required = {
+                "name": r["name"],
+                "real_name": r["real_name"],
+                "display_name": r["display_name"],
+                "title": r["title"],
+                "tz": r["tz"],
+                "team_id": r["team_id"],
+            }
+            ws_keys = [
+                row["workspace_key"]
+                for row in self._conn.execute(
+                    "SELECT workspace_key FROM user_workspaces WHERE user_id=?",
+                    (r["user_id"],),
+                ).fetchall()
+            ]
+            required_with_assoc = {
+                **required,
+                "workspace_keys": ws_keys or None,
+            }
+            if self._outbox_covers_fields(
+                device_id, "user", r["user_id"], required_with_assoc
+            ):
+                # Association coverage: every workspace_key must appear in some payload.
+                covered_user_ws: set[str] = set()
+                for prow in self._conn.execute(
+                    """
+                    SELECT payload_json FROM change_log
+                    WHERE device_id=? AND entity='user' AND entity_key=?
+                    """,
+                    (device_id, r["user_id"]),
+                ).fetchall():
+                    try:
+                        payload = json.loads(prow["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if isinstance(payload.get("workspace_key"), str):
+                        covered_user_ws.add(payload["workspace_key"])
+                    for wk in payload.get("workspace_keys") or []:
+                        if isinstance(wk, str):
+                            covered_user_ws.add(wk)
+                if set(ws_keys).issubset(covered_user_ws):
+                    continue
+            user = User(
+                user_id=r["user_id"],
+                team_id=r["team_id"],
+                name=r["name"],
+                real_name=r["real_name"],
+                display_name=r["display_name"],
+                title=r["title"],
+                email=None,
+                is_bot=bool(r["is_bot"]),
+                is_deleted=bool(r["is_deleted"]),
+                is_restricted=bool(r["is_restricted"]),
+                is_ultra_restricted=bool(r["is_ultra_restricted"]),
+                is_external=bool(r["is_external"]),
+                tz=r["tz"],
+                raw=json.loads(r["raw_json"] or "{}"),
+                workspace_key=ws_keys[0] if ws_keys else None,
+            )
+            field_hlcs = {
+                k: v
+                for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
+                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+            }
+            if self.append_entity_change(
+                hlc=_row_hlc(r, hlc),
+                device_id=device_id,
+                entity="user",
+                entity_key=user.user_id,
+                payload={
+                    "user_id": user.user_id,
+                    "team_id": user.team_id,
+                    "name": user.name,
+                    "real_name": user.real_name,
+                    "display_name": user.display_name,
+                    "title": user.title,
+                    "email": None,
+                    "is_bot": user.is_bot,
+                    "is_deleted": user.is_deleted,
+                    "is_restricted": user.is_restricted,
+                    "is_ultra_restricted": user.is_ultra_restricted,
+                    "is_external": user.is_external,
+                    "tz": user.tz,
+                    "raw": user.raw,
+                    "workspace_key": user.workspace_key,
+                    "workspace_keys": ws_keys,
+                    "first_seen": r["first_seen"],
+                    "last_seen": r["last_seen"],
+                    "field_hlcs": field_hlcs,
+                    "clock_epoch": self.directory_clock_epoch(),
+                    **({"clock_repair": True} if emit_clock_repair else {}),
+                },
+            ):
+                counts["users"] += 1
+        for r in self._conn.execute("SELECT * FROM message_versions").fetchall():
+            entity_key = f"{r['channel_id']}|{r['ts']}|{r['content_sha256']}"
+            if self._has_entity_outbox(device_id, "message_version", entity_key):
+                continue
+            ch = self._conn.execute(
+                "SELECT workspace_key FROM channels WHERE channel_id=?",
+                (r["channel_id"],),
+            ).fetchone()
+            workspace_key = ch["workspace_key"] if ch else "unknown"
+            raw = json.loads(r["raw_json"] or "{}")
+            payload = {
+                "channel_id": r["channel_id"],
+                "ts": r["ts"],
+                "workspace_key": workspace_key,
+                "content_sha256": r["content_sha256"],
+                "edited_ts": r["edited_ts"],
+                "is_deletion": bool(r["is_deletion"]),
+                "is_partial": bool(r["is_partial"]),
+                "source_rank": r["source_rank"],
+                "user_id": r["user_id"],
+                "thread_ts": r["thread_ts"],
+                "subtype": r["subtype"],
+                "text": r["text"],
+                "search_text": r["search_text"],
+                "raw": raw,
+                "source": "backfill",
+                "first_seen": r["first_seen"],
+                "last_seen": r["last_seen"],
+            }
+            if self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="message_version",
+                entity_key=entity_key,
+                payload=payload,
+            ):
+                counts["message_versions"] += 1
+        for r in self._conn.execute(
+            """
+            SELECT * FROM message_sightings
+            WHERE device_id=?
+            """,
+            (device_id,),
+        ).fetchall():
+            sighting_key = (
+                f"{r['channel_id']}|{r['ts']}|{r['content_sha256']}|"
+                f"{r['device_id']}|{r['source']}"
+            )
+            if self._has_entity_outbox(device_id, "sighting", sighting_key):
+                continue
+            if self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="sighting",
+                entity_key=sighting_key,
+                payload={
+                    "channel_id": r["channel_id"],
+                    "ts": r["ts"],
+                    "content_sha256": r["content_sha256"],
+                    "device_id": r["device_id"],
+                    "source": r["source"],
+                    "first_seen": r["first_seen"],
+                    "last_seen": r["last_seen"],
+                    "snapshot_id": r["last_snapshot_id"] or r["first_snapshot_id"] or "backfill",
+                    "state_sha256": r["last_state_sha256"] or "backfill",
+                },
+            ):
+                counts["sightings"] += 1
+        if emit_clock_repair:
+            self.set_meta("field_hlcs_policy", "v8-epoch-repair", commit=True)
+        return counts
+
+    def list_change_log_since(
+        self, *, device_id: str, since_seq: int
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT seq, hlc, device_id, entity, entity_key, op, payload_json, payload_sha256
+            FROM change_log
+            WHERE device_id=? AND seq > ?
+            ORDER BY seq ASC
+            """,
+            (device_id, since_seq),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def append_entity_change(
+        self,
+        *,
+        hlc: str,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        payload: dict[str, Any],
+        op: str = "upsert",
+    ) -> bool:
+        from slack_cache_mcp.desktop.sanitize import sanitize
+
+        clean = sanitize(payload)
+        if not isinstance(clean, dict):
+            raise TypeError("change_log payload must sanitize to a dict")
+        blob = json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        sha = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return self.insert_change_log_row(
+            hlc=hlc,
+            device_id=device_id,
+            entity=entity,
+            entity_key=entity_key,
+            op=op,
+            payload=clean,
+            payload_sha256=sha,
+        )
 
     def upsert_source(
         self,
@@ -607,43 +1544,414 @@ class SqliteRepository:
         self._conn.commit()
         return marked
 
-    def upsert_workspace(self, ws: Workspace, hlc: str, seen_at: str) -> None:
+    def upsert_workspace(
+        self,
+        ws: Workspace,
+        hlc: str,
+        seen_at: str,
+        *,
+        device_id: str | None = None,
+        write_change_log: bool = True,
+        hlc_lww: bool = True,
+        commit: bool = True,
+        incoming_field_hlcs: dict[str, str] | None = None,
+        force_fields: bool = False,
+        fill_nulls_only: bool = False,
+    ) -> None:
         raw = json.dumps(ws.raw, ensure_ascii=False)
-        self._conn.execute(
-            """
-            INSERT INTO workspaces(
-              workspace_key, team_id, enterprise_id, name, domain, self_user_id,
-              self_is_guest, raw_json, first_seen, last_seen, updated_hlc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workspace_key) DO UPDATE SET
-              team_id=COALESCE(excluded.team_id, workspaces.team_id),
-              enterprise_id=COALESCE(excluded.enterprise_id, workspaces.enterprise_id),
-              name=COALESCE(excluded.name, workspaces.name),
-              domain=COALESCE(excluded.domain, workspaces.domain),
-              self_user_id=COALESCE(excluded.self_user_id, workspaces.self_user_id),
-              self_is_guest=excluded.self_is_guest,
-              raw_json=excluded.raw_json,
-              last_seen=excluded.last_seen,
-              updated_hlc=excluded.updated_hlc
-            """,
-            (
-                ws.workspace_key,
-                ws.team_id,
-                ws.enterprise_id,
-                ws.name,
-                ws.domain,
-                ws.self_user_id,
-                1 if ws.self_is_guest else 0,
-                raw,
-                seen_at,
-                seen_at,
-                hlc,
-            ),
-        )
-        self._conn.commit()
+        _ = hlc_lww  # always maintain per-field clocks
+        existing = self._conn.execute(
+            "SELECT * FROM workspaces WHERE workspace_key=?",
+            (ws.workspace_key,),
+        ).fetchone()
+        if existing is None:
+            field_hlcs: dict[str, str] = {}
+            for key, val in (
+                ("team_id", ws.team_id),
+                ("enterprise_id", ws.enterprise_id),
+                ("name", ws.name),
+                ("domain", ws.domain),
+                ("self_user_id", ws.self_user_id),
+            ):
+                if val is None:
+                    continue
+                if incoming_field_hlcs is not None:
+                    field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
+                else:
+                    field_hlcs[key] = hlc
+            if incoming_field_hlcs and incoming_field_hlcs.get(_REPAIR_HLC_KEY):
+                field_hlcs[_REPAIR_HLC_KEY] = incoming_field_hlcs[_REPAIR_HLC_KEY]
+            self._conn.execute(
+                """
+                INSERT INTO workspaces(
+                  workspace_key, team_id, enterprise_id, name, domain, self_user_id,
+                  self_is_guest, raw_json, first_seen, last_seen, updated_hlc,
+                  field_hlcs_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ws.workspace_key,
+                    ws.team_id,
+                    ws.enterprise_id,
+                    ws.name,
+                    ws.domain,
+                    ws.self_user_id,
+                    1 if ws.self_is_guest else 0,
+                    raw,
+                    seen_at,
+                    seen_at,
+                    hlc,
+                    _dump_field_hlcs(field_hlcs),
+                ),
+            )
+        else:
+            field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
-    def upsert_channel(self, ch: Channel, hlc: str, seen_at: str) -> None:
+            def _take(field: str, current: Any, incoming: Any) -> Any:
+                if fill_nulls_only:
+                    if current is not None or incoming is None:
+                        return current
+                    field_hlcs[field] = _UNKNOWN_FIELD_HLC
+                    return incoming
+                if force_fields:
+                    if incoming is None:
+                        return current
+                    forced = (
+                        incoming_field_hlcs.get(field)
+                        if incoming_field_hlcs is not None
+                        else None
+                    )
+                    field_hlcs[field] = forced if forced else _UNKNOWN_FIELD_HLC
+                    return incoming
+                if incoming_field_hlcs is not None:
+                    clock_in: str | None = incoming_field_hlcs.get(field)
+                    replace_unknown = False
+                else:
+                    clock_in = hlc
+                    replace_unknown = True
+                value, clock = _merge_sparse_field(
+                    current,
+                    field_hlcs.get(field),
+                    incoming,
+                    clock_in,
+                    replace_unknown=replace_unknown,
+                )
+                if clock:
+                    field_hlcs[field] = clock
+                else:
+                    field_hlcs.pop(field, None)
+                return value
+
+            team_id = _take("team_id", existing["team_id"], ws.team_id)
+            enterprise_id = _take(
+                "enterprise_id", existing["enterprise_id"], ws.enterprise_id
+            )
+            name = _take("name", existing["name"], ws.name)
+            domain = _take("domain", existing["domain"], ws.domain)
+            self_user_id = _take(
+                "self_user_id", existing["self_user_id"], ws.self_user_id
+            )
+            if force_fields and incoming_field_hlcs:
+                repair_hlc = incoming_field_hlcs.get(_REPAIR_HLC_KEY)
+                if repair_hlc:
+                    field_hlcs[_REPAIR_HLC_KEY] = repair_hlc
+            row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
+            self_is_guest = (
+                (1 if ws.self_is_guest else 0) if row_wins else existing["self_is_guest"]
+            )
+            raw_json = raw if row_wins else existing["raw_json"]
+            updated_hlc = hlc if row_wins else existing["updated_hlc"]
+            self._conn.execute(
+                """
+                UPDATE workspaces SET
+                  team_id=?, enterprise_id=?, name=?, domain=?, self_user_id=?,
+                  self_is_guest=?, raw_json=?, last_seen=MAX(last_seen, ?),
+                  updated_hlc=?, field_hlcs_json=?
+                WHERE workspace_key=?
+                """,
+                (
+                    team_id,
+                    enterprise_id,
+                    name,
+                    domain,
+                    self_user_id,
+                    self_is_guest,
+                    raw_json,
+                    seen_at,
+                    updated_hlc,
+                    _dump_field_hlcs(field_hlcs),
+                    ws.workspace_key,
+                ),
+            )
+        if write_change_log and device_id:
+            # Emit the merged stored row + its field clocks (not the possibly-losing
+            # incoming observation), so peers cannot accept a rejected value@winning clock.
+            stored = self._conn.execute(
+                "SELECT * FROM workspaces WHERE workspace_key=?",
+                (ws.workspace_key,),
+            ).fetchone()
+            if stored is not None:
+                self.append_entity_change(
+                    hlc=str(stored["updated_hlc"] or hlc),
+                    device_id=device_id,
+                    entity="workspace",
+                    entity_key=ws.workspace_key,
+                    payload={
+                        "workspace_key": stored["workspace_key"],
+                        "team_id": stored["team_id"],
+                        "enterprise_id": stored["enterprise_id"],
+                        "name": stored["name"],
+                        "domain": stored["domain"],
+                        "self_user_id": stored["self_user_id"],
+                        "self_is_guest": bool(stored["self_is_guest"]),
+                        "raw": json.loads(stored["raw_json"] or "{}"),
+                        "first_seen": stored["first_seen"],
+                        "last_seen": stored["last_seen"],
+                            "field_hlcs": {
+                                k: v
+                                for k, v in _load_field_hlcs(stored["field_hlcs_json"]).items()
+                                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+                            },
+                            "clock_epoch": self.directory_clock_epoch(),
+                        },
+                    )
+        if commit:
+            self._conn.commit()
+
+    def upsert_channel(
+        self,
+        ch: Channel,
+        hlc: str,
+        seen_at: str,
+        *,
+        device_id: str | None = None,
+        write_change_log: bool = True,
+        hlc_lww: bool = True,
+        commit: bool = True,
+        incoming_field_hlcs: dict[str, str] | None = None,
+        force_fields: bool = False,
+        fill_nulls_only: bool = False,
+    ) -> None:
         raw = json.dumps(ch.raw, ensure_ascii=False)
+        if hlc_lww:
+            existing = self._conn.execute(
+                "SELECT * FROM channels WHERE channel_id=?",
+                (ch.channel_id,),
+            ).fetchone()
+            if existing is None:
+                if incoming_field_hlcs is not None:
+                    field_hlcs = {
+                        "workspace_key": incoming_field_hlcs.get(
+                            "workspace_key", _UNKNOWN_FIELD_HLC
+                        )
+                    }
+                else:
+                    field_hlcs = {"workspace_key": hlc}
+                for key, val in (
+                    ("name", ch.name),
+                    ("topic", ch.topic),
+                    ("purpose", ch.purpose),
+                    ("im_user_id", ch.im_user_id),
+                    ("context_team_id", ch.context_team_id),
+                ):
+                    if val is None:
+                        continue
+                    if incoming_field_hlcs is not None:
+                        field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
+                    else:
+                        field_hlcs[key] = hlc
+                if incoming_field_hlcs and incoming_field_hlcs.get(_REPAIR_HLC_KEY):
+                    field_hlcs[_REPAIR_HLC_KEY] = incoming_field_hlcs[_REPAIR_HLC_KEY]
+                self._conn.execute(
+                    """
+                    INSERT INTO channels(
+                      channel_id, workspace_key, context_team_id, name, kind,
+                      is_ext_shared, is_archived, is_member, topic, purpose, im_user_id,
+                      raw_json, first_seen, last_seen, updated_hlc, field_hlcs_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ch.channel_id,
+                        ch.workspace_key,
+                        ch.context_team_id,
+                        ch.name,
+                        ch.kind,
+                        1 if ch.is_ext_shared else 0,
+                        1 if ch.is_archived else 0,
+                        1 if ch.is_member else 0,
+                        ch.topic,
+                        ch.purpose,
+                        ch.im_user_id,
+                        raw,
+                        seen_at,
+                        seen_at,
+                        hlc,
+                        _dump_field_hlcs(field_hlcs),
+                    ),
+                )
+            else:
+                field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
+
+                def _take(field: str, current: Any, incoming: Any) -> Any:
+                    if fill_nulls_only:
+                        if current is not None or incoming is None:
+                            return current
+                        field_hlcs[field] = _UNKNOWN_FIELD_HLC
+                        return incoming
+                    if force_fields:
+                        if incoming is None:
+                            return current
+                        forced = (
+                            incoming_field_hlcs.get(field)
+                            if incoming_field_hlcs is not None
+                            else None
+                        )
+                        field_hlcs[field] = forced if forced else _UNKNOWN_FIELD_HLC
+                        return incoming
+                    if incoming_field_hlcs is not None:
+                        clock_in: str | None = incoming_field_hlcs.get(field)
+                        replace_unknown = False
+                    else:
+                        clock_in = hlc
+                        replace_unknown = True
+                    value, clock = _merge_sparse_field(
+                        current,
+                        field_hlcs.get(field),
+                        incoming,
+                        clock_in,
+                        replace_unknown=replace_unknown,
+                    )
+                    if clock:
+                        field_hlcs[field] = clock
+                    else:
+                        field_hlcs.pop(field, None)
+                    return value
+
+                # workspace_key is required; still LWW by its own field clock so
+                # opposite delivery orders converge.
+                workspace_key = _take(
+                    "workspace_key", existing["workspace_key"], ch.workspace_key
+                )
+                name = _take("name", existing["name"], ch.name)
+                topic = _take("topic", existing["topic"], ch.topic)
+                purpose = _take("purpose", existing["purpose"], ch.purpose)
+                im_user_id = _take("im_user_id", existing["im_user_id"], ch.im_user_id)
+                context_team_id = _take(
+                    "context_team_id", existing["context_team_id"], ch.context_team_id
+                )
+                if force_fields and incoming_field_hlcs:
+                    repair_hlc = incoming_field_hlcs.get(_REPAIR_HLC_KEY)
+                    if repair_hlc:
+                        field_hlcs[_REPAIR_HLC_KEY] = repair_hlc
+                row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
+                kind = ch.kind if row_wins else existing["kind"]
+                is_ext_shared = (
+                    (1 if ch.is_ext_shared else 0) if row_wins else existing["is_ext_shared"]
+                )
+                is_archived = (
+                    (1 if ch.is_archived else 0) if row_wins else existing["is_archived"]
+                )
+                is_member = (1 if ch.is_member else 0) if row_wins else existing["is_member"]
+                raw_json = raw if row_wins else existing["raw_json"]
+                updated_hlc = hlc if row_wins else existing["updated_hlc"]
+                self._conn.execute(
+                    """
+                    UPDATE channels SET
+                      workspace_key=?, context_team_id=?, name=?, kind=?,
+                      is_ext_shared=?, is_archived=?, is_member=?,
+                      topic=?, purpose=?, im_user_id=?, raw_json=?,
+                      last_seen=MAX(last_seen, ?), updated_hlc=?, field_hlcs_json=?
+                    WHERE channel_id=?
+                    """,
+                    (
+                        workspace_key,
+                        context_team_id,
+                        name,
+                        kind,
+                        is_ext_shared,
+                        is_archived,
+                        is_member,
+                        topic,
+                        purpose,
+                        im_user_id,
+                        raw_json,
+                        seen_at,
+                        updated_hlc,
+                        _dump_field_hlcs(field_hlcs),
+                        ch.channel_id,
+                    ),
+                )
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO channel_workspaces(channel_id, workspace_key)
+                VALUES (?, ?)
+                """,
+                (ch.channel_id, ch.workspace_key),
+            )
+            if ch.name:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO channel_aliases(channel_id, name, first_seen)
+                    VALUES (?, ?, ?)
+                    """,
+                    (ch.channel_id, ch.name, seen_at),
+                )
+            if write_change_log and device_id:
+                stored = self._conn.execute(
+                    "SELECT * FROM channels WHERE channel_id=?",
+                    (ch.channel_id,),
+                ).fetchone()
+                if stored is not None:
+                    ws_keys = [
+                        row["workspace_key"]
+                        for row in self._conn.execute(
+                            "SELECT workspace_key FROM channel_workspaces WHERE channel_id=?",
+                            (ch.channel_id,),
+                        ).fetchall()
+                    ]
+                    aliases = [
+                        {"name": row["name"], "first_seen": row["first_seen"]}
+                        for row in self._conn.execute(
+                            "SELECT name, first_seen FROM channel_aliases WHERE channel_id=?",
+                            (ch.channel_id,),
+                        ).fetchall()
+                    ]
+                    self.append_entity_change(
+                        hlc=str(stored["updated_hlc"] or hlc),
+                        device_id=device_id,
+                        entity="channel",
+                        entity_key=ch.channel_id,
+                        payload={
+                            "channel_id": stored["channel_id"],
+                            "workspace_key": stored["workspace_key"],
+                            "workspace_keys": ws_keys,
+                            "aliases": [a["name"] for a in aliases],
+                            "alias_records": aliases,
+                            "context_team_id": stored["context_team_id"],
+                            "name": stored["name"],
+                            "kind": stored["kind"],
+                            "is_ext_shared": bool(stored["is_ext_shared"]),
+                            "is_archived": bool(stored["is_archived"]),
+                            "is_member": bool(stored["is_member"]),
+                            "topic": stored["topic"],
+                            "purpose": stored["purpose"],
+                            "im_user_id": stored["im_user_id"],
+                            "raw": json.loads(stored["raw_json"] or "{}"),
+                            "first_seen": stored["first_seen"],
+                            "last_seen": stored["last_seen"],
+                            "field_hlcs": {
+                                k: v
+                                for k, v in _load_field_hlcs(
+                                    stored["field_hlcs_json"]
+                                ).items()
+                                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+                            },
+                            "clock_epoch": self.directory_clock_epoch(),
+                        },
+                    )
+            if commit:
+                self._conn.commit()
+            return
         self._conn.execute(
             """
             INSERT INTO channels(
@@ -652,6 +1960,7 @@ class SqliteRepository:
               raw_json, first_seen, last_seen, updated_hlc
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
+              workspace_key=excluded.workspace_key,
               name=COALESCE(excluded.name, channels.name),
               kind=excluded.kind,
               is_ext_shared=excluded.is_ext_shared,
@@ -696,10 +2005,261 @@ class SqliteRepository:
                 """,
                 (ch.channel_id, ch.name, seen_at),
             )
-        self._conn.commit()
+        if write_change_log and device_id:
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="channel",
+                entity_key=ch.channel_id,
+                payload={
+                    "channel_id": ch.channel_id,
+                    "workspace_key": ch.workspace_key,
+                    "context_team_id": ch.context_team_id,
+                    "name": ch.name,
+                    "kind": ch.kind,
+                    "is_ext_shared": ch.is_ext_shared,
+                    "is_archived": ch.is_archived,
+                    "is_member": ch.is_member,
+                    "topic": ch.topic,
+                    "purpose": ch.purpose,
+                    "im_user_id": ch.im_user_id,
+                    "raw": ch.raw,
+                    "first_seen": seen_at,
+                    "last_seen": seen_at,
+                },
+            )
+        if commit:
+            self._conn.commit()
 
-    def upsert_user(self, user: User, hlc: str, seen_at: str) -> None:
+    def upsert_user(
+        self,
+        user: User,
+        hlc: str,
+        seen_at: str,
+        *,
+        device_id: str | None = None,
+        write_change_log: bool = True,
+        hlc_lww: bool = True,
+        commit: bool = True,
+        workspace_keys: list[str] | None = None,
+        incoming_field_hlcs: dict[str, str] | None = None,
+        force_fields: bool = False,
+        fill_nulls_only: bool = False,
+    ) -> None:
         raw = json.dumps(user.raw, ensure_ascii=False)
+        assoc_keys = list(workspace_keys or [])
+        if user.workspace_key and user.workspace_key not in assoc_keys:
+            assoc_keys.append(user.workspace_key)
+        if hlc_lww:
+            existing = self._conn.execute(
+                "SELECT * FROM users WHERE user_id=?",
+                (user.user_id,),
+            ).fetchone()
+            if existing is None:
+                field_hlcs = {}
+                for key, val in (
+                    ("name", user.name),
+                    ("real_name", user.real_name),
+                    ("display_name", user.display_name),
+                    ("title", user.title),
+                    ("tz", user.tz),
+                    ("team_id", user.team_id),
+                ):
+                    if val is None:
+                        continue
+                    if incoming_field_hlcs is not None:
+                        field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
+                    else:
+                        field_hlcs[key] = hlc
+                if incoming_field_hlcs and incoming_field_hlcs.get(_REPAIR_HLC_KEY):
+                    field_hlcs[_REPAIR_HLC_KEY] = incoming_field_hlcs[_REPAIR_HLC_KEY]
+                self._conn.execute(
+                    """
+                    INSERT INTO users(
+                      user_id, team_id, name, real_name, display_name, title, email,
+                      is_bot, is_deleted, is_restricted, is_ultra_restricted, is_external,
+                      tz, raw_json, first_seen, last_seen, updated_hlc, field_hlcs_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user.user_id,
+                        user.team_id,
+                        user.name,
+                        user.real_name,
+                        user.display_name,
+                        user.title,
+                        None,
+                        1 if user.is_bot else 0,
+                        1 if user.is_deleted else 0,
+                        1 if user.is_restricted else 0,
+                        1 if user.is_ultra_restricted else 0,
+                        1 if user.is_external else 0,
+                        user.tz,
+                        raw,
+                        seen_at,
+                        seen_at,
+                        hlc,
+                        _dump_field_hlcs(field_hlcs),
+                    ),
+                )
+            else:
+                field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
+
+                def _take(field: str, current: Any, incoming: Any) -> Any:
+                    if fill_nulls_only:
+                        if current is not None or incoming is None:
+                            return current
+                        field_hlcs[field] = _UNKNOWN_FIELD_HLC
+                        return incoming
+                    if force_fields:
+                        if incoming is None:
+                            return current
+                        forced = (
+                            incoming_field_hlcs.get(field)
+                            if incoming_field_hlcs is not None
+                            else None
+                        )
+                        field_hlcs[field] = forced if forced else _UNKNOWN_FIELD_HLC
+                        return incoming
+                    if incoming_field_hlcs is not None:
+                        clock_in: str | None = incoming_field_hlcs.get(field)
+                        replace_unknown = False
+                    else:
+                        clock_in = hlc
+                        replace_unknown = True
+                    value, clock = _merge_sparse_field(
+                        current,
+                        field_hlcs.get(field),
+                        incoming,
+                        clock_in,
+                        replace_unknown=replace_unknown,
+                    )
+                    if clock:
+                        field_hlcs[field] = clock
+                    else:
+                        field_hlcs.pop(field, None)
+                    return value
+
+                name = _take("name", existing["name"], user.name)
+                real_name = _take("real_name", existing["real_name"], user.real_name)
+                display_name = _take(
+                    "display_name", existing["display_name"], user.display_name
+                )
+                title = _take("title", existing["title"], user.title)
+                tz = _take("tz", existing["tz"], user.tz)
+                team_id = _take("team_id", existing["team_id"], user.team_id)
+                if force_fields and incoming_field_hlcs:
+                    repair_hlc = incoming_field_hlcs.get(_REPAIR_HLC_KEY)
+                    if repair_hlc:
+                        field_hlcs[_REPAIR_HLC_KEY] = repair_hlc
+                row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
+                flags = {
+                    "is_bot": (1 if user.is_bot else 0) if row_wins else existing["is_bot"],
+                    "is_deleted": (
+                        (1 if user.is_deleted else 0) if row_wins else existing["is_deleted"]
+                    ),
+                    "is_restricted": (
+                        (1 if user.is_restricted else 0)
+                        if row_wins
+                        else existing["is_restricted"]
+                    ),
+                    "is_ultra_restricted": (
+                        (1 if user.is_ultra_restricted else 0)
+                        if row_wins
+                        else existing["is_ultra_restricted"]
+                    ),
+                    "is_external": (
+                        (1 if user.is_external else 0) if row_wins else existing["is_external"]
+                    ),
+                }
+                raw_json = raw if row_wins else existing["raw_json"]
+                updated_hlc = hlc if row_wins else existing["updated_hlc"]
+                self._conn.execute(
+                    """
+                    UPDATE users SET
+                      team_id=?, name=?, real_name=?, display_name=?, title=?,
+                      is_bot=?, is_deleted=?, is_restricted=?, is_ultra_restricted=?,
+                      is_external=?, tz=?, raw_json=?, last_seen=MAX(last_seen, ?),
+                      updated_hlc=?, field_hlcs_json=?
+                    WHERE user_id=?
+                    """,
+                    (
+                        team_id,
+                        name,
+                        real_name,
+                        display_name,
+                        title,
+                        flags["is_bot"],
+                        flags["is_deleted"],
+                        flags["is_restricted"],
+                        flags["is_ultra_restricted"],
+                        flags["is_external"],
+                        tz,
+                        raw_json,
+                        seen_at,
+                        updated_hlc,
+                        _dump_field_hlcs(field_hlcs),
+                        user.user_id,
+                    ),
+                )
+            for wk in assoc_keys:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO user_workspaces(user_id, workspace_key)
+                    VALUES (?, ?)
+                    """,
+                    (user.user_id, wk),
+                )
+            if write_change_log and device_id:
+                stored = self._conn.execute(
+                    "SELECT * FROM users WHERE user_id=?",
+                    (user.user_id,),
+                ).fetchone()
+                ws_stored = [
+                    row["workspace_key"]
+                    for row in self._conn.execute(
+                        "SELECT workspace_key FROM user_workspaces WHERE user_id=?",
+                        (user.user_id,),
+                    ).fetchall()
+                ]
+                if stored is not None:
+                    self.append_entity_change(
+                        hlc=str(stored["updated_hlc"] or hlc),
+                        device_id=device_id,
+                        entity="user",
+                        entity_key=user.user_id,
+                        payload={
+                            "user_id": stored["user_id"],
+                            "team_id": stored["team_id"],
+                            "name": stored["name"],
+                            "real_name": stored["real_name"],
+                            "display_name": stored["display_name"],
+                            "title": stored["title"],
+                            "email": None,
+                            "is_bot": bool(stored["is_bot"]),
+                            "is_deleted": bool(stored["is_deleted"]),
+                            "is_restricted": bool(stored["is_restricted"]),
+                            "is_ultra_restricted": bool(stored["is_ultra_restricted"]),
+                            "is_external": bool(stored["is_external"]),
+                            "tz": stored["tz"],
+                            "raw": json.loads(stored["raw_json"] or "{}"),
+                            "workspace_key": ws_stored[0] if ws_stored else None,
+                            "workspace_keys": ws_stored,
+                            "first_seen": stored["first_seen"],
+                            "last_seen": stored["last_seen"],
+                            "field_hlcs": {
+                                k: v
+                                for k, v in _load_field_hlcs(
+                                    stored["field_hlcs_json"]
+                                ).items()
+                                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+                            },
+                            "clock_epoch": self.directory_clock_epoch(),
+                        },
+                    )
+            if commit:
+                self._conn.commit()
+            return
         self._conn.execute(
             """
             INSERT INTO users(
@@ -749,7 +2309,162 @@ class SqliteRepository:
                 """,
                 (user.user_id, user.workspace_key),
             )
-        self._conn.commit()
+        if write_change_log and device_id:
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="user",
+                entity_key=user.user_id,
+                payload={
+                    "user_id": user.user_id,
+                    "team_id": user.team_id,
+                    "name": user.name,
+                    "real_name": user.real_name,
+                    "display_name": user.display_name,
+                    "title": user.title,
+                    "email": None,
+                    "is_bot": user.is_bot,
+                    "is_deleted": user.is_deleted,
+                    "is_restricted": user.is_restricted,
+                    "is_ultra_restricted": user.is_ultra_restricted,
+                    "is_external": user.is_external,
+                    "tz": user.tz,
+                    "raw": user.raw,
+                    "workspace_key": user.workspace_key,
+                    "first_seen": seen_at,
+                    "last_seen": seen_at,
+                },
+            )
+        if commit:
+            self._conn.commit()
+
+    def upsert_sighting_only(
+        self,
+        *,
+        channel_id: str,
+        ts: str,
+        content_sha256: str,
+        device_id: str,
+        source: str,
+        seen_at: str,
+        snapshot_id: str,
+        state_sha256: str,
+        commit: bool = True,
+        first_seen: str | None = None,
+        bump_count: bool = True,
+    ) -> None:
+        first = first_seen or seen_at
+        if bump_count:
+            conflict_sql = """
+              last_seen=MAX(message_sightings.last_seen, excluded.last_seen),
+              first_seen=MIN(message_sightings.first_seen, excluded.first_seen),
+              sightings=message_sightings.sightings + 1,
+              last_snapshot_id=excluded.last_snapshot_id,
+              last_state_sha256=excluded.last_state_sha256
+            """
+        else:
+            conflict_sql = """
+              last_seen=MAX(message_sightings.last_seen, excluded.last_seen),
+              first_seen=MIN(message_sightings.first_seen, excluded.first_seen),
+              last_snapshot_id=excluded.last_snapshot_id,
+              last_state_sha256=excluded.last_state_sha256
+            """
+        self._conn.execute(
+            f"""
+            INSERT INTO message_sightings(
+              channel_id, ts, content_sha256, device_id, source,
+              first_seen, last_seen, sightings, first_snapshot_id, last_snapshot_id,
+              last_state_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(channel_id, ts, content_sha256, device_id, source) DO UPDATE SET
+              {conflict_sql}
+            """,
+            (
+                channel_id,
+                ts,
+                content_sha256,
+                device_id,
+                source,
+                first,
+                seen_at,
+                snapshot_id,
+                snapshot_id,
+                state_sha256,
+            ),
+        )
+        if commit:
+            self._conn.commit()
+
+    def merge_version_sighting_times(
+        self,
+        *,
+        channel_id: str,
+        ts: str,
+        content_sha256: str,
+        first_seen: str,
+        last_seen: str,
+        commit: bool = True,
+    ) -> None:
+        unknown = {"", "1970-01-01T00:00:00Z"}
+        # Ignore unknown incoming bounds; also treat stored epoch as unknown.
+        use_first = first_seen not in unknown
+        use_last = last_seen not in unknown
+        if not use_first and not use_last:
+            return
+        if use_first:
+            self._conn.execute(
+                """
+                UPDATE message_versions SET
+                  first_seen=CASE
+                    WHEN first_seen IS NULL OR first_seen='' OR first_seen='1970-01-01T00:00:00Z'
+                      OR first_seen > ?
+                    THEN ? ELSE first_seen END
+                WHERE channel_id=? AND ts=? AND content_sha256=?
+                """,
+                (first_seen, first_seen, channel_id, ts, content_sha256),
+            )
+        if use_last:
+            self._conn.execute(
+                """
+                UPDATE message_versions SET
+                  last_seen=CASE
+                    WHEN last_seen IS NULL OR last_seen='' OR last_seen='1970-01-01T00:00:00Z'
+                      OR last_seen < ?
+                    THEN ? ELSE last_seen END
+                WHERE channel_id=? AND ts=? AND content_sha256=?
+                """,
+                (last_seen, last_seen, channel_id, ts, content_sha256),
+            )
+        if commit:
+            self._conn.commit()
+
+    def reconcile_version_times_from_sightings(
+        self,
+        *,
+        channel_id: str,
+        ts: str,
+        content_sha256: str,
+        commit: bool = True,
+    ) -> None:
+        """After a version arrives, pull bounds from any earlier sighting rows."""
+        row = self._conn.execute(
+            """
+            SELECT MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen
+            FROM message_sightings
+            WHERE channel_id=? AND ts=? AND content_sha256=?
+            """,
+            (channel_id, ts, content_sha256),
+        ).fetchone()
+        if row is None or not row["last_seen"]:
+            return
+        self.merge_version_sighting_times(
+            channel_id=channel_id,
+            ts=ts,
+            content_sha256=content_sha256,
+            first_seen=str(row["first_seen"] or row["last_seen"]),
+            last_seen=str(row["last_seen"]),
+            commit=commit,
+        )
 
     def ingest_observation(
         self,
@@ -760,8 +2475,12 @@ class SqliteRepository:
         state_sha256: str,
         seen_at: str,
         hlc: str,
+        write_change_log: bool = True,
+        write_sighting: bool = True,
+        commit: bool = True,
+        reproject: bool = True,
     ) -> bool:
-        """Upsert version+sighting. Returns True if a new message_versions row was inserted."""
+        """Upsert version (+ optional sighting). Returns True if a new message_versions row was inserted."""
         existed = self._conn.execute(
             """
             SELECT 1 FROM message_versions
@@ -779,7 +2498,9 @@ class SqliteRepository:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id, ts, content_sha256) DO UPDATE SET
               last_seen=MAX(message_versions.last_seen, excluded.last_seen),
-              source_rank=MAX(message_versions.source_rank, excluded.source_rank)
+              source_rank=MAX(message_versions.source_rank, excluded.source_rank),
+              is_partial=MIN(message_versions.is_partial, excluded.is_partial),
+              is_deletion=MAX(message_versions.is_deletion, excluded.is_deletion)
             """,
             (
                 obs.channel_id,
@@ -799,51 +2520,85 @@ class SqliteRepository:
                 seen_at,
             ),
         )
-        self._conn.execute(
-            """
-            INSERT INTO message_sightings(
-              channel_id, ts, content_sha256, device_id, source,
-              first_seen, last_seen, sightings, first_snapshot_id, last_snapshot_id,
-              last_state_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-            ON CONFLICT(channel_id, ts, content_sha256, device_id, source) DO UPDATE SET
-              last_seen=excluded.last_seen,
-              sightings=message_sightings.sightings + 1,
-              last_snapshot_id=excluded.last_snapshot_id,
-              last_state_sha256=excluded.last_state_sha256
-            """,
-            (
-                obs.channel_id,
-                obs.ts,
-                obs.content_sha256,
-                device_id,
-                obs.source,
-                seen_at,
-                seen_at,
-                snapshot_id,
-                snapshot_id,
-                state_sha256,
-            ),
-        )
-        payload = {
-            "channel_id": obs.channel_id,
-            "ts": obs.ts,
-            "content_sha256": obs.content_sha256,
-            "source": obs.source,
-        }
-        payload_json = json.dumps(payload, sort_keys=True)
-        import hashlib
-
-        payload_sha = hashlib.sha256(payload_json.encode()).hexdigest()
-        entity_key = f"{obs.channel_id}|{obs.ts}|{obs.content_sha256}"
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO change_log(
-              hlc, device_id, entity, entity_key, op, payload_json, payload_sha256
-            ) VALUES (?, ?, 'message_version', ?, 'upsert', ?, ?)
-            """,
-            (hlc, device_id, entity_key, payload_json, payload_sha),
-        )
+        if write_sighting:
+            self._conn.execute(
+                """
+                INSERT INTO message_sightings(
+                  channel_id, ts, content_sha256, device_id, source,
+                  first_seen, last_seen, sightings, first_snapshot_id, last_snapshot_id,
+                  last_state_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(channel_id, ts, content_sha256, device_id, source) DO UPDATE SET
+                  last_seen=excluded.last_seen,
+                  sightings=message_sightings.sightings + 1,
+                  last_snapshot_id=excluded.last_snapshot_id,
+                  last_state_sha256=excluded.last_state_sha256
+                """,
+                (
+                    obs.channel_id,
+                    obs.ts,
+                    obs.content_sha256,
+                    device_id,
+                    obs.source,
+                    seen_at,
+                    seen_at,
+                    snapshot_id,
+                    snapshot_id,
+                    state_sha256,
+                ),
+            )
+        if write_change_log:
+            # Version content only (stable). Sightings are a separate outbox entity.
+            version_payload = {
+                "channel_id": obs.channel_id,
+                "ts": obs.ts,
+                "workspace_key": obs.workspace_key,
+                "content_sha256": obs.content_sha256,
+                "edited_ts": obs.edited_ts,
+                "is_deletion": obs.is_deletion,
+                "is_partial": obs.is_partial,
+                "source_rank": obs.source_rank,
+                "user_id": obs.user_id,
+                "thread_ts": obs.thread_ts,
+                "subtype": obs.subtype,
+                "text": obs.text,
+                "search_text": obs.search_text,
+                "raw": obs.raw,
+                "source": obs.source,
+                "reply_count": obs.reply_count,
+                "latest_reply": obs.latest_reply,
+                "reply_users": obs.reply_users,
+            }
+            entity_key = f"{obs.channel_id}|{obs.ts}|{obs.content_sha256}"
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="message_version",
+                entity_key=entity_key,
+                payload=version_payload,
+            )
+            if write_sighting:
+                sighting_payload = {
+                    "channel_id": obs.channel_id,
+                    "ts": obs.ts,
+                    "content_sha256": obs.content_sha256,
+                    "device_id": device_id,
+                    "source": obs.source,
+                    "first_seen": seen_at,
+                    "last_seen": seen_at,
+                    "snapshot_id": snapshot_id,
+                    "state_sha256": state_sha256,
+                }
+                sighting_key = (
+                    f"{obs.channel_id}|{obs.ts}|{obs.content_sha256}|{device_id}|{obs.source}"
+                )
+                self.append_entity_change(
+                    hlc=hlc,
+                    device_id=device_id,
+                    entity="sighting",
+                    entity_key=sighting_key,
+                    payload=sighting_payload,
+                )
         # thread meta
         if obs.thread_ts or (obs.reply_count and obs.reply_count > 0):
             root = obs.thread_ts or obs.ts
@@ -874,11 +2629,15 @@ class SqliteRepository:
                     hlc,
                 ),
             )
-        self._conn.commit()
-        self.reproject_message(obs.channel_id, obs.ts)
+        if commit:
+            self._conn.commit()
+        if reproject:
+            self.reproject_message(obs.channel_id, obs.ts)
         return existed is None
 
-    def reproject_message(self, channel_id: str, ts: str) -> None:
+    def reproject_message(
+        self, channel_id: str, ts: str, *, commit: bool = True
+    ) -> dict[str, Any] | None:
         rows = self._conn.execute(
             """
             SELECT * FROM message_versions WHERE channel_id=? AND ts=?
@@ -886,7 +2645,7 @@ class SqliteRepository:
             (channel_id, ts),
         ).fetchall()
         if not rows:
-            return
+            return None
         versions = [
             VersionCandidate(
                 channel_id=r["channel_id"],
@@ -907,7 +2666,7 @@ class SqliteRepository:
         ]
         chosen = choose_current(versions)
         if chosen is None:
-            return
+            return None
         deleted = deleted_state_for(versions, chosen)
         reply_count, latest_reply, reply_users = max_merge_thread_meta(versions)
         # workspace from channel table
@@ -1026,15 +2785,48 @@ class SqliteRepository:
             "INSERT INTO messages_trigram(rowid, search_text) VALUES (?, ?)",
             (rowid, chosen.search_text),
         )
-        self._conn.commit()
-        # Keep message + aggregate search_docs in sync during normal ingest.
+        meta = {
+            "previous_thread_ts": previous_thread_ts,
+            "is_new_msg": existing is None,
+            "thread_ts": chosen.thread_ts,
+            "deleted_state": deleted,
+        }
+        if commit:
+            self._conn.commit()
+            self.refresh_message_search_docs(
+                channel_id,
+                ts,
+                previous_thread_ts=previous_thread_ts,
+                is_new_msg=existing is None,
+            )
+        return meta
+
+    def refresh_message_search_docs(
+        self,
+        channel_id: str,
+        ts: str,
+        *,
+        previous_thread_ts: str | None = None,
+        is_new_msg: bool | None = None,
+        commit: bool = True,
+    ) -> None:
+        """Best-effort search_docs refresh after a durable message projection."""
         try:
             from slack_cache_mcp.search.docs import SearchDocsBuilder
 
+            row = self._conn.execute(
+                """
+                SELECT thread_ts, deleted_state, text FROM messages
+                WHERE channel_id=? AND ts=?
+                """,
+                (channel_id, ts),
+            ).fetchone()
+            if row is None:
+                return
             builder = SearchDocsBuilder(self)
-            thread_root = chosen.thread_ts or ts
+            thread_root = row["thread_ts"] or ts
             is_root = thread_root == ts
-            is_new_msg = existing is None
+            deleted = row["deleted_state"] or "none"
             text_changed = True
             if deleted != "none":
                 builder.drop_message_doc(channel_id, ts)
@@ -1046,14 +2838,17 @@ class SqliteRepository:
                 message_ts=ts,
                 text_changed=text_changed or deleted != "none",
                 previous_thread_ts=previous_thread_ts,
-                is_new=is_new_msg,
+                is_new=bool(is_new_msg) if is_new_msg is not None else False,
             )
-            # Always refresh reply previews on root reprojection: raw parent text
-            # can change even when normalized search-doc text does not.
             if is_root:
                 builder.refresh_reply_docs_after_parent_change(channel_id, ts)
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
         except Exception:
+            # In transactional apply (commit=False), propagate so the outbox marker
+            # rolls back and retry can rebuild search docs.
+            if not commit:
+                raise
             pass
 
     def list_workspaces(self) -> list[dict[str, Any]]:
@@ -1413,6 +3208,31 @@ class SqliteRepository:
                 "status": dict(st) if st else None,
                 "coverage_ranges": [dict(r) for r in ranges],
             }
+        devices = []
+        for d in self.list_devices():
+            sightings = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM message_sightings WHERE device_id=?",
+                (d["device_id"],),
+            ).fetchone()["c"]
+            changes = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM change_log WHERE device_id=?",
+                (d["device_id"],),
+            ).fetchone()["c"]
+            devices.append(
+                {
+                    "device_id": d["device_id"],
+                    "label": d["label"],
+                    "has_public_key": bool(d.get("public_key")),
+                    "sightings": sightings,
+                    "change_log_rows": changes,
+                }
+            )
+        from slack_cache_mcp.sync.state_hash import compute_state_hash
+
+        try:
+            state_hash = compute_state_hash(self)
+        except Exception:
+            state_hash = None
         return {
             "messages": count,
             "workspaces": len(self.list_workspaces()),
@@ -1426,6 +3246,9 @@ class SqliteRepository:
             "channel": channel,
             # Provide structured per-channel info separately (stable type: dict|None)
             "channel_status": channel_block,
+            "devices": devices,
+            "state_hash": state_hash,
+            "schema_version": SCHEMA_VERSION,
         }
 
     def search_fts(

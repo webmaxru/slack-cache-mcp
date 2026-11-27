@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
   raw_json TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  updated_hlc TEXT NOT NULL
+  updated_hlc TEXT NOT NULL,
+  field_hlcs_json TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS channels (
   raw_json TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  updated_hlc TEXT NOT NULL
+  updated_hlc TEXT NOT NULL,
+  field_hlcs_json TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS channel_workspaces (
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS users (
   raw_json TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  updated_hlc TEXT NOT NULL
+  updated_hlc TEXT NOT NULL,
+  field_hlcs_json TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS user_workspaces (
@@ -333,6 +336,14 @@ CREATE TABLE IF NOT EXISTS change_log (
   payload_json TEXT NOT NULL,
   payload_sha256 TEXT NOT NULL,
   UNIQUE (device_id, entity, entity_key, payload_sha256)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS sync_cursors (
+  peer TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  cursor TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (peer, direction)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS meta (
