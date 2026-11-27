@@ -37,12 +37,14 @@ def _renew_meta_lease_on_side_conn(
     *,
     lease_s: float = 120.0,
     busy_deadline: float | None = None,
-) -> bool:
+    stop: threading.Event | None = None,
+) -> bool | None:
     """Renew meta lease via a private connection (safe for heartbeat threads).
 
-    Ownership loss and connect failures return False. Transient SQLite busy /
-    locked errors are retried until ``busy_deadline`` (default: now + lease_s)
-    so an unrelated writer does not abort a still-valid lease.
+    Returns True on success, False on ownership loss / hard failure, or None
+    when ``stop`` is set (cancelled). Transient SQLite busy / locked errors are
+    retried until ``busy_deadline`` (default: now + lease_s) so an unrelated
+    writer does not abort a still-valid lease; retries are cancellable.
     """
     deadline = (
         float(busy_deadline)
@@ -50,6 +52,8 @@ def _renew_meta_lease_on_side_conn(
         else time.time() + max(lease_s, 1.0)
     )
     while True:
+        if stop is not None and stop.is_set():
+            return None
         conn: sqlite3.Connection | None = None
         try:
             # Short per-attempt timeout; we retry busy ourselves until deadline.
@@ -91,8 +95,15 @@ def _renew_meta_lease_on_side_conn(
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.rollback()
+            if stop is not None and stop.is_set():
+                return None
             if _is_sqlite_busy(exc) and time.time() < deadline:
-                time.sleep(0.05)
+                # Interruptible backoff so inference can join before lock release.
+                if stop is not None:
+                    if stop.wait(0.05):
+                        return None
+                else:
+                    time.sleep(0.05)
                 continue
             return False
         finally:
@@ -258,10 +269,14 @@ def embed_pending(
                         _owner,
                         lease_s=lease_s,
                         busy_deadline=time.time() + max(lease_s - 30.0, 1.0),
+                        stop=_stop,
                     )
                 except Exception:
                     # Connect / unexpected errors: fail closed so inference aborts.
                     _ok["ok"] = False
+                    return
+                if _stop.is_set() or ok is None:
+                    # Cancelled by inference teardown — do not fail the batch.
                     return
                 if not ok:
                     _ok["ok"] = False
@@ -276,9 +291,14 @@ def embed_pending(
         try:
             vectors = embedder.embed_documents(texts)
         finally:
+            # Stop must be observed by busy retries before we return (callers
+            # release the OS lock immediately after embed_pending returns).
             stop_beat.set()
             if beater is not None:
-                beater.join(timeout=5.0)
+                # connect(timeout=1) + a couple of interruptible backoffs.
+                beater.join(timeout=10.0)
+                if beater.is_alive():
+                    beat_ok["ok"] = False
         if not beat_ok["ok"]:
             return {
                 "ok": False,
