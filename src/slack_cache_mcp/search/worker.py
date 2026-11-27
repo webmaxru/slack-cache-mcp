@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import sqlite3
 import threading
 import time
@@ -275,21 +276,15 @@ def embed_pending(
         commit_gate = threading.Lock()
         commit_allowed = {"ok": True}
 
-        beat_entered = threading.Event()
-
         def _beat(
             _stop: threading.Event = stop_beat,
             _done: threading.Event = done_beat,
-            _entered: threading.Event = beat_entered,
             _ok: dict[str, bool] = beat_ok,
             _owner: str | None = lock_owner,
             _path: str = db_path,
             _gate: threading.Lock = commit_gate,
             _allowed: dict[str, bool] = commit_allowed,
         ) -> None:
-            # Signal entry before any wait so interrupted start() can tell a
-            # launched thread from a never-started one.
-            _entered.set()
             # Last renew (or acquire) left ~120s; after a 30s sleep ~90s remain.
             # Busy retries must not outlive a still-valid lease window.
             try:
@@ -323,47 +318,38 @@ def embed_pending(
 
         # One protected lifetime for start + embed; teardown always in finally.
         # Prefer done_beat over join() (CPython 3.12 interrupted-join quirk).
+        # Defer SIGINT around Thread.start() so launch is atomic — no timeout
+        # heuristic that can miss a delayed _beat entry.
         beater: threading.Thread | None = None
         interrupted = False
         vectors: Any = None
-        launch_attempted = False
-        launch_thread: threading.Thread | None = None
+        sigint_pending = {"flag": False}
+
+        def _note_sigint(
+            _signum: int,
+            _frame: Any,
+            _pending: dict[str, bool] = sigint_pending,
+        ) -> None:
+            _pending["flag"] = True
 
         try:
-            while True:
+            if lock_owner is not None:
+                t = threading.Thread(
+                    target=_beat, name="embed-op-lock-beat", daemon=True
+                )
+                prev_handler = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, _note_sigint)
                 try:
-                    if lock_owner is not None:
-                        launch_thread = threading.Thread(
-                            target=_beat, name="embed-op-lock-beat", daemon=True
-                        )
-                        launch_attempted = True
-                        launch_thread.start()
-                        beater = launch_thread
-                    else:
-                        done_beat.set()
-                    break
-                except KeyboardInterrupt:
-                    interrupted = True
-                    # start() may have launched the OS thread before returning.
-                    # Defer further Ctrl-C until entry is resolved — an interrupted
-                    # wait must not take the "never started" path and fake done_beat.
-                    if launch_attempted and launch_thread is not None:
-                        beater = launch_thread
-                        while True:
-                            try:
-                                if beat_entered.wait(timeout=2.0):
-                                    break
-                                # Timed out with no entry — thread never ran.
-                                beater = None
-                                if not done_beat.is_set():
-                                    done_beat.set()
-                                break
-                            except KeyboardInterrupt:
-                                interrupted = True
-                                continue
-                    break
+                    t.start()
+                    beater = t
+                finally:
+                    signal.signal(signal.SIGINT, prev_handler)
+            else:
+                done_beat.set()
 
-            if not interrupted:
+            if sigint_pending["flag"]:
+                interrupted = True
+            else:
                 try:
                     vectors = embedder.embed_documents(texts)
                 except KeyboardInterrupt:
