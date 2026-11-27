@@ -2480,21 +2480,41 @@ class SqliteRepository:
         return True
 
     def _embed_lock_paths(self) -> list[Path]:
-        """Sidecar paths for both resolved and unresolved DB pathnames.
+        """Sidecar paths deduplicated by file identity (not string equality).
 
-        Older builds locked ``str(path)+.embedding_op.lock`` without resolve();
-        we lock both so symlink aliases cannot bypass exclusion.
+        Includes an inode-keyed lock (alias-invariant), the resolved sidecar,
+        and the unresolved sidecar used by mid-PR builds — then drops paths
+        that ``os.path.samefile`` shows are the same inode.
         """
-        unresolved = Path(str(self.path) + ".embedding_op.lock")
-        resolved = Path(str(self.path.resolve()) + ".embedding_op.lock")
-        out: list[Path] = []
-        seen: set[str] = set()
-        for p in (resolved, unresolved):
-            key = str(p)
-            if key not in seen:
-                seen.add(key)
-                out.append(p)
-        return out
+        resolved_db = self.path.resolve()
+        candidates: list[Path] = []
+        with contextlib.suppress(OSError):
+            st = resolved_db.stat()
+            candidates.append(
+                resolved_db.parent
+                / f".embedding_op.{st.st_dev}-{st.st_ino}.lock"
+            )
+        candidates.append(Path(str(resolved_db) + ".embedding_op.lock"))
+        candidates.append(Path(str(self.path) + ".embedding_op.lock"))
+        unique: list[Path] = []
+        for p in candidates:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not p.exists():
+                with contextlib.suppress(OSError):
+                    p.write_text("0", encoding="utf-8")
+            dup = False
+            for u in unique:
+                try:
+                    if os.path.samefile(p, u):
+                        dup = True
+                        break
+                except OSError:
+                    if p.resolve() == u.resolve():
+                        dup = True
+                        break
+            if not dup:
+                unique.append(p)
+        return unique
 
     def _lock_embed_file(self, fh: TextIO) -> None:
         """Exclusive, non-blocking byte-range / flock; raises OSError if busy."""
@@ -2567,12 +2587,14 @@ class SqliteRepository:
             return raw, int(m.group(1)), None
         return raw, None, None
 
-    def _legacy_meta_blocks(self, owner: str) -> bool:
+    _EMBED_OP_LOCK_LEASE_S = 180.0
+
+    def _legacy_meta_blocks(self, owner: str, *, holding_files: bool) -> bool:
         """True if another live holder still owns the meta lock row.
 
         ``file+meta`` claims are authoritative only while the OS file lock is
-        held — a crashed new-protocol holder leaves a stealable meta row even
-        if its PID was reused. Legacy-only rows still use PID liveness.
+        held. When we already hold the files, prior ``file+meta`` rows are
+        superseded. Legacy-only rows still use PID liveness.
         """
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
@@ -2586,28 +2608,29 @@ class SqliteRepository:
         if other == owner:
             return False
         if protocol == "file+meta":
+            if holding_files:
+                return False
             return self._probe_file_locks_busy()
         if pid is not None:
             return self._process_alive(pid)
         # Opaque legacy row without PID: preserve exclusion.
         return True
 
-    def _claim_legacy_meta(self, owner: str) -> bool:
+    def _claim_legacy_meta(self, owner: str, *, holding_files: bool) -> bool:
         """Claim/refresh the meta lock under IMMEDIATE; False if blocked."""
         started = self._begin_immediate()
         try:
-            if self._legacy_meta_blocks(owner):
+            if self._legacy_meta_blocks(owner, holding_files=holding_files):
                 if started:
                     self._conn.commit()
                 return False
-            # expires_at keeps 918c1ec-era parsers from treating the row as
-            # absent; a long horizon is fine because file+meta crash recovery
-            # keys off the OS lock, not the lease clock.
+            # Short renewable expires_at so 918c1ec-era lease readers can
+            # recover after a crash; renew_embedding_op_lock refreshes it.
             payload = json.dumps(
                 {
                     "owner": owner,
                     "pid": os.getpid(),
-                    "expires_at": time.time() + 365 * 24 * 3600,
+                    "expires_at": time.time() + self._EMBED_OP_LOCK_LEASE_S,
                     "protocol": "file+meta",
                 }
             )
@@ -2669,7 +2692,7 @@ class SqliteRepository:
         if self._embed_lock_fhs:
             return True
         with contextlib.suppress(Exception):
-            if self._legacy_meta_blocks(owner=""):
+            if self._legacy_meta_blocks(owner="", holding_files=False):
                 return True
         return self._probe_file_locks_busy()
 
@@ -2680,25 +2703,23 @@ class SqliteRepository:
     def acquire_embedding_op_lock(
         self, owner: str, *, lease_s: float | None = None
     ) -> bool:
-        """Acquire crash-released OS file locks + dual-protocol meta claim.
+        """Acquire crash-released OS file locks, then dual-protocol meta claim.
 
-        Locks both resolved and unresolved sidecars, and writes a meta row
-        compatible with older lease parsers. ``lease_s`` is ignored.
+        File locks are taken first so claim/steal races cannot leave an active
+        file holder without metadata. ``lease_s`` is ignored.
         """
         del lease_s
         if self._embed_lock_fhs:
             return self._embed_lock_owner == owner
-        claimed_meta = False
         fhs: list[TextIO] = []
         try:
-            if not self._claim_legacy_meta(owner):
-                return False
-            claimed_meta = True
             for path in self._embed_lock_paths():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fh: TextIO = path.open("a+")
                 fhs.append(fh)
                 self._lock_embed_file(fh)
+            if not self._claim_legacy_meta(owner, holding_files=True):
+                raise OSError("embedding_op_meta_blocked")
             self._embed_lock_fhs = fhs
             self._embed_lock_owner = owner
             return True
@@ -2708,17 +2729,18 @@ class SqliteRepository:
                     self._unlock_embed_file(fh)
                 with contextlib.suppress(Exception):
                     fh.close()
-            if claimed_meta:
-                with contextlib.suppress(Exception):
-                    self._clear_legacy_meta(owner)
+            with contextlib.suppress(Exception):
+                self._clear_legacy_meta(owner)
             return False
 
     def renew_embedding_op_lock(
         self, owner: str, *, lease_s: float | None = None
     ) -> bool:
-        """Fence: confirm this instance still holds the OS lock for ``owner``."""
+        """Fence + refresh short meta lease while the OS lock is held."""
         del lease_s
-        return self.embedding_op_lock_owned(owner)
+        if not self.embedding_op_lock_owned(owner):
+            return False
+        return self._claim_legacy_meta(owner, holding_files=True)
 
     def release_embedding_op_lock(self, owner: str) -> None:
         """Release the OS file locks and dual-protocol meta row if owned."""
