@@ -268,6 +268,25 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         commit=False,
         incoming_field_hlcs=incoming_field_hlcs,
     )
+    # Union observations independent of the LWW projection.
+    for wk in payload.get("workspace_keys") or []:
+        if isinstance(wk, str) and wk:
+            repo._conn.execute(  # noqa: SLF001
+                """
+                INSERT OR IGNORE INTO channel_workspaces(channel_id, workspace_key)
+                VALUES (?, ?)
+                """,
+                (ch.channel_id, wk),
+            )
+    for alias in payload.get("aliases") or []:
+        if isinstance(alias, str) and alias:
+            repo._conn.execute(  # noqa: SLF001
+                """
+                INSERT OR IGNORE INTO channel_aliases(channel_id, name, first_seen)
+                VALUES (?, ?, ?)
+                """,
+                (ch.channel_id, alias, seen_at),
+            )
 
 
 def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:

@@ -109,10 +109,10 @@ Age encrypt requires recipients at export time. Peers exchange public identity v
 ### Bundle trust + envelope v2
 Import rejects unknown senders and signing/age key mismatches against `sync peers add` registrations; header keys never overwrite a registered peer. Envelope format version 2 signs the canonical header+payload (not payload alone). Export runs `backfill_outbox` so upgraded M4 archives ship full sanitized facts. HLC watermark is persisted in `meta.hlc_watermark` and restored for ingest/import.
 
-### Copilot round-2/3 hardening
+### Copilot round-2..5 hardening
 - Device identity fails closed if `device.json` is missing keys or malformed; `device.secrets` only when keyring unconfirmed; create mode 0600.
-- `sync peers add` resets **all** push cursors; import treats undecryptable superseded bundles as skips, not hard errors.
+- `sync peers add` resets **all** push cursors. Decrypt failures are always errors (remove superseded folder bundles after full re-export).
 - Import rejects forged row authors and sighting payload `device_id` mismatches.
-- Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps.
-- Directory upserts always maintain `field_hlcs_json`; backfill covers missing fields and ships per-field clocks in payloads.
+- Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps; epoch bounds are ignored as unknown.
+- Directory upserts always maintain `field_hlcs_json` (seeded on migrate); channel outbox carries association/alias unions; backfill is cover-aware with per-field clocks.
 - Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.

@@ -168,44 +168,14 @@ def import_bundles(
     total_applied = 0
     total_skipped = 0
     errors: list[dict[str, str]] = []
-    # sender_id -> max authenticated to_seq imported this pass
-    covered_to: dict[str, int] = {}
-    pending_decrypt: list[tuple[Path, str, int | None, int | None]] = []
-
-    def _parse_bundle_name(name: str) -> tuple[str | None, int | None, int | None]:
-        # bundle-<device>-<from>-<to>.jsonl.zst.age
-        stem = name
-        for suffix in (".jsonl.zst.age", ".age"):
-            if stem.endswith(suffix):
-                stem = stem[: -len(suffix)]
-        parts = stem.split("-")
-        if len(parts) < 4 or parts[0] != "bundle":
-            return None, None, None
-        try:
-            to_seq = int(parts[-1])
-            from_seq = int(parts[-2])
-        except ValueError:
-            return None, None, None
-        device = "-".join(parts[1:-2])
-        return device or None, from_seq, to_seq
 
     for path in files:
         try:
             ciphertext = path.read_bytes()
-            try:
-                envelope_bytes = age_decrypt(ciphertext, identity.age_identity)
-            except Exception as dec_exc:
-                sender_guess, from_seq, to_seq = _parse_bundle_name(path.name)
-                pending_decrypt.append((path, str(dec_exc), from_seq, to_seq))
-                if sender_guess:
-                    # stash guess on the path via parallel list already
-                    pending_decrypt[-1] = (
-                        path,
-                        f"{dec_exc}|sender_guess={sender_guess}",
-                        from_seq,
-                        to_seq,
-                    )
-                continue
+            # Decrypt failures are always reported. Late-peer / superseded bundles
+            # must be removed from the exchange folder after a full re-export —
+            # we never infer identity or coverage from unauthenticated filenames.
+            envelope_bytes = age_decrypt(ciphertext, identity.age_identity)
             # Peek device_id before full verify so we can pin the registered key.
             peek = json.loads(envelope_bytes.decode("utf-8"))
             if not isinstance(peek, dict):
@@ -243,35 +213,9 @@ def import_bundles(
             imported_files += 1
             to_seq = header.get("to_seq")
             if to_seq is not None:
-                to_i = int(to_seq)
-                covered_to[sender_id] = max(covered_to.get(sender_id, 0), to_i)
                 repo.set_sync_cursor(f"{peer}:{sender_id}", "pull", str(to_seq))
         except Exception as exc:
             errors.append({"path": str(path), "error": str(exc)})
-
-    # Decrypt failures are superseded only when an authenticated replacement from the
-    # same sender covers their to_seq; otherwise they remain integrity errors.
-    for path, msg, from_seq, to_seq in pending_decrypt:
-        sender_guess = None
-        if "|sender_guess=" in msg:
-            msg, _, sender_guess = msg.partition("|sender_guess=")
-        name_device, name_from, name_to = _parse_bundle_name(path.name)
-        sender = sender_guess or name_device
-        end = to_seq if to_seq is not None else name_to
-        _ = from_seq if from_seq is not None else name_from
-        if (
-            sender
-            and end is not None
-            and covered_to.get(sender, -1) >= int(end)
-        ):
-            total_skipped += 1
-            continue
-        errors.append(
-            {
-                "path": str(path),
-                "error": f"bundle decrypt failed without replacement coverage: {msg}",
-            }
-        )
 
     # Persist merged HLC so subsequent local ingest dominates imported clocks.
     tick = hlc_clock.now()

@@ -367,6 +367,9 @@ class SqliteRepository:
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN field_hlcs_json TEXT NOT NULL DEFAULT '{{}}'"
                 )
+        # Seed empty field clocks from updated_hlc for any non-null sparse fields so
+        # a peer observation with a lower HLC cannot replace migrated local values.
+        self._seed_directory_field_hlcs()
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -409,6 +412,45 @@ class SqliteRepository:
             (peer, direction, cursor, _utc_now()),
         )
         self._conn.commit()
+
+    def _seed_directory_field_hlcs(self) -> None:
+        specs: list[tuple[str, str, tuple[str, ...]]] = (
+            (
+                "workspaces",
+                "workspace_key",
+                ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
+            ),
+            (
+                "channels",
+                "channel_id",
+                ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
+            ),
+            (
+                "users",
+                "user_id",
+                ("team_id", "name", "real_name", "display_name", "title", "tz"),
+            ),
+        )
+        for table, pk, fields in specs:
+            rows = self._conn.execute(f"SELECT * FROM {table}").fetchall()
+            for row in rows:
+                current = _load_field_hlcs(row["field_hlcs_json"])
+                if current:
+                    continue
+                hlc = str(row["updated_hlc"] or "")
+                if not hlc:
+                    continue
+                seeded = {
+                    field: hlc
+                    for field in fields
+                    if row[field] is not None and str(row[field]) != ""
+                }
+                if not seeded:
+                    continue
+                self._conn.execute(
+                    f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                    (_dump_field_hlcs(seeded), row[pk]),
+                )
 
     def reset_push_cursors(self) -> int:
         """Reset every push cursor so the next export re-sends full history."""
@@ -716,6 +758,20 @@ class SqliteRepository:
             for key, val in required.items():
                 if val is not None and key not in field_hlcs:
                     field_hlcs[key] = _row_hlc(r, hlc)
+            ws_keys = [
+                row["workspace_key"]
+                for row in self._conn.execute(
+                    "SELECT workspace_key FROM channel_workspaces WHERE channel_id=?",
+                    (ch.channel_id,),
+                ).fetchall()
+            ]
+            aliases = [
+                row["name"]
+                for row in self._conn.execute(
+                    "SELECT name FROM channel_aliases WHERE channel_id=?",
+                    (ch.channel_id,),
+                ).fetchall()
+            ]
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -724,6 +780,8 @@ class SqliteRepository:
                 payload={
                     "channel_id": ch.channel_id,
                     "workspace_key": ch.workspace_key,
+                    "workspace_keys": ws_keys,
+                    "aliases": aliases,
                     "context_team_id": ch.context_team_id,
                     "name": ch.name,
                     "kind": ch.kind,
@@ -1515,6 +1573,20 @@ class SqliteRepository:
                     (ch.channel_id,),
                 ).fetchone()
                 if stored is not None:
+                    ws_keys = [
+                        row["workspace_key"]
+                        for row in self._conn.execute(
+                            "SELECT workspace_key FROM channel_workspaces WHERE channel_id=?",
+                            (ch.channel_id,),
+                        ).fetchall()
+                    ]
+                    aliases = [
+                        row["name"]
+                        for row in self._conn.execute(
+                            "SELECT name FROM channel_aliases WHERE channel_id=?",
+                            (ch.channel_id,),
+                        ).fetchall()
+                    ]
                     self.append_entity_change(
                         hlc=str(stored["updated_hlc"] or hlc),
                         device_id=device_id,
@@ -1523,6 +1595,8 @@ class SqliteRepository:
                         payload={
                             "channel_id": stored["channel_id"],
                             "workspace_key": stored["workspace_key"],
+                            "workspace_keys": ws_keys,
+                            "aliases": aliases,
                             "context_team_id": stored["context_team_id"],
                             "name": stored["name"],
                             "kind": stored["kind"],
@@ -1951,22 +2025,36 @@ class SqliteRepository:
         last_seen: str,
         commit: bool = True,
     ) -> None:
-        # Treat the epoch sentinel as "unknown" so a later real sighting can replace it.
-        self._conn.execute(
-            """
-            UPDATE message_versions SET
-              first_seen=CASE
-                WHEN first_seen IS NULL OR first_seen='' OR first_seen='1970-01-01T00:00:00Z'
-                  OR first_seen > ?
-                THEN ? ELSE first_seen END,
-              last_seen=CASE
-                WHEN last_seen IS NULL OR last_seen='' OR last_seen='1970-01-01T00:00:00Z'
-                  OR last_seen < ?
-                THEN ? ELSE last_seen END
-            WHERE channel_id=? AND ts=? AND content_sha256=?
-            """,
-            (first_seen, first_seen, last_seen, last_seen, channel_id, ts, content_sha256),
-        )
+        unknown = {"", "1970-01-01T00:00:00Z"}
+        # Ignore unknown incoming bounds; also treat stored epoch as unknown.
+        use_first = first_seen not in unknown
+        use_last = last_seen not in unknown
+        if not use_first and not use_last:
+            return
+        if use_first:
+            self._conn.execute(
+                """
+                UPDATE message_versions SET
+                  first_seen=CASE
+                    WHEN first_seen IS NULL OR first_seen='' OR first_seen='1970-01-01T00:00:00Z'
+                      OR first_seen > ?
+                    THEN ? ELSE first_seen END
+                WHERE channel_id=? AND ts=? AND content_sha256=?
+                """,
+                (first_seen, first_seen, channel_id, ts, content_sha256),
+            )
+        if use_last:
+            self._conn.execute(
+                """
+                UPDATE message_versions SET
+                  last_seen=CASE
+                    WHEN last_seen IS NULL OR last_seen='' OR last_seen='1970-01-01T00:00:00Z'
+                      OR last_seen < ?
+                    THEN ? ELSE last_seen END
+                WHERE channel_id=? AND ts=? AND content_sha256=?
+                """,
+                (last_seen, last_seen, channel_id, ts, content_sha256),
+            )
         if commit:
             self._conn.commit()
 
