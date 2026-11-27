@@ -2757,23 +2757,49 @@ class SqliteRepository:
     ) -> bool:
         """Fence + refresh short meta lease while the OS lock is held.
 
-        If another process wrote the meta row while we held the file lock
-        (legacy lease reader), fail closed instead of silently reclaiming.
+        Ownership check and lease write happen under one IMMEDIATE transaction
+        so a legacy worker cannot slip in between.
         """
         if not self.embedding_op_lock_owned(owner):
             return False
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
-        ).fetchone()
-        parsed = self._parse_legacy_embed_meta(
-            str(row["value"]) if row else None
-        )
-        # Missing row = a legacy holder acquired and released under us — lost.
-        if not parsed or parsed[0] != owner:
-            return False
-        return self._claim_legacy_meta(
-            owner, holding_files=True, lease_s=lease_s
-        )
+        lease = self._EMBED_OP_LOCK_LEASE_S if lease_s is None else float(lease_s)
+        started = self._begin_immediate()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (self._EMBED_OP_LOCK_META_KEY,),
+            ).fetchone()
+            parsed = self._parse_legacy_embed_meta(
+                str(row["value"]) if row else None
+            )
+            # Missing or foreign row = lost ownership (do not recreate).
+            if not parsed or parsed[0] != owner:
+                if started:
+                    self._conn.commit()
+                return False
+            payload = json.dumps(
+                {
+                    "owner": owner,
+                    "pid": os.getpid(),
+                    "expires_at": time.time() + max(lease, 1.0),
+                    "protocol": "file+meta",
+                }
+            )
+            self._conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (self._EMBED_OP_LOCK_META_KEY, payload),
+            )
+            if started:
+                self._conn.commit()
+            return True
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
 
     def heartbeat_embedding_op_lock(self) -> bool:
         """Renew the short meta lease if this instance holds the op lock.

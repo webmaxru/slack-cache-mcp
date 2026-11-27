@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import sqlite3
+import threading
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -13,9 +17,58 @@ if TYPE_CHECKING:
     from slack_cache_mcp.search.embedder import Embedder
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
+_EMBED_OP_LOCK_META_KEY = "embedding_op_lock"
+
 
 def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _renew_meta_lease_on_side_conn(
+    db_path: str, owner: str, *, lease_s: float = 120.0
+) -> bool:
+    """Renew meta lease via a private connection (safe for heartbeat threads)."""
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key=?", (_EMBED_OP_LOCK_META_KEY,)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        try:
+            data = json.loads(str(row["value"]))
+        except (json.JSONDecodeError, TypeError):
+            conn.rollback()
+            return False
+        if not isinstance(data, dict) or str(data.get("owner")) != owner:
+            conn.rollback()
+            return False
+        payload = json.dumps(
+            {
+                "owner": owner,
+                "pid": os.getpid(),
+                "expires_at": time.time() + max(lease_s, 1.0),
+                "protocol": "file+meta",
+            }
+        )
+        conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (_EMBED_OP_LOCK_META_KEY, payload),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 
 def embed_pending(
@@ -75,17 +128,29 @@ def embed_pending(
     if (prev and prev["value"] != embedder.model_id) or (
         prev_dim and int(prev_dim["value"]) != int(embedder.dim)
     ):
-        lost = _fence()
-        if lost is not None:
-            return lost
-        repo._conn.execute(  # noqa: SLF001
-            "UPDATE search_docs SET embedded_model=NULL, embedded_at=NULL"
-        )
         with contextlib.suppress(sqlite3.OperationalError):
-            repo._conn.execute("DELETE FROM docs_vec")  # noqa: SLF001
-        with contextlib.suppress(sqlite3.OperationalError):
-            repo._conn.execute("DELETE FROM doc_embeddings")  # noqa: SLF001
-        repo._conn.commit()  # noqa: SLF001
+            repo._conn.execute("BEGIN IMMEDIATE")  # noqa: SLF001
+        try:
+            if lock_owner is not None and not repo.renew_embedding_op_lock(lock_owner):
+                repo._conn.execute("ROLLBACK")  # noqa: SLF001
+                return {
+                    "ok": False,
+                    "embedded": 0,
+                    "model_id": embedder.model_id,
+                    "error": "embedding_op_lock_lost",
+                }
+            repo._conn.execute(  # noqa: SLF001
+                "UPDATE search_docs SET embedded_model=NULL, embedded_at=NULL"
+            )
+            with contextlib.suppress(sqlite3.OperationalError):
+                repo._conn.execute("DELETE FROM docs_vec")  # noqa: SLF001
+            with contextlib.suppress(sqlite3.OperationalError):
+                repo._conn.execute("DELETE FROM doc_embeddings")  # noqa: SLF001
+            repo._conn.commit()  # noqa: SLF001
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                repo._conn.execute("ROLLBACK")  # noqa: SLF001
+            raise
 
     # Reconcile only when counts diverge (or vec missing); commit before inference.
     need_reconcile = True
@@ -116,33 +181,70 @@ def embed_pending(
         params.append(int(limit))
     rows = list(repo._conn.execute(sql, params).fetchall())  # noqa: SLF001
     embedded = 0
+    db_path = str(repo.path)
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
-        # Stretch the meta lease across inference (no second SQLite thread).
-        if lock_owner is not None:
-            if not repo.renew_embedding_op_lock(lock_owner, lease_s=3600.0):
-                return {
-                    "ok": False,
-                    "embedded": embedded,
-                    "model_id": embedder.model_id,
-                    "error": "embedding_op_lock_lost",
-                }
+        lost = _fence(embedded=embedded)
+        if lost is not None:
+            return lost
         texts = [r["text"] for r in batch]
-        vectors = embedder.embed_documents(texts)
+        # Short renewable lease via a side connection during inference.
+        stop_beat = threading.Event()
+        beat_ok = {"ok": True}
+
+        def _beat(
+            _stop: threading.Event = stop_beat,
+            _ok: dict[str, bool] = beat_ok,
+            _owner: str | None = lock_owner,
+            _path: str = db_path,
+        ) -> None:
+            while not _stop.wait(30.0):
+                if _owner is None:
+                    return
+                if not _renew_meta_lease_on_side_conn(_path, _owner):
+                    _ok["ok"] = False
+                    return
+
+        beater: threading.Thread | None = None
+        if lock_owner is not None:
+            beater = threading.Thread(
+                target=_beat, name="embed-op-lock-beat", daemon=True
+            )
+            beater.start()
+        try:
+            vectors = embedder.embed_documents(texts)
+        finally:
+            stop_beat.set()
+            if beater is not None:
+                beater.join(timeout=5.0)
+        if not beat_ok["ok"]:
+            return {
+                "ok": False,
+                "embedded": embedded,
+                "model_id": embedder.model_id,
+                "error": "embedding_op_lock_lost",
+            }
         lost = _fence(embedded=embedded)
         if lost is not None:
             return lost
         now = _utc_now()
         for j, r in enumerate(batch):
-            lost = _fence(embedded=embedded)
-            if lost is not None:
-                return lost
             # Hash check + vector upsert + status update under one write lock so a
             # concurrent edit cannot leave a stale vector marked complete.
             with contextlib.suppress(sqlite3.OperationalError):
                 # OperationalError if already inside a transaction.
                 repo._conn.execute("BEGIN IMMEDIATE")  # noqa: SLF001
             try:
+                if lock_owner is not None and not repo.renew_embedding_op_lock(
+                    lock_owner
+                ):
+                    repo._conn.execute("ROLLBACK")  # noqa: SLF001
+                    return {
+                        "ok": False,
+                        "embedded": embedded,
+                        "model_id": embedder.model_id,
+                        "error": "embedding_op_lock_lost",
+                    }
                 cur = repo._conn.execute(  # noqa: SLF001
                     "SELECT text_sha256 FROM search_docs WHERE doc_id=?",
                     (int(r["doc_id"]),),
@@ -186,22 +288,34 @@ def embed_pending(
                     repo._conn.execute("ROLLBACK")  # noqa: SLF001
                 raise
 
-    lost = _fence(embedded=embedded)
-    if lost is not None:
-        return lost
-    repo._conn.execute(  # noqa: SLF001
-        """
-        INSERT INTO meta(key, value) VALUES ('embedding_model', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-        (embedder.model_id,),
-    )
-    repo._conn.execute(  # noqa: SLF001
-        """
-        INSERT INTO meta(key, value) VALUES ('embedding_dim', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-        (str(embedder.dim),),
-    )
-    repo._conn.commit()  # noqa: SLF001
+    with contextlib.suppress(sqlite3.OperationalError):
+        repo._conn.execute("BEGIN IMMEDIATE")  # noqa: SLF001
+    try:
+        if lock_owner is not None and not repo.renew_embedding_op_lock(lock_owner):
+            repo._conn.execute("ROLLBACK")  # noqa: SLF001
+            return {
+                "ok": False,
+                "embedded": embedded,
+                "model_id": embedder.model_id,
+                "error": "embedding_op_lock_lost",
+            }
+        repo._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO meta(key, value) VALUES ('embedding_model', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (embedder.model_id,),
+        )
+        repo._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO meta(key, value) VALUES ('embedding_dim', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (str(embedder.dim),),
+        )
+        repo._conn.commit()  # noqa: SLF001
+    except Exception:
+        with contextlib.suppress(sqlite3.Error):
+            repo._conn.execute("ROLLBACK")  # noqa: SLF001
+        raise
     return {"ok": True, "embedded": embedded, "model_id": embedder.model_id}

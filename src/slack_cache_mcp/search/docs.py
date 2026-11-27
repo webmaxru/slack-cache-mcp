@@ -294,6 +294,10 @@ class SearchDocsBuilder:
                     if started:
                         self.repo._conn.commit()  # noqa: SLF001
                     continue
+                if not self.repo.heartbeat_embedding_op_lock():
+                    if started:
+                        self.repo._conn.rollback()  # noqa: SLF001
+                    raise RuntimeError("embedding_op_lock_lost")
                 n = self._finalize_window_plan(channel_id, plan)
                 cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
                 if cur is None or int(cur) != int(generation):
