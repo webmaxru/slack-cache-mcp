@@ -33,16 +33,16 @@ def embed_pending(
     switches a persisted ONNX index to hashing (e.g. CLI ``rebuild --embeddings``
     with ``SLACKCACHE_EMBEDDER=hashing``). Daemon auto-fallback leaves it False.
 
-    When ``lock_owner`` is set, renew the embedding op lease before destructive
-    model switches and periodically during the embed loop.
+    When ``lock_owner`` is set, fence the crash-released OS lock before every
+    mutating transaction (model wipe, per-batch upserts, final meta write).
     """
-    def _fence() -> dict[str, Any] | None:
+    def _fence(*, embedded: int = 0) -> dict[str, Any] | None:
         if lock_owner is None:
             return None
         if not repo.renew_embedding_op_lock(lock_owner):
             return {
                 "ok": False,
-                "embedded": 0,
+                "embedded": embedded,
                 "model_id": embedder.model_id,
                 "error": "embedding_op_lock_lost",
             }
@@ -117,16 +117,14 @@ def embed_pending(
     rows = list(repo._conn.execute(sql, params).fetchall())  # noqa: SLF001
     embedded = 0
     for i in range(0, len(rows), batch_size):
-        if i > 0 and i % (batch_size * 8) == 0:
-            lost = _fence()
-            if lost is not None:
-                lost["embedded"] = embedded
-                return lost
         batch = rows[i : i + batch_size]
         texts = [r["text"] for r in batch]
         vectors = embedder.embed_documents(texts)
         now = _utc_now()
         for j, r in enumerate(batch):
+            lost = _fence(embedded=embedded)
+            if lost is not None:
+                return lost
             # Hash check + vector upsert + status update under one write lock so a
             # concurrent edit cannot leave a stale vector marked complete.
             with contextlib.suppress(sqlite3.OperationalError):
@@ -176,6 +174,9 @@ def embed_pending(
                     repo._conn.execute("ROLLBACK")  # noqa: SLF001
                 raise
 
+    lost = _fence(embedded=embedded)
+    if lost is not None:
+        return lost
     repo._conn.execute(  # noqa: SLF001
         """
         INSERT INTO meta(key, value) VALUES ('embedding_model', ?)

@@ -8,10 +8,9 @@ import json
 import os
 import re
 import sqlite3
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from slack_cache_mcp.domain.models import (
     CanvasDoc,
@@ -143,8 +142,14 @@ class SqliteRepository:
         if not read_only:
             self.ensure_schema()
         # Defer docs_vec creation until embedder dimension is known (worker).
+        # Crash-released OS file lock for embedding rebuilds (see acquire_*).
+        self._embed_lock_fh: Any | None = None
+        self._embed_lock_owner: str | None = None
 
     def close(self) -> None:
+        if self._embed_lock_fh is not None:
+            with contextlib.suppress(Exception):
+                self._release_embed_file_lock()
         self._conn.close()
 
     def ensure_schema(self) -> None:
@@ -2441,221 +2446,128 @@ class SqliteRepository:
                 return False
             raise
 
-    _EMBED_OP_LOCK_KEY = "embedding_op_lock"
-    _EMBED_OP_LOCK_DEFAULT_LEASE_S = 900.0
-    _LEGACY_EMBED_OP_OWNER_RE = re.compile(
-        r"^(?:cli-rebuild|daemon)-(\d+)$"
-    )
+    _EMBED_OP_LOCK_META_KEY = "embedding_op_lock"  # legacy meta row (migrated away)
 
-    @staticmethod
-    def _process_alive(pid: int) -> bool:
-        """True if ``pid`` looks like a live process (crash-released lock)."""
-        if pid <= 0:
-            return False
+    def _embed_lock_path(self) -> Path:
+        return Path(str(self.path) + ".embedding_op.lock")
+
+    def _lock_embed_file(self, fh: TextIO) -> None:
+        """Exclusive, non-blocking byte-range / flock; raises OSError if busy."""
+        fh.seek(0)
+        if fh.read(1) == "":
+            fh.write("0")
+            fh.flush()
+        fh.seek(0)
         if os.name == "nt":
-            # os.kill(pid, 0) is unreliable on Windows (WinError 87 on missing
-            # PIDs). OpenProcess is the supported existence probe.
-            import ctypes
+            import msvcrt
 
-            process_query_limited_information = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                process_query_limited_information, False, int(pid)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(  # type: ignore[attr-defined]
+                fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB  # type: ignore[attr-defined]
             )
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # Exists but not owned by us — still a live holder.
-            return True
-        except OSError:
-            return False
-        return True
 
-    def _parse_embedding_op_lock(
-        self, raw: str | None
-    ) -> tuple[str, float, int | None] | None:
-        """Return ``(owner, expires_at_unix, pid)`` or None if absent."""
-        if not raw:
-            return None
-        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
-            data = json.loads(raw)
-            if (
-                isinstance(data, dict)
-                and data.get("owner")
-                and data.get("expires_at") is not None
-            ):
-                pid_raw = data.get("pid")
-                pid = int(pid_raw) if pid_raw is not None else None
-                return str(data["owner"]), float(data["expires_at"]), pid
-        # Legacy plain-owner rows: keep exclusion while the holder PID lives;
-        # dead PIDs are abandoned and stealable.
-        m = self._LEGACY_EMBED_OP_OWNER_RE.match(raw)
-        if m:
-            pid = int(m.group(1))
-            if self._process_alive(pid):
-                return raw, time.time() + 3600.0, pid
-            return None
-        # Opaque legacy string without a PID — preserve exclusion with a
-        # finite lease so a truly abandoned row can eventually be recovered.
-        return raw, time.time() + 3600.0, None
+    def _unlock_embed_file(self, fh: TextIO) -> None:
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
 
-    def _embedding_op_lock_blocks(
-        self,
-        parsed: tuple[str, float, int | None],
-        owner: str,
-        now: float,
-    ) -> bool:
-        """True when another holder still exclusively owns the lock."""
-        other_owner, expires_at, pid = parsed
-        if other_owner == owner:
-            return False
-        if pid is not None:
-            # Crash-released: a live PID keeps exclusion even past lease expiry
-            # so long rebuilds are safe without perfect renew timing.
-            return self._process_alive(pid)
-        return expires_at > now
+            with contextlib.suppress(OSError):
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            with contextlib.suppress(OSError):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+
+    def _release_embed_file_lock(self) -> None:
+        fh = self._embed_lock_fh
+        self._embed_lock_fh = None
+        self._embed_lock_owner = None
+        if fh is None:
+            return
+        with contextlib.suppress(Exception):
+            self._unlock_embed_file(fh)
+        with contextlib.suppress(Exception):
+            fh.close()
 
     def embedding_op_lock_held(self) -> bool:
-        """True when another process would be blocked from acquiring."""
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
-        ).fetchone()
-        parsed = self._parse_embedding_op_lock(
-            str(row["value"]) if row else None
-        )
-        if not parsed:
+        """True when another process currently holds the OS file lock."""
+        if self._embed_lock_fh is not None:
+            return True
+        path = self._embed_lock_path()
+        try:
+            fh = path.open("a+")
+        except OSError:
             return False
-        return self._embedding_op_lock_blocks(
-            parsed, owner="", now=time.time()
-        )
+        try:
+            self._lock_embed_file(fh)
+        except OSError:
+            fh.close()
+            return True
+        with contextlib.suppress(Exception):
+            self._unlock_embed_file(fh)
+        with contextlib.suppress(Exception):
+            fh.close()
+        return False
 
     def embedding_op_lock_owned(self, owner: str) -> bool:
-        """True if ``owner`` currently holds the lock row."""
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
-        ).fetchone()
-        parsed = self._parse_embedding_op_lock(
-            str(row["value"]) if row else None
+        """True if this repository instance holds the lock for ``owner``."""
+        return (
+            self._embed_lock_fh is not None and self._embed_lock_owner == owner
         )
-        return bool(parsed and parsed[0] == owner)
 
     def acquire_embedding_op_lock(
         self, owner: str, *, lease_s: float | None = None
     ) -> bool:
-        """Acquire exclusive leased lock for search-index mutations.
+        """Acquire a crash-released OS file lock for search-index mutations.
 
-        Survives nested SQLite commits inside ``rebuild_all`` / ``embed_pending``.
-        Steal only when the prior holder crashed (dead PID) or its leaseless
-        opaque legacy row expired — never while a live holder is still working.
+        The lock is held by an open FD, so it survives nested SQLite commits and
+        is released automatically if the process dies. ``lease_s`` is ignored
+        (kept for call-site compatibility).
         """
-        lease = (
-            self._EMBED_OP_LOCK_DEFAULT_LEASE_S if lease_s is None else float(lease_s)
-        )
-        started = self._begin_immediate()
+        del lease_s  # OS locks do not use leases.
+        if self._embed_lock_fh is not None:
+            return self._embed_lock_owner == owner
+        path = self._embed_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = path.open("a+")
         try:
-            now = time.time()
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
-            ).fetchone()
-            parsed = self._parse_embedding_op_lock(
-                str(row["value"]) if row else None
-            )
-            if parsed and self._embedding_op_lock_blocks(parsed, owner, now):
+            self._lock_embed_file(fh)
+        except OSError:
+            fh.close()
+            return False
+        self._embed_lock_fh = fh
+        self._embed_lock_owner = owner
+        # Drop legacy meta-row locks from earlier rounds so they cannot linger.
+        with contextlib.suppress(Exception):
+            started = self._begin_immediate()
+            try:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
+                )
                 if started:
                     self._conn.commit()
-                return False
-            payload = json.dumps(
-                {
-                    "owner": owner,
-                    "expires_at": now + max(lease, 1.0),
-                    "pid": os.getpid(),
-                }
-            )
-            self._conn.execute(
-                """
-                INSERT INTO meta(key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (self._EMBED_OP_LOCK_KEY, payload),
-            )
-            if started:
-                self._conn.commit()
-            return True
-        except Exception:
-            if started:
-                with contextlib.suppress(sqlite3.Error):
-                    self._conn.rollback()
-            raise
+            except Exception:
+                if started:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.rollback()
+        return True
 
     def renew_embedding_op_lock(
         self, owner: str, *, lease_s: float | None = None
     ) -> bool:
-        """Extend our lease; False if ownership was lost."""
-        lease = (
-            self._EMBED_OP_LOCK_DEFAULT_LEASE_S if lease_s is None else float(lease_s)
-        )
-        started = self._begin_immediate()
-        try:
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
-            ).fetchone()
-            parsed = self._parse_embedding_op_lock(
-                str(row["value"]) if row else None
-            )
-            if not parsed or parsed[0] != owner:
-                if started:
-                    self._conn.commit()
-                return False
-            payload = json.dumps(
-                {
-                    "owner": owner,
-                    "expires_at": time.time() + max(lease, 1.0),
-                    "pid": os.getpid(),
-                }
-            )
-            self._conn.execute(
-                """
-                INSERT INTO meta(key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (self._EMBED_OP_LOCK_KEY, payload),
-            )
-            if started:
-                self._conn.commit()
-            return True
-        except Exception:
-            if started:
-                with contextlib.suppress(sqlite3.Error):
-                    self._conn.rollback()
-            raise
+        """Fence: confirm this instance still holds the OS lock for ``owner``."""
+        del lease_s
+        return self.embedding_op_lock_owned(owner)
 
     def release_embedding_op_lock(self, owner: str) -> None:
-        """Release the embedding op lock if still owned by ``owner``."""
-        started = self._begin_immediate()
-        try:
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
-            ).fetchone()
-            parsed = self._parse_embedding_op_lock(
-                str(row["value"]) if row else None
-            )
-            # Allow release by owner even after expiry (cleanup).
-            if parsed and parsed[0] == owner:
-                self._conn.execute(
-                    "DELETE FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
-                )
-            if started:
-                self._conn.commit()
-        except Exception:
-            if started:
-                with contextlib.suppress(sqlite3.Error):
-                    self._conn.rollback()
-            raise
+        """Release the OS file lock if still owned by ``owner``."""
+        if self._embed_lock_owner != owner:
+            return
+        self._release_embed_file_lock()
 
     def _ensure_dirty_seq_initialized(self) -> None:
         """Seed ``window_dirty_seq`` above legacy map gens; never overwrite."""

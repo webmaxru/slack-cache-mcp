@@ -215,77 +215,24 @@ def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
 
 
 def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
-    """Leased lock survives commits; dead-PID / expired leaseless rows are stealable."""
-    import json
-    import os
-    import time
-
-    assert archive.acquire_embedding_op_lock("owner-a", lease_s=60.0) is True
-    archive._conn.commit()  # noqa: SLF001
-    assert archive.embedding_op_lock_held() is True
+    """Crash-released OS file lock excludes a second repository handle."""
+    assert archive.acquire_embedding_op_lock("owner-a") is True
     assert archive.embedding_op_lock_owned("owner-a") is True
-    assert archive.acquire_embedding_op_lock("owner-b") is False
-    archive.release_embedding_op_lock("owner-b")  # no-op for other owner
-    assert archive.embedding_op_lock_held() is True
     assert archive.renew_embedding_op_lock("owner-a") is True
+    other = SqliteRepository(archive.path, read_only=False)
+    try:
+        assert other.acquire_embedding_op_lock("owner-b") is False
+        assert other.embedding_op_lock_held() is True
+    finally:
+        other.close()
     archive.release_embedding_op_lock("owner-a")
-    assert archive.embedding_op_lock_held() is False
-    assert archive.acquire_embedding_op_lock("owner-b") is True
-    archive.release_embedding_op_lock("owner-b")
-    # Dead PID + expired lease → stealable (crash recovery).
-    archive._conn.execute(  # noqa: SLF001
-        """
-        INSERT INTO meta(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-        (
-            archive._EMBED_OP_LOCK_KEY,  # noqa: SLF001
-            json.dumps(
-                {
-                    "owner": "dead",
-                    "expires_at": time.time() - 10,
-                    "pid": 1_999_999_999,
-                }
-            ),
-        ),
-    )
-    archive._conn.commit()  # noqa: SLF001
-    assert archive.acquire_embedding_op_lock("owner-c") is True
-    archive.release_embedding_op_lock("owner-c")
-    # Live PID keeps exclusion even past lease expiry.
-    archive._conn.execute(  # noqa: SLF001
-        """
-        INSERT INTO meta(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-        (
-            archive._EMBED_OP_LOCK_KEY,  # noqa: SLF001
-            json.dumps(
-                {
-                    "owner": "still-alive",
-                    "expires_at": time.time() - 10,
-                    "pid": os.getpid(),
-                }
-            ),
-        ),
-    )
-    archive._conn.commit()  # noqa: SLF001
-    assert archive.acquire_embedding_op_lock("owner-d") is False
-    archive.release_embedding_op_lock("still-alive")
-    # Legacy plain owner with live PID stays exclusive during upgrade.
-    archive._conn.execute(  # noqa: SLF001
-        """
-        INSERT INTO meta(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-        (
-            archive._EMBED_OP_LOCK_KEY,  # noqa: SLF001
-            f"cli-rebuild-{os.getpid()}",
-        ),
-    )
-    archive._conn.commit()  # noqa: SLF001
-    assert archive.acquire_embedding_op_lock("owner-e") is False
-    archive.release_embedding_op_lock(f"cli-rebuild-{os.getpid()}")
+    assert archive.embedding_op_lock_owned("owner-a") is False
+    other2 = SqliteRepository(archive.path, read_only=False)
+    try:
+        assert other2.acquire_embedding_op_lock("owner-b") is True
+        other2.release_embedding_op_lock("owner-b")
+    finally:
+        other2.close()
 
 
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:
