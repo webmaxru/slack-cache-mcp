@@ -414,7 +414,7 @@ class SqliteRepository:
         self._conn.commit()
 
     def _seed_directory_field_hlcs(self) -> None:
-        specs: list[tuple[str, str, tuple[str, ...]]] = (
+        specs: list[tuple[str, str, tuple[str, ...]]] = [
             (
                 "workspaces",
                 "workspace_key",
@@ -430,26 +430,26 @@ class SqliteRepository:
                 "user_id",
                 ("team_id", "name", "real_name", "display_name", "title", "tz"),
             ),
-        )
+        ]
         for table, pk, fields in specs:
             rows = self._conn.execute(f"SELECT * FROM {table}").fetchall()
             for row in rows:
                 current = _load_field_hlcs(row["field_hlcs_json"])
-                if current:
-                    continue
                 hlc = str(row["updated_hlc"] or "")
                 if not hlc:
                     continue
-                seeded = {
-                    field: hlc
-                    for field in fields
-                    if row[field] is not None and str(row[field]) != ""
-                }
-                if not seeded:
+                changed = False
+                for field in fields:
+                    if row[field] is None:
+                        continue
+                    if field not in current:
+                        current[field] = hlc
+                        changed = True
+                if not changed:
                     continue
                 self._conn.execute(
                     f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
-                    (_dump_field_hlcs(seeded), row[pk]),
+                    (_dump_field_hlcs(current), row[pk]),
                 )
 
     def reset_push_cursors(self) -> int:
@@ -738,7 +738,51 @@ class SqliteRepository:
                 "purpose": r["purpose"],
                 "im_user_id": r["im_user_id"],
             }
-            if self._outbox_covers_fields(device_id, "channel", r["channel_id"], required):
+            ws_keys = [
+                row["workspace_key"]
+                for row in self._conn.execute(
+                    "SELECT workspace_key FROM channel_workspaces WHERE channel_id=?",
+                    (r["channel_id"],),
+                ).fetchall()
+            ]
+            alias_rows = self._conn.execute(
+                "SELECT name, first_seen FROM channel_aliases WHERE channel_id=?",
+                (r["channel_id"],),
+            ).fetchall()
+            aliases = [
+                {"name": row["name"], "first_seen": row["first_seen"]} for row in alias_rows
+            ]
+            # Union coverage: every workspace/alias must appear in some outbox payload.
+            covered_ws: set[str] = set()
+            covered_aliases: set[str] = set()
+            for prow in self._conn.execute(
+                """
+                SELECT payload_json FROM change_log
+                WHERE device_id=? AND entity='channel' AND entity_key=?
+                """,
+                (device_id, r["channel_id"]),
+            ).fetchall():
+                try:
+                    payload = json.loads(prow["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if isinstance(payload.get("workspace_key"), str):
+                    covered_ws.add(payload["workspace_key"])
+                for wk in payload.get("workspace_keys") or []:
+                    if isinstance(wk, str):
+                        covered_ws.add(wk)
+                for alias in payload.get("aliases") or []:
+                    if isinstance(alias, str):
+                        covered_aliases.add(alias)
+                    elif isinstance(alias, dict) and isinstance(alias.get("name"), str):
+                        covered_aliases.add(alias["name"])
+            if (
+                self._outbox_covers_fields(device_id, "channel", r["channel_id"], required)
+                and set(ws_keys).issubset(covered_ws)
+                and {a["name"] for a in aliases}.issubset(covered_aliases)
+            ):
                 continue
             ch = Channel(
                 channel_id=r["channel_id"],
@@ -758,20 +802,6 @@ class SqliteRepository:
             for key, val in required.items():
                 if val is not None and key not in field_hlcs:
                     field_hlcs[key] = _row_hlc(r, hlc)
-            ws_keys = [
-                row["workspace_key"]
-                for row in self._conn.execute(
-                    "SELECT workspace_key FROM channel_workspaces WHERE channel_id=?",
-                    (ch.channel_id,),
-                ).fetchall()
-            ]
-            aliases = [
-                row["name"]
-                for row in self._conn.execute(
-                    "SELECT name FROM channel_aliases WHERE channel_id=?",
-                    (ch.channel_id,),
-                ).fetchall()
-            ]
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -1581,9 +1611,9 @@ class SqliteRepository:
                         ).fetchall()
                     ]
                     aliases = [
-                        row["name"]
+                        {"name": row["name"], "first_seen": row["first_seen"]}
                         for row in self._conn.execute(
-                            "SELECT name FROM channel_aliases WHERE channel_id=?",
+                            "SELECT name, first_seen FROM channel_aliases WHERE channel_id=?",
                             (ch.channel_id,),
                         ).fetchall()
                     ]

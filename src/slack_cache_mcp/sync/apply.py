@@ -279,14 +279,27 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
                 (ch.channel_id, wk),
             )
     for alias in payload.get("aliases") or []:
+        alias_name: str | None = None
+        alias_seen = seen_at
         if isinstance(alias, str) and alias:
-            repo._conn.execute(  # noqa: SLF001
-                """
-                INSERT OR IGNORE INTO channel_aliases(channel_id, name, first_seen)
-                VALUES (?, ?, ?)
-                """,
-                (ch.channel_id, alias, seen_at),
-            )
+            alias_name = alias
+        elif isinstance(alias, dict) and isinstance(alias.get("name"), str):
+            alias_name = alias["name"]
+            if isinstance(alias.get("first_seen"), str) and alias["first_seen"]:
+                alias_seen = alias["first_seen"]
+        if not alias_name:
+            continue
+        repo._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO channel_aliases(channel_id, name, first_seen)
+            VALUES (?, ?, ?)
+            ON CONFLICT(channel_id, name) DO UPDATE SET
+              first_seen=CASE
+                WHEN channel_aliases.first_seen > excluded.first_seen
+                THEN excluded.first_seen ELSE channel_aliases.first_seen END
+            """,
+            (ch.channel_id, alias_name, alias_seen),
+        )
 
 
 def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
