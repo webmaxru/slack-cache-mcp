@@ -655,10 +655,13 @@ def _ingest_profile(
             ),
         )
     finally:
-        _scrub_credential_scratch(mirror)
-        if edge_mode:
-            # Raw Edge IndexedDB blobs can hold tokens inside Redux; drop after sanitize/vault.
-            _scrub_edge_raw_idb(mirror)
+        # Nest so Edge raw-IDB scrub still runs if credential-scratch cleanup raises.
+        try:
+            _scrub_credential_scratch(mirror)
+        finally:
+            if edge_mode:
+                # Raw Edge IndexedDB blobs can hold tokens inside Redux; drop after sanitize/vault.
+                _scrub_edge_raw_idb(mirror)
 
     return {
         "source": redact_path(profile.path),

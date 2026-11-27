@@ -51,16 +51,30 @@ def detect_idb_backend(
     idb = Path(profile_or_mirror) / "IndexedDB"
     if not idb.is_dir():
         return "missing"
+    def _linkish(path: Path) -> bool:
+        try:
+            if path.is_symlink():
+                return True
+            if not path.exists():
+                return False
+            return path.resolve() != path.parent.resolve() / path.name
+        except OSError:
+            return True
+
     if slack_origin_only:
         scan_roots = [idb / f"{origin}.leveldb", idb / f"{origin}.blob"]
         file_iter: list[Path] = []
         for root in scan_roots:
-            if root.is_dir():
-                file_iter.extend(p for p in root.rglob("*") if p.is_file())
+            # Never follow a symlink/junction Slack-origin root (Edge boundary).
+            if _linkish(root) or not root.is_dir():
+                continue
+            file_iter.extend(
+                p for p in root.rglob("*") if not _linkish(p) and p.is_file()
+            )
     else:
         file_iter = list(idb.rglob("*"))
     for p in file_iter:
-        if not p.is_file() or p.name == "LOCK":
+        if _linkish(p) or not p.is_file() or p.name == "LOCK":
             continue
         try:
             with open(p, "rb") as fh:
@@ -69,7 +83,8 @@ def detect_idb_backend(
             continue
         if head.startswith(b"SQLite format 3"):
             return "sqlite"
-    if (idb / f"{origin}.leveldb").is_dir():
+    leveldb_root = idb / f"{origin}.leveldb"
+    if leveldb_root.is_dir() and not _linkish(leveldb_root):
         return "leveldb"
     if not slack_origin_only and (
         any(idb.glob("*.indexeddb.leveldb")) or any(idb.glob("*.indexeddb.blob"))

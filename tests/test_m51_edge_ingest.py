@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from slack_cache_mcp.config import Settings, load_settings
 from slack_cache_mcp.desktop.locate import discover_profiles
@@ -287,13 +290,69 @@ def test_edge_snapshot_rejects_symlink_escape(tmp_path: Path) -> None:
         link.symlink_to(outside)
     except OSError:
         # Windows without symlink privilege — skip rather than false-fail.
-        import pytest
-
         pytest.skip("symlinks unavailable")
     mirror = tmp_path / "mirror"
     stats = snapshot_profile(src, mirror, require_stable_blobs=False, allowlist=ALLOWLIST_EDGE_IDB)
     assert not (mirror / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob" / "1" / "00" / "escape").exists()
     assert any("symlink" in e for e in stats.errors)
+
+
+def test_edge_snapshot_rejects_symlinked_idb_root(tmp_path: Path) -> None:
+    """A symlinked/junction Slack .blob root must not be followed out of the Edge boundary."""
+    from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend
+    from slack_cache_mcp.desktop.snapshot import _resolved_under
+
+    src = tmp_path / "Edge" / "User Data" / "Default"
+    (src / "IndexedDB").mkdir(parents=True)
+    real_blob = tmp_path / "evil_blob"
+    (real_blob / "1" / "00").mkdir(parents=True)
+    (real_blob / "1" / "00" / "secret").write_text("xoxc-FAKE-TOKEN", encoding="utf-8")
+    blob_link = src / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob"
+    try:
+        blob_link.symlink_to(real_blob, target_is_directory=True)
+    except OSError:
+        # Windows without symlink privilege: directory junction still redirects resolve().
+        try:
+            import _winapi
+
+            _winapi.CreateJunction(str(real_blob), str(blob_link))
+        except Exception:  # noqa: BLE001
+            pytest.skip("symlinks/junctions unavailable")
+    # Containment helper must reject the linked root itself.
+    secret = real_blob / "1" / "00" / "secret"
+    assert _resolved_under(secret, blob_link) is False
+    assert detect_idb_backend(src, slack_origin_only=True) in {"missing", "unknown"}
+    mirror = tmp_path / "mirror"
+    stats = snapshot_profile(src, mirror, require_stable_blobs=False, allowlist=ALLOWLIST_EDGE_IDB)
+    assert any("symlink root" in e for e in stats.errors)
+    assert not (mirror / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob").exists()
+
+
+def test_edge_scrub_runs_even_if_credential_scrub_raises(tmp_path: Path, monkeypatch: Any) -> None:
+    """Edge raw IDB cleanup must be nested so credential-scrub failures cannot skip it."""
+    from slack_cache_mcp import pipeline as pipeline_mod
+
+    edge = build_edge_browser_profile(tmp_path / "Edge" / "User Data" / "Default")
+    data = tmp_path / "data"
+    settings = Settings(
+        data_dir=data,
+        source_overrides=[str(edge)],
+        capture_dms=True,
+    )
+    called: list[str] = []
+
+    def boom(mirror: Path) -> None:
+        called.append("cred")
+        raise RuntimeError("cred scrub failed")
+
+    def edge_ok(mirror: Path) -> None:
+        called.append("edge")
+
+    monkeypatch.setattr(pipeline_mod, "_scrub_credential_scratch", boom)
+    monkeypatch.setattr(pipeline_mod, "_scrub_edge_raw_idb", edge_ok)
+    with pytest.raises(RuntimeError, match="cred scrub failed"):
+        run_snapshot_once(settings)
+    assert called == ["cred", "edge"]
 
 
 def test_edge_purge_removes_prior_desktop_allowlist_leftovers(tmp_path: Path) -> None:

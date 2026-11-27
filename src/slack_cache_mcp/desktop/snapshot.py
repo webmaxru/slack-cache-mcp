@@ -119,10 +119,27 @@ FORBIDDEN_BROWSER_NAME_PARTS = frozenset(
 )
 
 
-def _resolved_under(path: Path, root: Path) -> bool:
-    """True when ``path`` resolves to a real file/dir strictly under ``root`` (no symlink escape)."""
+def _is_linkish(path: Path) -> bool:
+    """True for symlinks and Windows junctions/reparse points that redirect resolve()."""
     try:
         if path.is_symlink():
+            return True
+        if not path.exists():
+            return False
+        # Junction: resolve() leaves the lexical parent/name location.
+        return path.resolve() != path.parent.resolve() / path.name
+    except OSError:
+        return True
+
+
+def _resolved_under(path: Path, root: Path) -> bool:
+    """True when ``path`` is a real entry under a non-link ``root`` (no symlink escape).
+
+    Rejects when either ``path`` or ``root`` is a symlink/junction. Resolving a
+    linked allow-root would otherwise make out-of-tree targets look "under" it.
+    """
+    try:
+        if _is_linkish(path) or _is_linkish(root):
             return False
         resolved = path.resolve()
         root_resolved = root.resolve()
@@ -319,11 +336,20 @@ def snapshot_profile(
 
     cache_bytes = 0
     for tree in allow_trees:
+        if allowlist == ALLOWLIST_EDGE_IDB and _is_linkish(tree):
+            # Symlinked/junction Slack .blob/.leveldb roots escape the Edge boundary.
+            try:
+                rel_tree = tree.relative_to(source).as_posix()
+            except ValueError:
+                rel_tree = tree.name
+            stats.errors.append(f"{rel_tree}: symlink root skipped")
+            continue
         if not tree.exists():
             stats.missing.append(tree.name)
             continue
         for p in tree.rglob("*"):
-            if p.is_symlink():
+            linkish = _is_linkish(p) if allowlist == ALLOWLIST_EDGE_IDB else p.is_symlink()
+            if linkish:
                 if allowlist == ALLOWLIST_EDGE_IDB:
                     stats.errors.append(f"{p.relative_to(source).as_posix()}: symlink skipped")
                 continue
