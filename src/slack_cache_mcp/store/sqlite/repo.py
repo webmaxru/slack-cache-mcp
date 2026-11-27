@@ -397,13 +397,15 @@ class SqliteRepository:
         self._pin_unknown_directory_field_hlcs()
 
     def _pin_unknown_directory_field_hlcs(self) -> None:
-        """Pin ``*`` on unclocked fields; once, rebuild directory outbox facts.
+        """Once: pin every non-null directory field to ``*`` (unknown provenance).
 
-        Earlier builds sometimes wrote invented field clocks into ``change_log``.
-        Policy ``v3-rebuild-directory-outbox`` drops local directory outbox rows so
-        the next export backfills from tables with known clocks only (``*`` omitted).
+        Clears earlier invented field clocks without touching ``change_log`` markers
+        (remote or local). Real HLCs from subsequent local observations or peers
+        converge by winning over ``*``.
         """
         policy = self.get_meta("field_hlcs_policy")
+        if policy == "v4-star-all-fields":
+            return
         specs: list[tuple[str, str, tuple[str, ...]]] = [
             (
                 "workspaces",
@@ -423,27 +425,14 @@ class SqliteRepository:
         ]
         for table, pk, fields in specs:
             for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
-                current = _load_field_hlcs(row["field_hlcs_json"])
-                changed = False
-                for field in fields:
-                    if row[field] is None:
-                        continue
-                    if field not in current:
-                        current[field] = _UNKNOWN_FIELD_HLC
-                        changed = True
-                if changed:
-                    self._conn.execute(
-                        f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
-                        (_dump_field_hlcs(current), row[pk]),
-                    )
-        if policy != "v3-rebuild-directory-outbox":
-            self._conn.execute(
-                """
-                DELETE FROM change_log
-                WHERE entity IN ('workspace', 'channel', 'user')
-                """
-            )
-            self.set_meta("field_hlcs_policy", "v3-rebuild-directory-outbox", commit=False)
+                current = {
+                    field: _UNKNOWN_FIELD_HLC for field in fields if row[field] is not None
+                }
+                self._conn.execute(
+                    f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                    (_dump_field_hlcs(current), row[pk]),
+                )
+        self.set_meta("field_hlcs_policy", "v4-star-all-fields", commit=False)
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None

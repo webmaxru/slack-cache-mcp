@@ -91,6 +91,18 @@ def export_bundle(
     cursor_raw = repo.get_sync_cursor(peer, "push")
     since_seq = int(cursor_raw) if cursor_raw is not None else 0
     rows = repo.list_change_log_since(device_id=identity.device_id, since_seq=since_seq)
+    # Stable dependency order inside the bundle (workspace → channel → …).
+    _order = {
+        "workspace": 0,
+        "channel": 1,
+        "user": 2,
+        "message_version": 3,
+        "sighting": 4,
+    }
+    rows = sorted(
+        rows,
+        key=lambda r: (_order.get(str(r.get("entity") or ""), 99), int(r.get("seq") or 0)),
+    )
     if not rows:
         return {
             "ok": True,

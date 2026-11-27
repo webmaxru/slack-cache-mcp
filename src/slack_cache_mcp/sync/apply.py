@@ -115,6 +115,15 @@ def apply_change_row(
     return True, reproject
 
 
+_ENTITY_ORDER = {
+    "workspace": 0,
+    "channel": 1,
+    "user": 2,
+    "message_version": 3,
+    "sighting": 4,
+}
+
+
 def apply_change_rows(
     repo: SqliteRepository,
     rows: list[dict[str, Any]],
@@ -124,7 +133,12 @@ def apply_change_rows(
     applied = 0
     skipped = 0
     touched: set[tuple[str, str]] = set()
-    for row in rows:
+    # Workspaces before channels (FK); messages before sightings.
+    ordered = sorted(
+        enumerate(rows),
+        key=lambda item: (_ENTITY_ORDER.get(str(item[1].get("entity") or ""), 99), item[0]),
+    )
+    for _idx, row in ordered:
         ok, keys = apply_change_row(repo, row, hlc_clock=hlc_clock, record_outbox=True)
         if ok:
             applied += 1
