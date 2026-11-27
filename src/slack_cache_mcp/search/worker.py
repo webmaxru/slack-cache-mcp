@@ -345,14 +345,22 @@ def embed_pending(
                 except KeyboardInterrupt:
                     interrupted = True
                     # start() may have launched the OS thread before returning.
+                    # Defer further Ctrl-C until entry is resolved — an interrupted
+                    # wait must not take the "never started" path and fake done_beat.
                     if launch_attempted and launch_thread is not None:
-                        if beat_entered.wait(timeout=2.0):
-                            beater = launch_thread
-                        else:
-                            # Never entered _beat — unblock teardown.
-                            beater = None
-                            if not done_beat.is_set():
-                                done_beat.set()
+                        beater = launch_thread
+                        while True:
+                            try:
+                                if beat_entered.wait(timeout=2.0):
+                                    break
+                                # Timed out with no entry — thread never ran.
+                                beater = None
+                                if not done_beat.is_set():
+                                    done_beat.set()
+                                break
+                            except KeyboardInterrupt:
+                                interrupted = True
+                                continue
                     break
 
             if not interrupted:
