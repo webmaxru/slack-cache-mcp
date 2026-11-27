@@ -24,51 +24,81 @@ def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _renew_meta_lease_on_side_conn(
-    db_path: str, owner: str, *, lease_s: float = 120.0
-) -> bool:
-    """Renew meta lease via a private connection (safe for heartbeat threads)."""
-    conn = sqlite3.connect(db_path, timeout=5.0)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key=?", (_EMBED_OP_LOCK_META_KEY,)
-        ).fetchone()
-        if not row:
-            conn.rollback()
-            return False
-        try:
-            data = json.loads(str(row["value"]))
-        except (json.JSONDecodeError, TypeError):
-            conn.rollback()
-            return False
-        if not isinstance(data, dict) or str(data.get("owner")) != owner:
-            conn.rollback()
-            return False
-        payload = json.dumps(
-            {
-                "owner": owner,
-                "pid": os.getpid(),
-                "expires_at": time.time() + max(lease_s, 1.0),
-                "protocol": "file+meta",
-            }
-        )
-        conn.execute(
-            """
-            INSERT INTO meta(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
-            (_EMBED_OP_LOCK_META_KEY, payload),
-        )
-        conn.commit()
-        return True
-    except Exception:
-        with contextlib.suppress(Exception):
-            conn.rollback()
+def _is_sqlite_busy(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
         return False
-    finally:
-        conn.close()
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _renew_meta_lease_on_side_conn(
+    db_path: str,
+    owner: str,
+    *,
+    lease_s: float = 120.0,
+    busy_deadline: float | None = None,
+) -> bool:
+    """Renew meta lease via a private connection (safe for heartbeat threads).
+
+    Ownership loss and connect failures return False. Transient SQLite busy /
+    locked errors are retried until ``busy_deadline`` (default: now + lease_s)
+    so an unrelated writer does not abort a still-valid lease.
+    """
+    deadline = (
+        float(busy_deadline)
+        if busy_deadline is not None
+        else time.time() + max(lease_s, 1.0)
+    )
+    while True:
+        conn: sqlite3.Connection | None = None
+        try:
+            # Short per-attempt timeout; we retry busy ourselves until deadline.
+            conn = sqlite3.connect(db_path, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key=?", (_EMBED_OP_LOCK_META_KEY,)
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return False
+            try:
+                data = json.loads(str(row["value"]))
+            except (json.JSONDecodeError, TypeError):
+                conn.rollback()
+                return False
+            if not isinstance(data, dict) or str(data.get("owner")) != owner:
+                conn.rollback()
+                return False
+            payload = json.dumps(
+                {
+                    "owner": owner,
+                    "pid": os.getpid(),
+                    "expires_at": time.time() + max(lease_s, 1.0),
+                    "protocol": "file+meta",
+                }
+            )
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (_EMBED_OP_LOCK_META_KEY, payload),
+            )
+            conn.commit()
+            return True
+        except Exception as exc:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.rollback()
+            if _is_sqlite_busy(exc) and time.time() < deadline:
+                time.sleep(0.05)
+                continue
+            return False
+        finally:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
 
 
 def embed_pending(
@@ -152,22 +182,40 @@ def embed_pending(
                 repo._conn.execute("ROLLBACK")  # noqa: SLF001
             raise
 
-    # Reconcile only when counts diverge (or vec missing); commit before inference.
-    need_reconcile = True
+    # Reconcile only when counts diverge (or vec missing); fence inside the same
+    # write txn so a stolen lease cannot drop/rebuild docs_vec under us.
     with contextlib.suppress(sqlite3.OperationalError):
-        vec_n = int(
-            repo._conn.execute("SELECT COUNT(*) AS c FROM docs_vec").fetchone()[0]  # noqa: SLF001
+        repo._conn.execute("BEGIN IMMEDIATE")  # noqa: SLF001
+    try:
+        if lock_owner is not None and not repo.renew_embedding_op_lock(lock_owner):
+            repo._conn.execute("ROLLBACK")  # noqa: SLF001
+            return {
+                "ok": False,
+                "embedded": 0,
+                "model_id": embedder.model_id,
+                "error": "embedding_op_lock_lost",
+            }
+        need_reconcile = True
+        with contextlib.suppress(sqlite3.OperationalError):
+            vec_n = int(
+                repo._conn.execute(  # noqa: SLF001
+                    "SELECT COUNT(*) AS c FROM docs_vec"
+                ).fetchone()[0]
+            )
+            blob_n = int(
+                repo._conn.execute(  # noqa: SLF001
+                    "SELECT COUNT(*) AS c FROM doc_embeddings"
+                ).fetchone()[0]
+            )
+            need_reconcile = vec_n != blob_n
+        ensure_docs_vec(  # noqa: SLF001
+            repo._conn, dim=embedder.dim, reconcile=need_reconcile
         )
-        blob_n = int(
-            repo._conn.execute(  # noqa: SLF001
-                "SELECT COUNT(*) AS c FROM doc_embeddings"
-            ).fetchone()[0]
-        )
-        need_reconcile = vec_n != blob_n
-    ensure_docs_vec(  # noqa: SLF001
-        repo._conn, dim=embedder.dim, reconcile=need_reconcile
-    )
-    repo._conn.commit()  # noqa: SLF001
+        repo._conn.commit()  # noqa: SLF001
+    except Exception:
+        with contextlib.suppress(sqlite3.Error):
+            repo._conn.execute("ROLLBACK")  # noqa: SLF001
+        raise
 
     sql = """
         SELECT doc_id, kind, workspace_key, channel_id, anchor_ts, text, text_sha256
@@ -198,10 +246,24 @@ def embed_pending(
             _owner: str | None = lock_owner,
             _path: str = db_path,
         ) -> None:
+            # Last renew (or acquire) left ~120s; after a 30s sleep ~90s remain.
+            # Busy retries must not outlive a still-valid lease window.
+            lease_s = 120.0
             while not _stop.wait(30.0):
                 if _owner is None:
                     return
-                if not _renew_meta_lease_on_side_conn(_path, _owner):
+                try:
+                    ok = _renew_meta_lease_on_side_conn(
+                        _path,
+                        _owner,
+                        lease_s=lease_s,
+                        busy_deadline=time.time() + max(lease_s - 30.0, 1.0),
+                    )
+                except Exception:
+                    # Connect / unexpected errors: fail closed so inference aborts.
+                    _ok["ok"] = False
+                    return
+                if not ok:
                     _ok["ok"] = False
                     return
 
