@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -2446,10 +2447,41 @@ class SqliteRepository:
                 return False
             raise
 
-    _EMBED_OP_LOCK_META_KEY = "embedding_op_lock"  # legacy meta row (migrated away)
+    _EMBED_OP_LOCK_META_KEY = "embedding_op_lock"  # dual-protocol with older builds
+    _LEGACY_EMBED_OP_OWNER_RE = re.compile(r"^(?:cli-rebuild|daemon)-(\d+)$")
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        """Best-effort liveness for legacy meta-lock holders during upgrades."""
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+
+            process_query_limited_information = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                process_query_limited_information, False, int(pid)
+            )
+            if not handle:
+                # Distinguish access-denied (live) from missing (dead).
+                err = ctypes.GetLastError()
+                return err == 5  # ERROR_ACCESS_DENIED
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
 
     def _embed_lock_path(self) -> Path:
-        return Path(str(self.path) + ".embedding_op.lock")
+        """Sidecar lock beside the canonical DB path (symlink-safe)."""
+        canon = self.path.resolve()
+        return Path(str(canon) + ".embedding_op.lock")
 
     def _lock_embed_file(self, fh: TextIO) -> None:
         """Exclusive, non-blocking byte-range / flock; raises OSError if busy."""
@@ -2458,20 +2490,18 @@ class SqliteRepository:
             fh.write("0")
             fh.flush()
         fh.seek(0)
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(  # type: ignore[attr-defined]
-                fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB  # type: ignore[attr-defined]
-            )
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def _unlock_embed_file(self, fh: TextIO) -> None:
         fh.seek(0)
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             with contextlib.suppress(OSError):
@@ -2480,23 +2510,122 @@ class SqliteRepository:
             import fcntl
 
             with contextlib.suppress(OSError):
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _parse_legacy_embed_meta(
+        self, raw: str | None
+    ) -> tuple[str, int | None] | None:
+        """Return ``(owner, pid)`` for a legacy/dual-protocol meta lock row."""
+        if not raw:
+            return None
+        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("owner"):
+                pid_raw = data.get("pid")
+                pid = int(pid_raw) if pid_raw is not None else None
+                if pid is None:
+                    m = self._LEGACY_EMBED_OP_OWNER_RE.match(str(data["owner"]))
+                    if m:
+                        pid = int(m.group(1))
+                return str(data["owner"]), pid
+        m = self._LEGACY_EMBED_OP_OWNER_RE.match(raw)
+        if m:
+            return raw, int(m.group(1))
+        return raw, None
+
+    def _legacy_meta_blocks(self, owner: str) -> bool:
+        """True if a live older holder still owns the meta lock row."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
+        ).fetchone()
+        parsed = self._parse_legacy_embed_meta(
+            str(row["value"]) if row else None
+        )
+        if not parsed:
+            return False
+        other, pid = parsed
+        if other == owner:
+            return False
+        if pid is not None:
+            return self._process_alive(pid)
+        # Opaque legacy row without PID: preserve exclusion.
+        return True
+
+    def _claim_legacy_meta(self, owner: str) -> bool:
+        """Claim/refresh the meta lock under IMMEDIATE; False if blocked."""
+        started = self._begin_immediate()
+        try:
+            if self._legacy_meta_blocks(owner):
+                if started:
+                    self._conn.commit()
+                return False
+            payload = json.dumps(
+                {
+                    "owner": owner,
+                    "pid": os.getpid(),
+                    "protocol": "file+meta",
+                }
+            )
+            self._conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (self._EMBED_OP_LOCK_META_KEY, payload),
+            )
+            if started:
+                self._conn.commit()
+            return True
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def _clear_legacy_meta(self, owner: str) -> None:
+        started = self._begin_immediate()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (self._EMBED_OP_LOCK_META_KEY,),
+            ).fetchone()
+            parsed = self._parse_legacy_embed_meta(
+                str(row["value"]) if row else None
+            )
+            if parsed and parsed[0] == owner:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key=?",
+                    (self._EMBED_OP_LOCK_META_KEY,),
+                )
+            if started:
+                self._conn.commit()
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
 
     def _release_embed_file_lock(self) -> None:
+        owner = self._embed_lock_owner
         fh = self._embed_lock_fh
         self._embed_lock_fh = None
         self._embed_lock_owner = None
-        if fh is None:
-            return
-        with contextlib.suppress(Exception):
-            self._unlock_embed_file(fh)
-        with contextlib.suppress(Exception):
-            fh.close()
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                self._unlock_embed_file(fh)
+            with contextlib.suppress(Exception):
+                fh.close()
+        if owner is not None:
+            with contextlib.suppress(Exception):
+                self._clear_legacy_meta(owner)
 
     def embedding_op_lock_held(self) -> bool:
-        """True when another process currently holds the OS file lock."""
+        """True when the OS file lock or a live legacy meta holder is present."""
         if self._embed_lock_fh is not None:
             return True
+        with contextlib.suppress(Exception):
+            if self._legacy_meta_blocks(owner=""):
+                return True
         path = self._embed_lock_path()
         try:
             fh = path.open("a+")
@@ -2522,15 +2651,18 @@ class SqliteRepository:
     def acquire_embedding_op_lock(
         self, owner: str, *, lease_s: float | None = None
     ) -> bool:
-        """Acquire a crash-released OS file lock for search-index mutations.
+        """Acquire crash-released OS file lock + dual-protocol meta claim.
 
-        The lock is held by an open FD, so it survives nested SQLite commits and
-        is released automatically if the process dies. ``lease_s`` is ignored
-        (kept for call-site compatibility).
+        The file lock survives nested SQLite commits and drops on process death.
+        The meta row keeps mutual exclusion with older builds that only knew the
+        metadata protocol. ``lease_s`` is ignored (API compatibility).
         """
-        del lease_s  # OS locks do not use leases.
+        del lease_s
         if self._embed_lock_fh is not None:
             return self._embed_lock_owner == owner
+        # Meta first so we never delete a live legacy holder's row.
+        if not self._claim_legacy_meta(owner):
+            return False
         path = self._embed_lock_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = path.open("a+")
@@ -2538,22 +2670,11 @@ class SqliteRepository:
             self._lock_embed_file(fh)
         except OSError:
             fh.close()
+            with contextlib.suppress(Exception):
+                self._clear_legacy_meta(owner)
             return False
         self._embed_lock_fh = fh
         self._embed_lock_owner = owner
-        # Drop legacy meta-row locks from earlier rounds so they cannot linger.
-        with contextlib.suppress(Exception):
-            started = self._begin_immediate()
-            try:
-                self._conn.execute(
-                    "DELETE FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
-                )
-                if started:
-                    self._conn.commit()
-            except Exception:
-                if started:
-                    with contextlib.suppress(sqlite3.Error):
-                        self._conn.rollback()
         return True
 
     def renew_embedding_op_lock(
@@ -2564,7 +2685,7 @@ class SqliteRepository:
         return self.embedding_op_lock_owned(owner)
 
     def release_embedding_op_lock(self, owner: str) -> None:
-        """Release the OS file lock if still owned by ``owner``."""
+        """Release the OS file lock and dual-protocol meta row if owned."""
         if self._embed_lock_owner != owner:
             return
         self._release_embed_file_lock()

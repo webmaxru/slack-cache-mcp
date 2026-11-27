@@ -216,6 +216,9 @@ def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
 
 def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
     """Crash-released OS file lock excludes a second repository handle."""
+    import json
+    import os
+
     assert archive.acquire_embedding_op_lock("owner-a") is True
     assert archive.embedding_op_lock_owned("owner-a") is True
     assert archive.renew_embedding_op_lock("owner-a") is True
@@ -233,6 +236,23 @@ def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
         other2.release_embedding_op_lock("owner-b")
     finally:
         other2.close()
+    # Live legacy meta holder still blocks a file-lock-only acquire path.
+    archive._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO meta(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (
+            archive._EMBED_OP_LOCK_META_KEY,  # noqa: SLF001
+            json.dumps({"owner": f"daemon-{os.getpid()}", "pid": os.getpid()}),
+        ),
+    )
+    archive._conn.commit()  # noqa: SLF001
+    assert archive.acquire_embedding_op_lock("owner-c") is False
+    archive._clear_legacy_meta(f"daemon-{os.getpid()}")  # noqa: SLF001
+    assert archive.acquire_embedding_op_lock("owner-c") is True
+    archive.release_embedding_op_lock("owner-c")
+
 
 
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:
