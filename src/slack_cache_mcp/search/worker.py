@@ -270,12 +270,14 @@ def embed_pending(
         texts = [r["text"] for r in batch]
         # Short renewable lease via a side connection during inference.
         stop_beat = threading.Event()
+        done_beat = threading.Event()
         beat_ok = {"ok": True}
         commit_gate = threading.Lock()
         commit_allowed = {"ok": True}
 
         def _beat(
             _stop: threading.Event = stop_beat,
+            _done: threading.Event = done_beat,
             _ok: dict[str, bool] = beat_ok,
             _owner: str | None = lock_owner,
             _path: str = db_path,
@@ -284,30 +286,34 @@ def embed_pending(
         ) -> None:
             # Last renew (or acquire) left ~120s; after a 30s sleep ~90s remain.
             # Busy retries must not outlive a still-valid lease window.
-            lease_s = 120.0
-            while not _stop.wait(30.0):
-                if _owner is None:
-                    return
-                try:
-                    ok = _renew_meta_lease_on_side_conn(
-                        _path,
-                        _owner,
-                        lease_s=lease_s,
-                        busy_deadline=time.time() + max(lease_s - 30.0, 1.0),
-                        stop=_stop,
-                        commit_gate=_gate,
-                        commit_allowed=_allowed,
-                    )
-                except Exception:
-                    # Connect / unexpected errors: fail closed so inference aborts.
-                    _ok["ok"] = False
-                    return
-                if _stop.is_set() or ok is None:
-                    # Cancelled by inference teardown — do not fail the batch.
-                    return
-                if not ok:
-                    _ok["ok"] = False
-                    return
+            try:
+                lease_s = 120.0
+                while not _stop.wait(30.0):
+                    if _owner is None:
+                        return
+                    try:
+                        ok = _renew_meta_lease_on_side_conn(
+                            _path,
+                            _owner,
+                            lease_s=lease_s,
+                            busy_deadline=time.time() + max(lease_s - 30.0, 1.0),
+                            stop=_stop,
+                            commit_gate=_gate,
+                            commit_allowed=_allowed,
+                        )
+                    except Exception:
+                        # Connect / unexpected errors: fail closed so inference aborts.
+                        _ok["ok"] = False
+                        return
+                    if _stop.is_set() or ok is None:
+                        # Cancelled by inference teardown — do not fail the batch.
+                        return
+                    if not ok:
+                        _ok["ok"] = False
+                        return
+            finally:
+                # Set only after side-conn renew returns (connection closed).
+                _done.set()
 
         beater: threading.Thread | None = None
         if lock_owner is not None:
@@ -315,18 +321,23 @@ def embed_pending(
                 target=_beat, name="embed-op-lock-beat", daemon=True
             )
             beater.start()
+        else:
+            done_beat.set()
         try:
             vectors = embedder.embed_documents(texts)
         finally:
             # Forbid further lease commits, then wait until the heartbeat exits
             # before returning — callers release the OS lock immediately after.
-            # Defer Ctrl-C until teardown finishes so release cannot race a renew.
-            stop_beat.set()
+            # Defer Ctrl-C across the *entire* teardown (stop + gate + wait).
+            # Prefer done_beat over join(): CPython 3.12 can mark a thread
+            # stopped after an interrupted join while it is still running.
             interrupted = False
             while True:
                 try:
+                    stop_beat.set()
                     with commit_gate:
                         commit_allowed["ok"] = False
+                    done_beat.wait()
                     if beater is not None:
                         beater.join()
                     break
