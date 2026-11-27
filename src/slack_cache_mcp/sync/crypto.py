@@ -11,7 +11,8 @@ from pyrage import decrypt, encrypt, x25519
 
 from slack_cache_mcp.sync.device import DeviceIdentity, verify_ed25519
 
-BUNDLE_FORMAT_VERSION = 1
+# v2: signature covers canonical header fields + payload (not payload alone).
+BUNDLE_FORMAT_VERSION = 2
 
 
 def age_encrypt(plaintext: bytes, recipients: list[str]) -> bytes:
@@ -28,6 +29,13 @@ def age_decrypt(ciphertext: bytes, identity: x25519.Identity) -> bytes:
     return out
 
 
+def _canonical_signed_bytes(envelope_without_sig: dict[str, Any]) -> bytes:
+    """Canonical JSON of every field except the signature itself."""
+    return json.dumps(
+        envelope_without_sig, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
 def build_signed_envelope(
     *,
     identity: DeviceIdentity,
@@ -42,8 +50,7 @@ def build_signed_envelope(
     ]
     raw = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
     compressed = zstd.ZstdCompressor(level=3).compress(raw)
-    signature = identity.sign(compressed)
-    envelope = {
+    envelope_body = {
         "v": BUNDLE_FORMAT_VERSION,
         "device_id": identity.device_id,
         "from_seq": from_seq,
@@ -52,9 +59,10 @@ def build_signed_envelope(
         "age_recipient": identity.age_recipient,
         "label": identity.label,
         "payload_zstd_b64": base64.b64encode(compressed).decode("ascii"),
-        "signature_b64": base64.b64encode(signature).decode("ascii"),
         "row_count": len(rows),
     }
+    signature = identity.sign(_canonical_signed_bytes(envelope_body))
+    envelope = {**envelope_body, "signature_b64": base64.b64encode(signature).decode("ascii")}
     return json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -62,8 +70,9 @@ def open_signed_envelope(
     envelope_bytes: bytes,
     *,
     require_device_id: str | None = None,
+    expected_ed25519_public: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Verify signature and return (header, change_log rows)."""
+    """Verify signature (and optional pinned key) and return (header, rows)."""
     try:
         envelope = json.loads(envelope_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -82,10 +91,13 @@ def open_signed_envelope(
     sig_b64 = str(envelope.get("signature_b64") or "")
     if not pub or not payload_b64 or not sig_b64:
         raise ValueError("bundle missing signature fields")
-    compressed = base64.b64decode(payload_b64.encode("ascii"))
+    if expected_ed25519_public is not None and pub != expected_ed25519_public:
+        raise ValueError("bundle signing key does not match registered peer")
     signature = base64.b64decode(sig_b64.encode("ascii"))
-    if not verify_ed25519(pub, compressed, signature):
+    body = {k: v for k, v in envelope.items() if k != "signature_b64"}
+    if not verify_ed25519(pub, _canonical_signed_bytes(body), signature):
         raise ValueError("bundle Ed25519 signature verification failed")
+    compressed = base64.b64decode(payload_b64.encode("ascii"))
     raw = zstd.ZstdDecompressor().decompress(compressed)
     rows: list[dict[str, Any]] = []
     for line in raw.decode("utf-8").splitlines():

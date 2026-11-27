@@ -105,3 +105,6 @@ Age encrypt requires recipients at export time. Peers exchange public identity v
 
 ### Convergence hash
 `state_hash` covers ordered projections of `messages`, `message_versions`, `channels`, `users`, and `workspaces` (not device-local drafts/paths). Property tests shuffle 2–4 devices and re-import duplicates.
+
+### Bundle trust + envelope v2
+Import rejects unknown senders and signing/age key mismatches against `sync peers add` registrations; header keys never overwrite a registered peer. Envelope format version 2 signs the canonical header+payload (not payload alone). Export runs `backfill_outbox` so upgraded M4 archives ship full sanitized facts. HLC watermark is persisted in `meta.hlc_watermark` and restored for ingest/import.

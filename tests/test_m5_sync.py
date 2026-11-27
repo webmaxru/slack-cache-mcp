@@ -24,17 +24,21 @@ from slack_cache_mcp.sync.state_hash import compute_state_hash
 
 
 def test_hlc_observe_advances_past_remote() -> None:
-    clock = HLC(device_id="D1")
-    first = clock.now()
-    w1, c1, _ = parse_hlc(first)
-    # Same physical wall, higher remote counter → local counter must jump past it.
-    clock.observe(f"{w1}-{c1 + 7}-D2")
-    assert clock.last_wall_ms == w1
-    assert clock.counter == c1 + 8
-    nxt = clock.now()
-    w2, c2, device = parse_hlc(nxt)
-    assert device == "D1"
-    assert (w2, c2) >= (w1, c1 + 8)
+    from unittest.mock import patch
+
+    # Freeze physical time so now()/observe() share one wall millisecond.
+    with patch("slack_cache_mcp.ingest.hlc.time.time", return_value=1_700_000_000.123):
+        clock = HLC(device_id="D1")
+        first = clock.now()
+        w1, c1, _ = parse_hlc(first)
+        clock.observe(f"{w1}-{c1 + 7}-D2")
+        assert clock.last_wall_ms == w1
+        assert clock.counter == c1 + 8
+        nxt = clock.now()
+        w2, c2, device = parse_hlc(nxt)
+        assert device == "D1"
+        assert w2 == w1
+        assert c2 == c1 + 9
 
 
 def test_device_identity_persists(tmp_path: Path) -> None:
@@ -314,6 +318,34 @@ def test_convergence_random_order_and_duplicates(
 
         for _d, repo, _i in devices:
             repo.close()
+
+
+def test_import_rejects_unknown_sender(tmp_path: Path) -> None:
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    folder = tmp_path / "usb"
+    folder.mkdir()
+    repo_a = SqliteRepository(dir_a / "archive.db")
+    repo_b = SqliteRepository(dir_b / "archive.db")
+    id_a = ensure_local_device(repo_a, dir_a)
+    id_b = ensure_local_device(repo_b, dir_b)
+    # A encrypts to B, but B never registered A → import must fail closed.
+    register_peer(repo_a, id_b.public_info())
+    _seed_facts(
+        repo_a,
+        device_id=id_a.device_id,
+        hlc=HLC(device_id=id_a.device_id),
+        workspace_key="W1",
+        channel_id="C1",
+        messages=[("1.000001", "secret", "sha-s")],
+    )
+    export_bundle(repo_a, identity=id_a, to_dir=folder)
+    result = import_bundles(repo_b, identity=id_b, from_dir=folder)
+    assert result["ok"] is False
+    assert result["errors"]
+    assert "unknown sender" in result["errors"][0]["error"]
+    repo_a.close()
+    repo_b.close()
 
 
 def test_apply_rows_sanitizes_payload(tmp_path: Path) -> None:

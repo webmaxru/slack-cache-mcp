@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import Any
 
@@ -28,10 +29,11 @@ def apply_change_row(
     *,
     hlc_clock: HLC | None = None,
     record_outbox: bool = True,
-) -> bool:
-    """Apply one change_log row. Returns True if a new outbox row was inserted.
+) -> tuple[bool, set[tuple[str, str]]]:
+    """Apply one change_log row atomically.
 
-    Idempotent on ``(device_id, entity, entity_key, payload_sha256)``.
+    Returns ``(applied, reproject_keys)``. Idempotent on
+    ``(device_id, entity, entity_key, payload_sha256)``.
     """
     device_id = str(row["device_id"])
     entity = str(row["entity"])
@@ -40,46 +42,62 @@ def apply_change_row(
     hlc = str(row["hlc"])
     payload = _as_dict(row.get("payload_json") or row.get("payload") or {})
     payload_sha = str(row.get("payload_sha256") or payload_sha256(payload))
+    reproject: set[tuple[str, str]] = set()
 
     if hlc_clock is not None:
         hlc_clock.observe(hlc)
 
-    if record_outbox:
-        inserted = repo.insert_change_log_row(
-            hlc=hlc,
-            device_id=device_id,
-            entity=entity,
-            entity_key=entity_key,
-            op=op,
-            payload=payload,
-            payload_sha256=payload_sha,
-        )
-        if not inserted:
-            return False
-    else:
-        # Still short-circuit if already known.
-        if repo.has_change_log(
-            device_id=device_id,
-            entity=entity,
-            entity_key=entity_key,
-            payload_sha256=payload_sha,
-        ):
-            return False
+    if repo.has_change_log(
+        device_id=device_id,
+        entity=entity,
+        entity_key=entity_key,
+        payload_sha256=payload_sha,
+    ):
+        return False, reproject
 
-    if entity == "message_version":
-        _apply_message_version(repo, payload, device_id=device_id, hlc=hlc)
-    elif entity == "workspace":
-        _apply_workspace(repo, payload, hlc=hlc)
-    elif entity == "channel":
-        _apply_channel(repo, payload, hlc=hlc)
-    elif entity == "user":
-        _apply_user(repo, payload, hlc=hlc)
-    elif entity == "sighting":
-        _apply_sighting(repo, payload)
-    else:
-        # Unknown entity types are recorded in the outbox but ignored for apply.
-        pass
-    return True
+    # Marker + fact updates in one transaction; rollback on any failure so a
+    # failed FK/apply cannot permanently skip the row.
+    try:
+        repo._conn.execute("BEGIN")  # noqa: SLF001
+        if record_outbox:
+            inserted = repo.insert_change_log_row(
+                hlc=hlc,
+                device_id=device_id,
+                entity=entity,
+                entity_key=entity_key,
+                op=op,
+                payload=payload,
+                payload_sha256=payload_sha,
+                commit=False,
+            )
+            if not inserted:
+                repo._conn.rollback()  # noqa: SLF001
+                return False, reproject
+
+        if entity == "message_version":
+            _apply_message_version(repo, payload, device_id=device_id, hlc=hlc)
+            ch = str(payload.get("channel_id") or "")
+            ts = str(payload.get("ts") or "")
+            if ch and ts:
+                reproject.add((ch, ts))
+        elif entity == "workspace":
+            _apply_workspace(repo, payload, hlc=hlc)
+        elif entity == "channel":
+            _apply_channel(repo, payload, hlc=hlc)
+            ch = str(payload.get("channel_id") or "")
+            if ch:
+                for ts in repo.list_known_message_ts(ch):
+                    reproject.add((ch, ts))
+        elif entity == "user":
+            _apply_user(repo, payload, hlc=hlc)
+        elif entity == "sighting":
+            _apply_sighting(repo, payload)
+        repo._conn.commit()  # noqa: SLF001
+    except Exception:
+        with contextlib.suppress(Exception):
+            repo._conn.rollback()  # noqa: SLF001
+        raise
+    return True, reproject
 
 
 def apply_change_rows(
@@ -92,20 +110,12 @@ def apply_change_rows(
     skipped = 0
     touched: set[tuple[str, str]] = set()
     for row in rows:
-        before = repo.change_log_count()
-        ok = apply_change_row(repo, row, hlc_clock=hlc_clock, record_outbox=True)
+        ok, keys = apply_change_row(repo, row, hlc_clock=hlc_clock, record_outbox=True)
         if ok:
             applied += 1
-            if str(row.get("entity")) == "message_version":
-                payload = _as_dict(row.get("payload_json") or row.get("payload") or {})
-                ch = str(payload.get("channel_id") or "")
-                ts = str(payload.get("ts") or "")
-                if ch and ts:
-                    touched.add((ch, ts))
+            touched.update(keys)
         else:
             skipped += 1
-        # Defensive: count should never shrink
-        assert repo.change_log_count() >= before
     for channel_id, ts in sorted(touched):
         repo.reproject_message(channel_id, ts)
     return {"applied": applied, "skipped": skipped, "reprojected": len(touched)}
@@ -143,7 +153,6 @@ def _apply_message_version(
         reply_users=list(payload.get("reply_users") or []),
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
-    # Use ingest path but suppress nested outbox write (already recorded).
     repo.ingest_observation(
         obs,
         device_id=device_id,
@@ -152,6 +161,8 @@ def _apply_message_version(
         seen_at=seen_at,
         hlc=hlc,
         write_change_log=False,
+        commit=False,
+        reproject=False,
     )
 
 
@@ -171,7 +182,9 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
         raw=clean_raw,
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
-    repo.upsert_workspace(ws, hlc, seen_at, write_change_log=False)
+    repo.upsert_workspace(
+        ws, hlc, seen_at, write_change_log=False, hlc_lww=True, commit=False
+    )
 
 
 def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
@@ -194,7 +207,9 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         raw=clean_raw,
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
-    repo.upsert_channel(ch, hlc, seen_at, write_change_log=False)
+    repo.upsert_channel(
+        ch, hlc, seen_at, write_change_log=False, hlc_lww=True, commit=False
+    )
 
 
 def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
@@ -220,7 +235,9 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         workspace_key=payload.get("workspace_key"),
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
-    repo.upsert_user(user, hlc, seen_at, write_change_log=False)
+    repo.upsert_user(
+        user, hlc, seen_at, write_change_log=False, hlc_lww=True, commit=False
+    )
 
 
 def _apply_sighting(repo: SqliteRepository, payload: dict[str, Any]) -> None:
@@ -233,4 +250,5 @@ def _apply_sighting(repo: SqliteRepository, payload: dict[str, Any]) -> None:
         seen_at=str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z"),
         snapshot_id=str(payload.get("snapshot_id") or "sync"),
         state_sha256=str(payload.get("state_sha256") or "sync"),
+        commit=False,
     )

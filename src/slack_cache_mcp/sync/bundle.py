@@ -34,6 +34,7 @@ def ensure_local_device(repo: SqliteRepository, data_dir: Path) -> DeviceIdentit
 
 
 def register_peer(repo: SqliteRepository, peer: DevicePublicInfo) -> None:
+    """Explicit trust operation: register/replace a peer's public keys."""
     public_key = json.dumps(
         {"ed25519": peer.ed25519_public_b64, "age": peer.age_recipient},
         sort_keys=True,
@@ -55,6 +56,15 @@ def list_age_recipients(
     return recipients
 
 
+def restore_hlc(repo: SqliteRepository, device_id: str) -> HLC:
+    """Build an HLC that dominates both local outbox and persisted watermark."""
+    clock = HLC(device_id=device_id)
+    for candidate in (repo.get_hlc_watermark(), repo.max_local_hlc(device_id)):
+        if candidate:
+            clock.observe(candidate)
+    return clock
+
+
 def export_bundle(
     repo: SqliteRepository,
     *,
@@ -65,6 +75,11 @@ def export_bundle(
     """Export local change_log rows since push cursor as an age-encrypted bundle."""
     to_dir = Path(to_dir)
     to_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure upgraded archives have complete outbox facts before export.
+    hlc = restore_hlc(repo, identity.device_id)
+    backfill = repo.backfill_outbox(device_id=identity.device_id, hlc=hlc.now())
+    repo.set_hlc_watermark(hlc.now())
 
     cursor_raw = repo.get_sync_cursor(peer, "push")
     since_seq = int(cursor_raw) if cursor_raw is not None else 0
@@ -77,6 +92,7 @@ def export_bundle(
             "from_seq": since_seq,
             "to_seq": since_seq,
             "peer": peer,
+            "backfill": backfill,
         }
 
     from_seq = int(rows[0]["seq"])
@@ -122,6 +138,7 @@ def export_bundle(
         "to_seq": to_seq,
         "peer": peer,
         "recipients": len(recipients),
+        "backfill": backfill,
     }
 
 
@@ -132,15 +149,12 @@ def import_bundles(
     from_dir: Path,
     peer: str = "folder",
 ) -> dict[str, Any]:
-    """Decrypt, verify, and apply all ``*.jsonl.zst.age`` bundles in ``from_dir``."""
+    """Decrypt, verify against registered peers, and apply bundles."""
     from_dir = Path(from_dir)
     if not from_dir.is_dir():
         raise FileNotFoundError(from_dir)
 
-    hlc_clock = HLC(device_id=identity.device_id)
-    last = repo.max_local_hlc(identity.device_id)
-    if last:
-        hlc_clock.observe(last)
+    hlc_clock = restore_hlc(repo, identity.device_id)
 
     files = sorted(from_dir.glob("bundle-*.jsonl.zst.age"))
     imported_files = 0
@@ -152,22 +166,32 @@ def import_bundles(
         try:
             ciphertext = path.read_bytes()
             envelope_bytes = age_decrypt(ciphertext, identity.age_identity)
-            header, rows = open_signed_envelope(envelope_bytes)
-            sender_id = str(header["device_id"])
+            # Peek device_id before full verify so we can pin the registered key.
+            peek = json.loads(envelope_bytes.decode("utf-8"))
+            if not isinstance(peek, dict):
+                raise ValueError("invalid envelope")
+            sender_id = str(peek.get("device_id") or "")
+            if not sender_id:
+                raise ValueError("bundle missing device_id")
             if sender_id == identity.device_id:
                 continue
-            age_recipient = header.get("age_recipient")
-            if not age_recipient:
-                raise ValueError("bundle header missing age_recipient")
-            register_peer(
-                repo,
-                DevicePublicInfo(
-                    device_id=sender_id,
-                    label=str(header.get("label") or sender_id),
-                    ed25519_public_b64=str(header["ed25519_public"]),
-                    age_recipient=str(age_recipient),
-                ),
+            registered = repo.get_device(sender_id)
+            if registered is None or not registered.get("public_key"):
+                raise ValueError(
+                    f"unknown sender {sender_id}; run `slackcache sync peers add` first"
+                )
+            keys = parse_public_key_json(registered.get("public_key"))
+            expected_ed = keys.get("ed25519")
+            expected_age = keys.get("age")
+            if not expected_ed or not expected_age:
+                raise ValueError(f"peer {sender_id} missing public keys")
+            header, rows = open_signed_envelope(
+                envelope_bytes,
+                expected_ed25519_public=expected_ed,
             )
+            if str(header.get("age_recipient") or "") != expected_age:
+                raise ValueError("bundle age_recipient does not match registered peer")
+            # Do NOT overwrite registered keys from the header (impersonation defense).
             stats = apply_change_rows(repo, rows, hlc_clock=hlc_clock)
             total_applied += int(stats["applied"])
             total_skipped += int(stats["skipped"])
@@ -178,6 +202,10 @@ def import_bundles(
         except Exception as exc:
             errors.append({"path": str(path), "error": str(exc)})
 
+    # Persist merged HLC so subsequent local ingest dominates imported clocks.
+    tick = hlc_clock.now()
+    repo.set_hlc_watermark(tick)
+
     return {
         "ok": not errors,
         "files_seen": len(files),
@@ -185,4 +213,5 @@ def import_bundles(
         "applied": total_applied,
         "skipped": total_skipped,
         "errors": errors,
+        "hlc_watermark": tick,
     }

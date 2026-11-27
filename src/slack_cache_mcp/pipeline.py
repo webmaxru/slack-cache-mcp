@@ -561,7 +561,7 @@ def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[s
 
     assert_data_dir_outside_sources(settings.data_dir, [p.path for p in valid])
     secure_data_dir(settings.data_dir)
-    from slack_cache_mcp.sync.bundle import ensure_local_device
+    from slack_cache_mcp.sync.bundle import ensure_local_device, restore_hlc
 
     repo = SqliteRepository(settings.archive_db)
     identity = ensure_local_device(repo, settings.data_dir)
@@ -572,7 +572,7 @@ def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[s
         keep=settings.vault_keep,
         keep_days=settings.vault_keep_days,
     )
-    hlc = HLC(device_id=device_id)
+    hlc = restore_hlc(repo, device_id)
     seen_at = _utc_now()
 
     per_source: list[dict[str, Any]] = []
@@ -590,6 +590,8 @@ def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[s
             )
         )
 
+    # Persist HLC so later cycles dominate any previously imported remote clocks.
+    repo.set_hlc_watermark(hlc.now())
     leaks = repo.scan_for_token_leak()
     vault_leaks = vault.scan_for_token_leak() if settings.vault_keep else []
     primary = next((p for p in valid if p.primary), valid[0])
