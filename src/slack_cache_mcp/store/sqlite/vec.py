@@ -56,12 +56,18 @@ def mark_docs_vec_divergent(
 
 
 def docs_vec_needs_reconcile(conn: sqlite3.Connection) -> bool:
-    """True when a divergence flag or legacy per-id list is pending."""
+    """True when divergence is flagged or one-time migration is still pending.
+
+    Read paths (MCP search) must treat pending migration as divergence so
+    stale vec rows cannot hide closer blobs before a worker reconciles.
+    """
     row = conn.execute(
         "SELECT 1 FROM meta WHERE key=? OR key=?",
         (_DIVERGENCE_META, _LEGACY_DIVERGENCE_META),
     ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+    return _needs_migration_reconcile(conn)
 
 
 def clear_docs_vec_divergence(conn: sqlite3.Connection) -> None:

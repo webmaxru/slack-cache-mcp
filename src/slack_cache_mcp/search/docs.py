@@ -271,6 +271,10 @@ class SearchDocsBuilder:
             try:
                 out[channel_id] = self._rebuild_windows_for_channel(channel_id)
                 self.repo.ack_dirty_window_channel(channel_id, generation)
+                # Always persist rebuild+ack together. ack may skip commit when
+                # nested in a caller txn; daemon close would then roll both back
+                # (e.g. after skipping embed due to ONNX demotion guard).
+                self.repo._conn.commit()  # noqa: SLF001
             except Exception:
                 # Leave channel (and remaining) dirty for the next pass.
                 raise

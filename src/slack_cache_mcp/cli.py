@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -285,8 +286,14 @@ def rebuild_cmd(
         result["search_docs"] = counts
     if do_all or embeddings:
         emb = load_embedder(models_dir=settings.models_dir)
-        # Explicit rebuild may intentionally switch to hashing.
-        emb_result = embed_pending(repo, emb, allow_hashing_demotion=True)
+        # Allow hashing demotion only when hashing was explicitly selected
+        # (SLACKCACHE_EMBEDDER=hashing) — not when ONNX merely failed to load.
+        explicit_hashing = (
+            os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing"
+        )
+        emb_result = embed_pending(
+            repo, emb, allow_hashing_demotion=explicit_hashing
+        )
         result["embeddings"] = emb_result
         if isinstance(emb_result, dict) and emb_result.get("ok") is False:
             result["ok"] = False
