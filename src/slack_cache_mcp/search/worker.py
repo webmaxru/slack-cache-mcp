@@ -38,13 +38,17 @@ def _renew_meta_lease_on_side_conn(
     lease_s: float = 120.0,
     busy_deadline: float | None = None,
     stop: threading.Event | None = None,
+    commit_gate: threading.Lock | None = None,
+    commit_allowed: dict[str, bool] | None = None,
 ) -> bool | None:
     """Renew meta lease via a private connection (safe for heartbeat threads).
 
     Returns True on success, False on ownership loss / hard failure, or None
-    when ``stop`` is set (cancelled). Transient SQLite busy / locked errors are
-    retried until ``busy_deadline`` (default: now + lease_s) so an unrelated
-    writer does not abort a still-valid lease; retries are cancellable.
+    when ``stop`` is set (cancelled) or commit is disallowed. Transient SQLite
+    busy / locked errors are retried until ``busy_deadline`` (default: now +
+    lease_s); retries are cancellable. ``commit_gate`` + ``commit_allowed``
+    serialize the final commit against teardown so a stalled renew cannot
+    extend a lease after ownership release begins.
     """
     deadline = (
         float(busy_deadline)
@@ -53,6 +57,8 @@ def _renew_meta_lease_on_side_conn(
     )
     while True:
         if stop is not None and stop.is_set():
+            return None
+        if commit_allowed is not None and not commit_allowed.get("ok", False):
             return None
         conn: sqlite3.Connection | None = None
         try:
@@ -89,6 +95,19 @@ def _renew_meta_lease_on_side_conn(
                 """,
                 (_EMBED_OP_LOCK_META_KEY, payload),
             )
+            # Commit only while teardown still allows it (mutex with join path).
+            if commit_gate is not None and commit_allowed is not None:
+                with commit_gate:
+                    if not commit_allowed.get("ok", False) or (
+                        stop is not None and stop.is_set()
+                    ):
+                        conn.rollback()
+                        return None
+                    conn.commit()
+                    return True
+            if stop is not None and stop.is_set():
+                conn.rollback()
+                return None
             conn.commit()
             return True
         except Exception as exc:
@@ -96,6 +115,8 @@ def _renew_meta_lease_on_side_conn(
                 with contextlib.suppress(Exception):
                     conn.rollback()
             if stop is not None and stop.is_set():
+                return None
+            if commit_allowed is not None and not commit_allowed.get("ok", False):
                 return None
             if _is_sqlite_busy(exc) and time.time() < deadline:
                 # Interruptible backoff so inference can join before lock release.
@@ -250,12 +271,16 @@ def embed_pending(
         # Short renewable lease via a side connection during inference.
         stop_beat = threading.Event()
         beat_ok = {"ok": True}
+        commit_gate = threading.Lock()
+        commit_allowed = {"ok": True}
 
         def _beat(
             _stop: threading.Event = stop_beat,
             _ok: dict[str, bool] = beat_ok,
             _owner: str | None = lock_owner,
             _path: str = db_path,
+            _gate: threading.Lock = commit_gate,
+            _allowed: dict[str, bool] = commit_allowed,
         ) -> None:
             # Last renew (or acquire) left ~120s; after a 30s sleep ~90s remain.
             # Busy retries must not outlive a still-valid lease window.
@@ -270,6 +295,8 @@ def embed_pending(
                         lease_s=lease_s,
                         busy_deadline=time.time() + max(lease_s - 30.0, 1.0),
                         stop=_stop,
+                        commit_gate=_gate,
+                        commit_allowed=_allowed,
                     )
                 except Exception:
                     # Connect / unexpected errors: fail closed so inference aborts.
@@ -291,14 +318,13 @@ def embed_pending(
         try:
             vectors = embedder.embed_documents(texts)
         finally:
-            # Stop must be observed by busy retries before we return (callers
-            # release the OS lock immediately after embed_pending returns).
+            # Forbid further lease commits, then wait until the heartbeat exits
+            # before returning — callers release the OS lock immediately after.
             stop_beat.set()
+            with commit_gate:
+                commit_allowed["ok"] = False
             if beater is not None:
-                # connect(timeout=1) + a couple of interruptible backoffs.
-                beater.join(timeout=10.0)
-                if beater.is_alive():
-                    beat_ok["ok"] = False
+                beater.join()
         if not beat_ok["ok"]:
             return {
                 "ok": False,
