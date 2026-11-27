@@ -320,11 +320,21 @@ def embed_pending(
         finally:
             # Forbid further lease commits, then wait until the heartbeat exits
             # before returning — callers release the OS lock immediately after.
+            # Defer Ctrl-C until teardown finishes so release cannot race a renew.
             stop_beat.set()
-            with commit_gate:
-                commit_allowed["ok"] = False
-            if beater is not None:
-                beater.join()
+            interrupted = False
+            while True:
+                try:
+                    with commit_gate:
+                        commit_allowed["ok"] = False
+                    if beater is not None:
+                        beater.join()
+                    break
+                except KeyboardInterrupt:
+                    interrupted = True
+                    continue
+            if interrupted:
+                raise KeyboardInterrupt
         if not beat_ok["ok"]:
             return {
                 "ok": False,
