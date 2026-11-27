@@ -99,10 +99,6 @@ def export_bundle(
         "message_version": 3,
         "sighting": 4,
     }
-    rows = sorted(
-        rows,
-        key=lambda r: (_order.get(str(r.get("entity") or ""), 99), int(r.get("seq") or 0)),
-    )
     if not rows:
         return {
             "ok": True,
@@ -114,8 +110,14 @@ def export_bundle(
             "backfill": backfill,
         }
 
-    from_seq = int(rows[0]["seq"])
-    to_seq = int(rows[-1]["seq"])
+    # Sequence bounds are independent of dependency order (min/max of the batch).
+    seqs = [int(r["seq"]) for r in rows]
+    from_seq = min(seqs)
+    to_seq = max(seqs)
+    rows = sorted(
+        rows,
+        key=lambda r: (_order.get(str(r.get("entity") or ""), 99), int(r.get("seq") or 0)),
+    )
     serializable: list[dict[str, Any]] = []
     for r in rows:
         payload = r["payload_json"]

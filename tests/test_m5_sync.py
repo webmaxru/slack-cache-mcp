@@ -515,3 +515,136 @@ def test_register_peer_resets_push_cursor(tmp_path: Path) -> None:
     assert repo.get_sync_cursor("usb-stick", "push") == "0"
     assert identity.device_id
     repo.close()
+
+
+def test_export_sequence_bounds_independent_of_entity_order(tmp_path: Path) -> None:
+    """from_seq/to_seq use min/max seq even when dependency sort reorders rows."""
+    data = tmp_path / "a"
+    folder = tmp_path / "usb"
+    folder.mkdir()
+    repo = SqliteRepository(data / "archive.db")
+    identity = ensure_local_device(repo, data)
+    hlc = HLC(device_id=identity.device_id)
+    # Sighting first (lower seq), then workspace (higher seq) — sort puts workspace first.
+    repo.append_entity_change(
+        hlc=hlc.now(),
+        device_id=identity.device_id,
+        entity="sighting",
+        entity_key="C1|1.0|dev",
+        payload={
+            "channel_id": "C1",
+            "ts": "1.0",
+            "device_id": identity.device_id,
+            "source_id": "src",
+            "first_seen": "2026-11-27T12:00:00Z",
+            "last_seen": "2026-11-27T12:00:00Z",
+        },
+    )
+    repo.append_entity_change(
+        hlc=hlc.now(),
+        device_id=identity.device_id,
+        entity="workspace",
+        entity_key="W1",
+        payload={
+            "workspace_key": "W1",
+            "team_id": "T1",
+            "name": "ws",
+            "self_is_guest": False,
+            "raw": {},
+            "field_hlcs": {"name": hlc.now()},
+        },
+    )
+    repo.set_sync_cursor("folder", "push", "0")
+    # Skip migration purge side-effects for this bounds check.
+    repo.set_meta("field_hlcs_policy", "v5-preserve-known-rebuild-outbox")
+    exported = export_bundle(repo, identity=identity, to_dir=folder)
+    assert exported["ok"] is True
+    assert exported["exported"] >= 2
+    assert exported["from_seq"] <= exported["to_seq"]
+    assert exported["from_seq"] == 1
+    assert exported["to_seq"] >= 2
+    assert repo.get_sync_cursor("folder", "push") == str(exported["to_seq"])
+    repo.close()
+
+
+def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) -> None:
+    """v5 recovery keeps real clocks, stars only gaps, rebuilds local directory outbox."""
+    from slack_cache_mcp.store.sqlite.repo import _UNKNOWN_FIELD_HLC, _load_field_hlcs
+
+    db = tmp_path / "a.db"
+    repo = SqliteRepository(db)
+    identity = ensure_local_device(repo, tmp_path / "a")
+    good = "1700000000000-20-new"
+    fabricated = "1700000000000-30-old"
+    repo._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO workspaces(
+          workspace_key, team_id, enterprise_id, name, domain, self_user_id,
+          self_is_guest, raw_json, first_seen, last_seen, updated_hlc, field_hlcs_json
+        ) VALUES (?, ?, NULL, ?, NULL, ?, 0, '{}', ?, ?, ?, ?)
+        """,
+        (
+            "W1",
+            "T1",
+            "kept",
+            "U1",
+            "2026-11-27T12:00:00Z",
+            "2026-11-27T12:00:00Z",
+            good,
+            json.dumps({"name": _UNKNOWN_FIELD_HLC, "team_id": good}),
+        ),
+    )
+    # Outbox still has the pre-star real name clock plus a fabricated domain clock.
+    repo.append_entity_change(
+        hlc=fabricated,
+        device_id=identity.device_id,
+        entity="workspace",
+        entity_key="W1",
+        payload={
+            "workspace_key": "W1",
+            "team_id": "T1",
+            "name": "kept",
+            "domain": "invented.example",
+            "self_user_id": "U1",
+            "self_is_guest": False,
+            "raw": {},
+            "field_hlcs": {"name": good, "domain": fabricated, "team_id": good},
+        },
+    )
+    repo.set_meta("field_hlcs_policy", "v4-star-all-fields")
+    repo._conn.commit()  # noqa: SLF001
+    repo.close()
+
+    repo2 = SqliteRepository(db)
+    row = repo2._conn.execute(  # noqa: SLF001
+        "SELECT field_hlcs_json, name, domain FROM workspaces WHERE workspace_key='W1'"
+    ).fetchone()
+    assert row is not None
+    clocks = _load_field_hlcs(row["field_hlcs_json"])
+    assert clocks.get("team_id") == good
+    assert clocks.get("name") == good  # recovered from outbox
+    assert clocks.get("self_user_id") == _UNKNOWN_FIELD_HLC
+    assert repo2.get_meta("field_hlcs_policy") == "v5-pending-outbox-purge"
+
+    before = repo2.change_log_count()
+    assert before >= 1
+    rebuilt = repo2.backfill_outbox(device_id=identity.device_id, hlc=good)
+    assert rebuilt["workspaces"] >= 1
+    assert repo2.get_meta("field_hlcs_policy") == "v5-preserve-known-rebuild-outbox"
+    rows = repo2._conn.execute(  # noqa: SLF001
+        """
+        SELECT payload_json FROM change_log
+        WHERE device_id=? AND entity='workspace' AND entity_key='W1'
+        """,
+        (identity.device_id,),
+    ).fetchall()
+    assert rows
+    for r in rows:
+        payload = json.loads(r["payload_json"])
+        fh = payload.get("field_hlcs") or {}
+        assert fabricated not in fh.values()
+        assert _UNKNOWN_FIELD_HLC not in fh.values()
+        assert fh.get("team_id") == good
+        assert fh.get("name") == good
+        assert "domain" not in fh  # null on table → not exported as clocked
+    repo2.close()

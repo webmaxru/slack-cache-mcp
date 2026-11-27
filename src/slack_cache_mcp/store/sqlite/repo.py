@@ -88,6 +88,24 @@ def _dump_field_hlcs(field_hlcs: dict[str, str]) -> str:
     return json.dumps(field_hlcs, sort_keys=True, separators=(",", ":"))
 
 
+def _real_field_hlc(clock: str | None) -> str | None:
+    """Return ``clock`` when it is a trustworthy (non-sentinel) field HLC."""
+    if not clock or clock == _UNKNOWN_FIELD_HLC:
+        return None
+    return clock
+
+
+def _prefer_real_hlc(left: str | None, right: str | None) -> str | None:
+    """Pick the dominating real field clock; ``*`` / empty never win."""
+    a = _real_field_hlc(left)
+    b = _real_field_hlc(right)
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if _hlc_dominates(a, b) else b
+
+
 def _merge_sparse_field(
     existing_val: Any,
     existing_field_hlc: str | None,
@@ -397,42 +415,85 @@ class SqliteRepository:
         self._pin_unknown_directory_field_hlcs()
 
     def _pin_unknown_directory_field_hlcs(self) -> None:
-        """Once: pin every non-null directory field to ``*`` (unknown provenance).
+        """Preserve known field clocks; pin only unknown non-null fields to ``*``.
 
-        Clears earlier invented field clocks without touching ``change_log`` markers
-        (remote or local). Real HLCs from subsequent local observations or peers
-        converge by winning over ``*``.
+        Recovery protocol after earlier migrations that invented or wiped clocks:
+        1. Collect the best real field HLC from table state and ``change_log`` payloads.
+        2. Write that map back (missing non-null fields → ``*``).
+        3. Mark ``v5-pending-outbox-purge`` so the next ``backfill_outbox`` drops
+           local directory outbox rows (fabricated facts) and rebuilds them from
+           the repaired table clocks. Peer ``change_log`` markers are kept.
         """
         policy = self.get_meta("field_hlcs_policy")
-        if policy == "v4-star-all-fields":
+        if policy in (
+            "v5-preserve-known-rebuild-outbox",
+            "v5-pending-outbox-purge",
+        ):
             return
-        specs: list[tuple[str, str, tuple[str, ...]]] = [
+        specs: list[tuple[str, str, str, tuple[str, ...]]] = [
             (
                 "workspaces",
+                "workspace",
                 "workspace_key",
                 ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
             ),
             (
                 "channels",
+                "channel",
                 "channel_id",
                 ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
             ),
             (
                 "users",
+                "user",
                 "user_id",
                 ("team_id", "name", "real_name", "display_name", "title", "tz"),
             ),
         ]
-        for table, pk, fields in specs:
+        recovered: dict[tuple[str, str, str], str] = {}
+        for entity in ("workspace", "channel", "user"):
+            for row in self._conn.execute(
+                "SELECT entity_key, payload_json FROM change_log WHERE entity=?",
+                (entity,),
+            ).fetchall():
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                field_hlcs = payload.get("field_hlcs")
+                if not isinstance(field_hlcs, dict):
+                    continue
+                for field, clock in field_hlcs.items():
+                    if not isinstance(field, str) or not isinstance(clock, str):
+                        continue
+                    real = _real_field_hlc(clock)
+                    if real is None:
+                        continue
+                    key = (entity, str(row["entity_key"]), field)
+                    preferred = _prefer_real_hlc(recovered.get(key), real)
+                    if preferred is not None:
+                        recovered[key] = preferred
+
+        for table, entity, pk, fields in specs:
             for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
-                current = {
-                    field: _UNKNOWN_FIELD_HLC for field in fields if row[field] is not None
-                }
+                current = _load_field_hlcs(row["field_hlcs_json"])
+                repaired: dict[str, str] = {}
+                for field in fields:
+                    if row[field] is None:
+                        continue
+                    best = _prefer_real_hlc(
+                        current.get(field),
+                        recovered.get((entity, str(row[pk]), field)),
+                    )
+                    repaired[field] = best if best is not None else _UNKNOWN_FIELD_HLC
                 self._conn.execute(
                     f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
-                    (_dump_field_hlcs(current), row[pk]),
+                    (_dump_field_hlcs(repaired), row[pk]),
                 )
-        self.set_meta("field_hlcs_policy", "v4-star-all-fields", commit=False)
+        # Defer local directory outbox purge until export (needs device_id).
+        self.set_meta("field_hlcs_policy", "v5-pending-outbox-purge", commit=False)
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -690,6 +751,37 @@ class SqliteRepository:
         peer observations. Skips entity keys that already have any outbox row.
         """
         from slack_cache_mcp.domain.models import Channel, User, Workspace
+
+        policy = self.get_meta("field_hlcs_policy")
+        if policy == "v5-pending-outbox-purge":
+            # Drop fabricated local directory facts; peer markers stay for idempotency.
+            self._conn.execute(
+                """
+                DELETE FROM change_log
+                WHERE device_id=? AND entity IN ('workspace', 'channel', 'user')
+                """,
+                (device_id,),
+            )
+            self._conn.execute(
+                """
+                UPDATE sync_cursors SET cursor='0', updated_at=?
+                WHERE direction='push'
+                """,
+                (_utc_now(),),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                VALUES ('folder', 'push', '0', ?)
+                ON CONFLICT(peer, direction) DO UPDATE SET
+                  cursor='0', updated_at=excluded.updated_at
+                """,
+                (_utc_now(),),
+            )
+            self.set_meta(
+                "field_hlcs_policy", "v5-preserve-known-rebuild-outbox", commit=False
+            )
+            self._conn.commit()
 
         self.delete_incomplete_local_message_outbox(device_id)
         counts = {
