@@ -266,13 +266,14 @@ class SearchDocsBuilder:
     def rebuild_dirty_windows(self) -> dict[str, int]:
         """Rebuild dirty channels one-by-one; ack only the generation rebuilt.
 
-        Acquires a write lock before reading messages so a concurrent edit cannot
-        leave a committed window with stale text while the generation mismatch
-        only re-queues the channel.
+        Plans windows from a read snapshot outside the write lock, then publishes
+        under a short transaction after re-validating the dirty generation —
+        avoiding multi-second DB-wide locks that trip the busy timeout.
         """
         pending = self.repo.peek_dirty_window_channels()
         out: dict[str, int] = {}
         for channel_id, generation in pending:
+            plan = self._plan_windows_for_channel(channel_id)
             started = self.repo._begin_immediate()  # noqa: SLF001
             try:
                 cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
@@ -280,15 +281,13 @@ class SearchDocsBuilder:
                     if started:
                         self.repo._conn.commit()  # noqa: SLF001
                     continue
-                n = self._rebuild_windows_for_channel(channel_id)
+                n = self._publish_window_plan(channel_id, plan)
                 cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
                 if cur is None or int(cur) != int(generation):
-                    # Concurrent mark while rebuilding — discard stale windows.
                     if started:
                         self.repo._conn.rollback()  # noqa: SLF001
                     continue
                 self.repo.ack_dirty_window_channel(channel_id, generation)
-                # Always persist rebuild+ack (ack may skip commit when nested).
                 self.repo._conn.commit()  # noqa: SLF001
                 out[channel_id] = n
             except Exception:
@@ -297,6 +296,99 @@ class SearchDocsBuilder:
                         self.repo._conn.rollback()  # noqa: SLF001
                 raise
         return out
+
+    def _plan_windows_for_channel(
+        self, channel_id: str
+    ) -> dict[str, Any]:
+        """Read-only snapshot: workspace, existing window keys, desired buckets."""
+        ch = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT workspace_key FROM messages
+            WHERE channel_id=? AND deleted_state='none' LIMIT 1
+            """,
+            (channel_id,),
+        ).fetchone()
+        existing = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id, start_ts, end_ts, anchor_ts FROM search_docs
+            WHERE channel_id=? AND kind='window'
+            """,
+            (channel_id,),
+        ).fetchall()
+        if not ch:
+            return {
+                "workspace_key": None,
+                "existing": [dict(r) for r in existing],
+                "buckets": [],
+            }
+        msgs = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT ts, ts_num, user_id, search_text, text FROM messages
+            WHERE channel_id=? AND deleted_state='none'
+              AND (thread_ts IS NULL OR thread_ts=ts)
+            ORDER BY ts_num ASC
+            """,
+            (channel_id,),
+        ).fetchall()
+        buckets: list[dict[str, str]] = []
+        bucket: list[Any] = []
+        for m in msgs:
+            if bucket:
+                prev_ts = float(bucket[-1]["ts_num"])
+                gap = float(m["ts_num"]) - prev_ts
+                size = sum(len(x["search_text"] or x["text"] or "") for x in bucket)
+                if gap > WINDOW_GAP_S or size > WINDOW_MAX_CHARS:
+                    buckets.append(self._bucket_payload(bucket))
+                    bucket = []
+            bucket.append(m)
+        if bucket:
+            buckets.append(self._bucket_payload(bucket))
+        return {
+            "workspace_key": ch["workspace_key"],
+            "existing": [dict(r) for r in existing],
+            "buckets": buckets,
+        }
+
+    def _bucket_payload(self, msgs: list[Any]) -> dict[str, str]:
+        text = "\n".join(
+            f"{m['user_id'] or '?'}: {m['search_text'] or m['text']}" for m in msgs
+        )
+        return {
+            "anchor_ts": msgs[0]["ts"],
+            "start_ts": msgs[0]["ts"],
+            "end_ts": msgs[-1]["ts"],
+            "text": text[: WINDOW_MAX_CHARS * 2],
+        }
+
+    def _publish_window_plan(self, channel_id: str, plan: dict[str, Any]) -> int:
+        """Apply a planned window set under the caller's write transaction."""
+        existing = plan["existing"]
+        workspace_key = plan["workspace_key"]
+        if workspace_key is None:
+            self._delete_doc_ids([int(r["doc_id"]) for r in existing])
+            return 0
+        desired_keys: set[tuple[str, str, str]] = set()
+        n = 0
+        for b in plan["buckets"]:
+            key = (b["anchor_ts"], b["start_ts"], b["end_ts"])
+            desired_keys.add(key)
+            self.repo.upsert_search_doc(
+                kind="window",
+                workspace_key=workspace_key,
+                channel_id=channel_id,
+                anchor_ts=b["anchor_ts"],
+                start_ts=b["start_ts"],
+                end_ts=b["end_ts"],
+                text=b["text"],
+            )
+            n += 1
+        stale_ids = [
+            int(r["doc_id"])
+            for r in existing
+            if (r["anchor_ts"], r["start_ts"], r["end_ts"]) not in desired_keys
+        ]
+        self._delete_doc_ids(stale_ids)
+        return n
 
     def _invalidate_and_rebuild_windows_around(
         self, channel_id: str, focus_ts: str

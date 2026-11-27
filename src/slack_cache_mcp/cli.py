@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -265,31 +266,21 @@ def rebuild_cmd(
     result: dict[str, object] = {"ok": True}
     do_all = all_derived or not (fts or embeddings or projection)
     explicit_hashing = os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing"
-    emb = None
-    # Validate embedder before destructive docs/embedding rebuild so a temporary
-    # ONNX load failure cannot wipe the index and then refuse re-embedding.
-    if do_all or embeddings:
-        emb = load_embedder(models_dir=settings.models_dir)
-        prev = repo._conn.execute(  # noqa: SLF001
-            "SELECT value FROM meta WHERE key='embedding_model'"
-        ).fetchone()
-        if (
-            not explicit_hashing
-            and prev
-            and not str(prev["value"]).startswith("hashing")
-            and str(emb.model_id).startswith("hashing")
-        ):
-            result["ok"] = False
-            result["embeddings"] = {
-                "ok": False,
-                "embedded": 0,
-                "error": "refuse_hashing_demotion",
-                "persisted_model": str(prev["value"]),
-                "model_id": emb.model_id,
-            }
-            repo.close()
-            typer.echo(json.dumps(result, indent=2, default=str))
-            raise typer.Exit(code=1)
+    emb = load_embedder(models_dir=settings.models_dir) if (do_all or embeddings) else None
+
+    def _refuse_demotion(persisted: str, model_id: str) -> None:
+        result["ok"] = False
+        result["embeddings"] = {
+            "ok": False,
+            "embedded": 0,
+            "error": "refuse_hashing_demotion",
+            "persisted_model": persisted,
+            "model_id": model_id,
+        }
+        repo.close()
+        typer.echo(json.dumps(result, indent=2, default=str))
+        raise typer.Exit(code=1)
+
     # Projection first so FTS/docs see the repaired current view.
     if do_all or projection:
         rows = repo._conn.execute(  # noqa: SLF001
@@ -300,24 +291,67 @@ def rebuild_cmd(
         result["projection_rebuilt"] = len(rows)
     if do_all or fts:
         result["fts"] = repo.rebuild_fts()
-    if do_all or embeddings or fts:
-        # --fts alone still refreshes search_docs text; embeddings only when asked/all.
+    if do_all or embeddings:
+        assert emb is not None
+        # Serialize demotion check + destructive rebuild + embed so a concurrent
+        # daemon promotion cannot invalidate the model mid-rebuild.
+        started = repo._begin_immediate()  # noqa: SLF001
+        try:
+            prev = repo._conn.execute(  # noqa: SLF001
+                "SELECT value FROM meta WHERE key='embedding_model'"
+            ).fetchone()
+            if (
+                not explicit_hashing
+                and prev
+                and not str(prev["value"]).startswith("hashing")
+                and str(emb.model_id).startswith("hashing")
+            ):
+                if started:
+                    repo._conn.rollback()  # noqa: SLF001
+                _refuse_demotion(str(prev["value"]), emb.model_id)
+            builder = SearchDocsBuilder(repo)
+            dirty_before = repo.peek_dirty_window_channels()
+            counts = builder.rebuild_all()
+            for ch, gen in dirty_before:
+                repo.ack_dirty_window_channel(ch, gen)
+            result["search_docs"] = counts
+            # Re-check model after rebuild (daemon may have written meta).
+            prev2 = repo._conn.execute(  # noqa: SLF001
+                "SELECT value FROM meta WHERE key='embedding_model'"
+            ).fetchone()
+            if (
+                not explicit_hashing
+                and prev2
+                and not str(prev2["value"]).startswith("hashing")
+                and str(emb.model_id).startswith("hashing")
+            ):
+                if started:
+                    repo._conn.rollback()  # noqa: SLF001
+                _refuse_demotion(str(prev2["value"]), emb.model_id)
+            emb_result = embed_pending(
+                repo, emb, allow_hashing_demotion=explicit_hashing
+            )
+            result["embeddings"] = emb_result
+            if isinstance(emb_result, dict) and emb_result.get("ok") is False:
+                result["ok"] = False
+                if started:
+                    repo._conn.rollback()  # noqa: SLF001
+            elif started:
+                repo._conn.commit()  # noqa: SLF001
+        except typer.Exit:
+            raise
+        except Exception:
+            if started:
+                with contextlib.suppress(Exception):
+                    repo._conn.rollback()  # noqa: SLF001
+            raise
+    elif fts:
         builder = SearchDocsBuilder(repo)
-        # Snapshot dirty generations before rebuild; ack only those so marks
-        # committed during/after rebuild_all remain queued.
         dirty_before = repo.peek_dirty_window_channels()
         counts = builder.rebuild_all()
         for ch, gen in dirty_before:
             repo.ack_dirty_window_channel(ch, gen)
         result["search_docs"] = counts
-    if do_all or embeddings:
-        assert emb is not None
-        emb_result = embed_pending(
-            repo, emb, allow_hashing_demotion=explicit_hashing
-        )
-        result["embeddings"] = emb_result
-        if isinstance(emb_result, dict) and emb_result.get("ok") is False:
-            result["ok"] = False
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
     if result.get("ok") is False:
