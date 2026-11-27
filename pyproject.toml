@@ -8,9 +8,13 @@ license = { text = "MIT" }
 authors = [{ name = "Maxim Salnikov" }]
 dependencies = [
     "cryptography>=50.0.2",
+    "fastembed>=0.7.0",
     "keyring>=25.7.0",
     "mcp==2.3.0",
+    "numpy>=2.0",
+    "sqlite-vec>=0.1.6",
     "typer>=0.16.0",
+    "tzdata>=2026.6",
     "ulid-py>=1.1.0",
     "watchdog>=7.1.0",
     "zstandard>=0.25.0",
@@ -100,6 +104,9 @@ module = [
     "ulid.*",
     "mcp",
     "mcp.*",
+    "sqlite_vec",
+    "fastembed",
+    "fastembed.*",
 ]
 ignore_missing_imports = true
 follow_imports = "skip"

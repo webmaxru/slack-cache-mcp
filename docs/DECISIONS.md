@@ -68,3 +68,23 @@ Implemented from the public export directory layout (channels/groups/dms/mpims/u
 
 ### Schema
 `SCHEMA_VERSION=3` adds reactions, files, message_files, saved_items, canvases, canvas_versions, drafts, source_yield (additive migrations).
+
+## 2026-11-25 — M4 intelligent search
+
+### Embedding default
+Production path: fastembed ONNX `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-d) after `slackcache models fetch` (HuggingFace only; no Slack). Runtime sets `HF_HUB_OFFLINE=1`. If model files are missing, fall back to deterministic `HashingEmbedder` (same dim) so hybrid search and tests stay offline.
+
+### Package boundary for fastembed
+`slack_cache_mcp.embeddings` is outside the offline import-linter source set (same idea as `sync/`): it may depend on fastembed/httpx transitively. `search/` and `mcp_server/` only use the `Embedder` protocol + `HashingEmbedder`. CLI/daemon inject the concrete backend.
+
+### sqlite-vec
+Load via `sqlite_vec.load(conn)` when `enable_load_extension` works. `docs_vec` is created at runtime (dimension from the active embedder). Always also write float32 BLOBs to `doc_embeddings` and use numpy cosine KNN when sqlite-vec cannot load (common on macOS Python builds without `enable_load_extension`).
+
+### Eval harness
+CI uses `HashingEmbedder` with planted synonym groups so paraphrase queries prove hybrid ≥ lexical + 10% relative on a synthetic labelled set. Latency bench defaults to a few thousand messages in CI; `slackcache eval --bench --bench-n 200000` is the PLAN laptop check.
+
+### Operators
+`with:`, `during:YYYY-MM`, `has:reaction`, `is:reply`, `is:edited` are implemented. Calendar dates interpret in Europe/Paris (`tzdata` dependency on Windows).
+
+### Schema
+`SCHEMA_VERSION=4` adds `search_docs` (+ runtime `docs_vec`).

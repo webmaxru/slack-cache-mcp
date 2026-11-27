@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -163,18 +165,20 @@ def encryption_spike_cmd() -> None:
 def search_cmd(
     query: str = typer.Argument(..., help="Search query (Slack operators supported)"),
     data_dir: Path | None = typer.Option(None, "--data-dir"),
-    mode: str = typer.Option("lexical", "--mode"),
+    mode: str = typer.Option("hybrid", "--mode"),
     limit: int = typer.Option(10, "--limit", min=1, max=50),
 ) -> None:
     """Search the local archive (same engine as MCP)."""
     _boot()
     from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.embeddings.factory import load_embedder
     from slack_cache_mcp.search.service import SearchService
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db, read_only=True)
-    svc = SearchService(repo)
+    emb = load_embedder(models_dir=settings.models_dir)
+    svc = SearchService(repo, embedder=emb)
     hits = svc.search_messages(query=query, mode=mode, limit=limit)
     typer.echo(json.dumps(hits, indent=2, default=str))
 
@@ -233,10 +237,280 @@ def mcp_cmd(
         typer.echo("Only --transport stdio is supported in stage 1", err=True)
         raise typer.Exit(2)
     from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.embeddings.factory import load_embedder
     from slack_cache_mcp.mcp_server.server import run_stdio
 
     settings = load_settings(data_dir=data_dir)
-    run_stdio(settings)
+    emb = load_embedder(models_dir=settings.models_dir)
+    run_stdio(settings, embedder=emb)
+
+
+@app.command("rebuild")
+def rebuild_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    fts: bool = typer.Option(False, "--fts"),
+    embeddings: bool = typer.Option(False, "--embeddings"),
+    projection: bool = typer.Option(False, "--projection"),
+    all_derived: bool = typer.Option(False, "--all", help="Rebuild docs + embeddings"),
+) -> None:
+    """Rebuild derived search tables (docs / embeddings)."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.embeddings.factory import load_embedder
+    from slack_cache_mcp.search.docs import SearchDocsBuilder
+    from slack_cache_mcp.search.worker import embed_pending
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+    settings = load_settings(data_dir=data_dir)
+    repo = SqliteRepository(settings.archive_db, read_only=False)
+    result: dict[str, object] = {"ok": True}
+    do_all = all_derived or not (fts or embeddings or projection)
+    explicit_hashing = os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing"
+    emb = load_embedder(models_dir=settings.models_dir) if (do_all or embeddings) else None
+    lock_owner = f"cli-rebuild-{os.getpid()}"
+    lock_held = False
+
+    def _refuse_demotion(persisted: str, model_id: str) -> None:
+        result["ok"] = False
+        result["embeddings"] = {
+            "ok": False,
+            "embedded": 0,
+            "error": "refuse_hashing_demotion",
+            "persisted_model": persisted,
+            "model_id": model_id,
+        }
+        if lock_held:
+            with contextlib.suppress(Exception):
+                repo.release_embedding_op_lock(lock_owner)
+        repo.close()
+        typer.echo(json.dumps(result, indent=2, default=str))
+        raise typer.Exit(code=1)
+
+    def _demotion_blocked(persisted: object | None) -> bool:
+        return bool(
+            not explicit_hashing
+            and persisted
+            and not str(persisted).startswith("hashing")
+            and emb is not None
+            and str(emb.model_id).startswith("hashing")
+        )
+
+    try:
+        # Acquire the leased op lock first, then re-check demotion under that
+        # ownership before projection can mutate derived embeddings.
+        if do_all or embeddings:
+            assert emb is not None
+            if not repo.acquire_embedding_op_lock(lock_owner):
+                result["ok"] = False
+                result["embeddings"] = {
+                    "ok": False,
+                    "embedded": 0,
+                    "error": "embedding_op_lock_held",
+                }
+                repo.close()
+                typer.echo(json.dumps(result, indent=2, default=str))
+                raise typer.Exit(code=1)
+            lock_held = True
+            started = repo._begin_immediate()  # noqa: SLF001
+            try:
+                if not repo.embedding_op_lock_owned(lock_owner):
+                    if started:
+                        repo._conn.rollback()  # noqa: SLF001
+                    result["ok"] = False
+                    result["embeddings"] = {
+                        "ok": False,
+                        "embedded": 0,
+                        "error": "embedding_op_lock_lost",
+                    }
+                    with contextlib.suppress(Exception):
+                        repo.release_embedding_op_lock(lock_owner)
+                    lock_held = False
+                    repo.close()
+                    typer.echo(json.dumps(result, indent=2, default=str))
+                    raise typer.Exit(code=1)
+                prev = repo._conn.execute(  # noqa: SLF001
+                    "SELECT value FROM meta WHERE key='embedding_model'"
+                ).fetchone()
+                if _demotion_blocked(prev["value"] if prev else None):
+                    if started:
+                        repo._conn.rollback()  # noqa: SLF001
+                    _refuse_demotion(str(prev["value"]), emb.model_id)
+                if started:
+                    repo._conn.commit()  # noqa: SLF001
+            except typer.Exit:
+                raise
+            except Exception:
+                if started:
+                    with contextlib.suppress(Exception):
+                        repo._conn.rollback()  # noqa: SLF001
+                raise
+
+        def _fence_lock() -> None:
+            nonlocal lock_held
+            if not lock_held:
+                return
+            if not repo.renew_embedding_op_lock(lock_owner):
+                result["ok"] = False
+                result["embeddings"] = {
+                    "ok": False,
+                    "embedded": 0,
+                    "error": "embedding_op_lock_lost",
+                }
+                with contextlib.suppress(Exception):
+                    repo.release_embedding_op_lock(lock_owner)
+                lock_held = False
+                repo.close()
+                typer.echo(json.dumps(result, indent=2, default=str))
+                raise typer.Exit(code=1)
+
+        # Projection only after lock + demotion check succeeded.
+        if do_all or projection:
+            _fence_lock()
+            rows = repo._conn.execute(  # noqa: SLF001
+                "SELECT DISTINCT channel_id, ts FROM message_versions"
+            ).fetchall()
+            for r in rows:
+                repo.reproject_message(r["channel_id"], r["ts"])
+            result["projection_rebuilt"] = len(rows)
+        if do_all or fts:
+            _fence_lock()
+            result["fts"] = repo.rebuild_fts()
+        if do_all or embeddings:
+            assert emb is not None
+            _fence_lock()
+            prev2 = repo._conn.execute(  # noqa: SLF001
+                "SELECT value FROM meta WHERE key='embedding_model'"
+            ).fetchone()
+            if _demotion_blocked(prev2["value"] if prev2 else None):
+                _refuse_demotion(str(prev2["value"]), emb.model_id)
+            builder = SearchDocsBuilder(repo)
+            dirty_before = repo.peek_dirty_window_channels()
+            counts = builder.rebuild_all()
+            for ch, gen in dirty_before:
+                repo.ack_dirty_window_channel(ch, gen)
+            result["search_docs"] = counts
+            _fence_lock()
+            emb_result = embed_pending(
+                repo,
+                emb,
+                allow_hashing_demotion=explicit_hashing,
+                lock_owner=lock_owner,
+            )
+            result["embeddings"] = emb_result
+            if isinstance(emb_result, dict) and emb_result.get("ok") is False:
+                result["ok"] = False
+        elif fts:
+            builder = SearchDocsBuilder(repo)
+            dirty_before = repo.peek_dirty_window_channels()
+            counts = builder.rebuild_all()
+            for ch, gen in dirty_before:
+                repo.ack_dirty_window_channel(ch, gen)
+            result["search_docs"] = counts
+    finally:
+        if lock_held:
+            with contextlib.suppress(Exception):
+                repo.release_embedding_op_lock(lock_owner)
+    repo.close()
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if result.get("ok") is False:
+        raise typer.Exit(code=1)
+
+
+models_app = typer.Typer(help="Local embedding model management", no_args_is_help=True)
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("list")
+def models_list_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """List local model cache status (no network)."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.embeddings.factory import load_embedder
+
+    settings = load_settings(data_dir=data_dir)
+    emb = load_embedder(models_dir=settings.models_dir)
+    typer.echo(
+        json.dumps(
+            {
+                "models_dir": str(settings.models_dir),
+                "active_model_id": emb.model_id,
+                "dim": emb.dim,
+                "models_dir_exists": settings.models_dir.exists(),
+            },
+            indent=2,
+        )
+    )
+
+
+@models_app.command("fetch")
+def models_fetch_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """Download embedding model weights from HuggingFace (NOT Slack).
+
+    Intentionally skips netguard so HF download can proceed once. Runtime
+    search/daemon still install the guard and set HF_HUB_OFFLINE=1.
+    """
+    # Do NOT call _boot()/netguard here — PLAN §10.3 / §13.
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.embeddings.fastembed_backend import fetch_fastembed_model
+
+    settings = load_settings(data_dir=data_dir)
+    try:
+        result = fetch_fastembed_model(models_dir=settings.models_dir)
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2, default=str))
+
+
+@app.command("eval")
+def eval_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    private: bool = typer.Option(False, "--private", help="Load private.jsonl metrics only"),
+    bench: bool = typer.Option(False, "--bench", help="Run latency bench"),
+    bench_n: int = typer.Option(5_000, "--bench-n", help="Synthetic messages for --bench"),
+) -> None:
+    """Run synthetic search eval (or private local metrics). Offline."""
+    _boot()
+    import os
+    from pathlib import Path as P
+
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.search.eval_harness import bench_hybrid_latency, run_eval
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+    settings = load_settings(data_dir=data_dir)
+    if private:
+        from slack_cache_mcp.search.eval_harness import run_private_eval
+
+        path = P(os.environ.get("LOCALAPPDATA", "")) / "slackcache" / "eval" / "private.jsonl"
+        # Metrics only — never print query text or expected refs.
+        result = run_private_eval(
+            settings.archive_db, path, models_dir=settings.models_dir
+        )
+        typer.echo(json.dumps(result, indent=2, default=str))
+        if not result.get("ok"):
+            raise typer.Exit(1)
+        return
+
+    if bench:
+        repo = SqliteRepository(settings.data_dir / "eval-bench.db", read_only=False)
+        result = bench_hybrid_latency(repo, n_messages=bench_n)
+        repo.close()
+        typer.echo(json.dumps(result, indent=2, default=str))
+        if not result.get("ok") or not result.get("pass_p95_under_300ms"):
+            raise typer.Exit(2)
+        return
+
+    repo = SqliteRepository(settings.data_dir / "eval.db", read_only=False)
+    result = run_eval(repo)
+    repo.close()
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("pass_hybrid_ge_lexical_plus_10pct"):
+        raise typer.Exit(2)
 
 
 @task_app.command("install")
@@ -276,8 +550,12 @@ def task_status_cmd() -> None:
 
 
 def main() -> None:
-    # Ensure guard even if Typer callback path changes.
-    netguard.install()
+    # PLAN §10.3 / §13: `models fetch` is the only command allowed network
+    # (HuggingFace, never Slack). Skip netguard for that argv only.
+    argv = [a.lower() for a in sys.argv[1:] if not a.startswith("-")]
+    allow_hf = len(argv) >= 2 and argv[0] == "models" and argv[1] == "fetch"
+    if not allow_hf:
+        netguard.install()
     app()
 
 

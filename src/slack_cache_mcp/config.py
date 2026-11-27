@@ -154,6 +154,10 @@ class Settings:
     def backups_dir(self) -> Path:
         return self.data_dir / "backups"
 
+    @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
 
 def load_settings(
     data_dir: Path | None = None,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import threading
 import time
 from pathlib import Path
@@ -118,6 +120,173 @@ def run_daemon(
                     )
                     purged = vault.purge_expired()
                     log_event(logger, "vault_purge", purged=purged)
+                    # Bounded embedding drain (message docs already upserted on ingest).
+                    repo = None
+                    try:
+                        from slack_cache_mcp.embeddings.factory import load_embedder
+                        from slack_cache_mcp.search.worker import embed_pending
+                        from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+                        # Reload each full pass so a newly fetched FastEmbed
+                        # model replaces hashing — but never demote a working
+                        # non-hashing model to hashing (would clear the index).
+                        # Also check the *persisted* archive model so a daemon
+                        # restart with a temporary ONNX load failure cannot wipe
+                        # the production index.
+                        repo = SqliteRepository(settings.archive_db, read_only=False)
+                        persisted_model = None
+                        with contextlib.suppress(Exception):
+                            prow = repo._conn.execute(  # noqa: SLF001
+                                "SELECT value FROM meta WHERE key='embedding_model'"
+                            ).fetchone()
+                            if prow:
+                                persisted_model = str(prow["value"])
+                        fresh = load_embedder(models_dir=settings.models_dir)
+                        prev = getattr(_run, "_embedder", None)
+                        demote_mem = (
+                            prev is not None
+                            and not str(getattr(prev, "model_id", "")).startswith(
+                                "hashing"
+                            )
+                            and str(fresh.model_id).startswith("hashing")
+                        )
+                        demote_disk = (
+                            persisted_model is not None
+                            and not persisted_model.startswith("hashing")
+                            and str(fresh.model_id).startswith("hashing")
+                        )
+                        if demote_mem:
+                            _run._embedder = prev  # type: ignore[attr-defined]
+                        elif demote_disk:
+                            # Skip embedding this pass; keep trying next cycle.
+                            _run._embedder = None  # type: ignore[attr-defined]
+                            log_event(
+                                logger,
+                                "embed_skip_hashing_demotion",
+                                persisted_model=persisted_model,
+                            )
+                        else:
+                            _run._embedder = fresh  # type: ignore[attr-defined]
+                        # Acquire the same leased op lock as CLI rebuild so a
+                        # daemon already mid-cycle cannot embed/promote under us.
+                        lock_owner = f"daemon-{os.getpid()}"
+                        if not repo.acquire_embedding_op_lock(
+                            lock_owner, lease_s=900.0
+                        ):
+                            log_event(logger, "embed_skip_op_lock")
+                        else:
+                            try:
+                                # Drain deferred channel window rebuilds.
+                                try:
+                                    from slack_cache_mcp.search.docs import (
+                                        SearchDocsBuilder,
+                                    )
+
+                                    rebuilt = (
+                                        SearchDocsBuilder(repo).rebuild_dirty_windows()
+                                    )
+                                    if rebuilt:
+                                        log_event(
+                                            logger,
+                                            "window_docs_rebuild",
+                                            channels=len(rebuilt),
+                                            windows=sum(rebuilt.values()),
+                                        )
+                                except Exception as win_exc:
+                                    log_event(
+                                        logger,
+                                        "window_docs_rebuild_error",
+                                        error=type(win_exc).__name__,
+                                    )
+                                    with contextlib.suppress(Exception):
+                                        repo._conn.rollback()  # noqa: SLF001
+                                # One-time backfill: upgraded archives may have empty
+                                # search_docs while messages already exist.
+                                try:
+                                    n_docs = int(
+                                        repo._conn.execute(  # noqa: SLF001
+                                            "SELECT COUNT(*) AS c FROM search_docs"
+                                        ).fetchone()["c"]
+                                    )
+                                    n_msgs = int(
+                                        repo._conn.execute(  # noqa: SLF001
+                                            "SELECT COUNT(*) AS c FROM messages"
+                                        ).fetchone()["c"]
+                                    )
+                                    flag = repo._conn.execute(  # noqa: SLF001
+                                        "SELECT value FROM meta WHERE key='search_docs_backfill'"
+                                    ).fetchone()
+                                    if n_msgs > 0 and (n_docs == 0 or not flag):
+                                        from slack_cache_mcp.search.docs import (
+                                            SearchDocsBuilder,
+                                        )
+
+                                        counts = SearchDocsBuilder(repo).rebuild_all()
+                                        repo._conn.execute(  # noqa: SLF001
+                                            """
+                                            INSERT INTO meta(key, value) VALUES ('search_docs_backfill', '1')
+                                            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                                            """
+                                        )
+                                        repo._conn.commit()  # noqa: SLF001
+                                        log_event(
+                                            logger,
+                                            "search_docs_backfill",
+                                            **{k: int(v) for k, v in counts.items()},
+                                        )
+                                except Exception as bf_exc:
+                                    log_event(
+                                        logger,
+                                        "search_docs_backfill_error",
+                                        error=type(bf_exc).__name__,
+                                    )
+                                    with contextlib.suppress(Exception):
+                                        repo._conn.rollback()  # noqa: SLF001
+                                active = getattr(_run, "_embedder", None)
+                                if active is None:
+                                    emb_result = {
+                                        "ok": False,
+                                        "embedded": 0,
+                                        "error": "embedder_unavailable",
+                                    }
+                                else:
+                                    if not repo.renew_embedding_op_lock(
+                                        lock_owner, lease_s=900.0
+                                    ):
+                                        emb_result = {
+                                            "ok": False,
+                                            "embedded": 0,
+                                            "error": "embedding_op_lock_lost",
+                                        }
+                                    else:
+                                        emb_result = embed_pending(
+                                            repo,
+                                            active,
+                                            limit=2_048,
+                                            lock_owner=lock_owner,
+                                        )
+                                log_event(
+                                    logger,
+                                    "embed_batch",
+                                    embedded=emb_result.get("embedded"),
+                                    model=emb_result.get("model_id"),
+                                    ok=emb_result.get("ok"),
+                                )
+                            finally:
+                                # Clear any aborted txn so lease release can commit.
+                                with contextlib.suppress(Exception):
+                                    repo._conn.rollback()  # noqa: SLF001
+                                with contextlib.suppress(Exception):
+                                    repo.release_embedding_op_lock(lock_owner)
+                    except Exception as emb_exc:
+                        log_event(
+                            logger,
+                            "embed_batch_error",
+                            error=type(emb_exc).__name__,
+                        )
+                    finally:
+                        if repo is not None:
+                            repo.close()
                 log_event(
                     logger,
                     "cycle_ok",

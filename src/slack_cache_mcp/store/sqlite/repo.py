@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
+import os
 import re
 import sqlite3
+import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from slack_cache_mcp.domain.models import (
     CanvasDoc,
@@ -27,7 +32,7 @@ from slack_cache_mcp.ingest.projection import (
     max_merge_thread_meta,
 )
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 _XOX_RE = re.compile(rb"xox[a-z]-", re.I)
@@ -86,17 +91,53 @@ def _filter_clause(filters: dict[str, Any], *, alias: str = "m") -> tuple[str, l
             f" AND ({alias}.thread_ts IS NOT NULL OR "
             f"COALESCE({alias}.reply_count, 0) > 0)"
         )
+    if filters.get("is_reply"):
+        sql += f" AND {alias}.is_reply=1"
+    if filters.get("is_edited"):
+        sql += f" AND {alias}.edited_ts IS NOT NULL"
+    if filters.get("has_reaction"):
+        sql += (
+            f" AND EXISTS (SELECT 1 FROM reactions rx "
+            f"WHERE rx.channel_id={alias}.channel_id AND rx.ts={alias}.ts)"
+        )
+    with_ids = filters.get("with_user_ids") or []
+    if with_ids:
+        # Participant: author OR another message in the same thread by that user.
+        placeholders = ",".join("?" for _ in with_ids)
+        sql += (
+            f" AND ("
+            f" {alias}.user_id IN ({placeholders})"
+            f" OR EXISTS ("
+            f"   SELECT 1 FROM messages w"
+            f"   WHERE w.channel_id={alias}.channel_id"
+            f"     AND w.user_id IN ({placeholders})"
+            f"     AND ("
+            f"       COALESCE({alias}.thread_ts, {alias}.ts) = COALESCE(w.thread_ts, w.ts)"
+            f"     )"
+            f" )"
+            f")"
+        )
+        params.extend(with_ids)
+        params.extend(with_ids)
     return sql, params
 
 
 class SqliteRepository:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        # Canonicalize so symlink aliases share lock identity within this build.
+        with contextlib.suppress(OSError):
+            if self.path.exists():
+                self.path = self.path.resolve()
         self.read_only = read_only
         if read_only:
             if not self.path.exists():
                 raise FileNotFoundError(self.path)
-            uri = f"file:{self.path.as_posix()}?mode=ro"
+            from urllib.parse import quote
+
+            # Quote so resolved targets containing `?`/`#` stay in the path.
+            encoded = quote(self.path.as_posix(), safe="/:")
+            uri = f"file:{encoded}?mode=ro"
             self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,10 +145,21 @@ class SqliteRepository:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # Best-effort sqlite-vec; lexical search still works if unavailable.
+        from slack_cache_mcp.store.sqlite.vec import try_load_sqlite_vec
+
+        self._vec_ready = try_load_sqlite_vec(self._conn)
         if not read_only:
             self.ensure_schema()
+        # Defer docs_vec creation until embedder dimension is known (worker).
+        # Crash-released OS file locks for embedding rebuilds (see acquire_*).
+        self._embed_lock_fhs: list[TextIO] = []
+        self._embed_lock_owner: str | None = None
 
     def close(self) -> None:
+        if self._embed_lock_fhs:
+            with contextlib.suppress(Exception):
+                self._release_embed_file_lock()
         self._conn.close()
 
     def ensure_schema(self) -> None:
@@ -209,8 +261,45 @@ class SqliteRepository:
               PRIMARY KEY (snapshot_id, source_name)
             ) STRICT
             """,
+            """
+            CREATE TABLE IF NOT EXISTS search_docs (
+              doc_id INTEGER PRIMARY KEY,
+              kind TEXT NOT NULL,
+              workspace_key TEXT NOT NULL,
+              channel_id TEXT,
+              anchor_ts TEXT,
+              start_ts TEXT,
+              end_ts TEXT,
+              text TEXT NOT NULL,
+              text_sha256 TEXT NOT NULL,
+              embedded_model TEXT,
+              embedded_at TEXT,
+              message_rowid INTEGER,
+              UNIQUE (kind, workspace_key, channel_id, anchor_ts, start_ts, end_ts)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS doc_embeddings (
+              doc_id INTEGER PRIMARY KEY,
+              dim INTEGER NOT NULL,
+              embedding BLOB NOT NULL,
+              model_id TEXT NOT NULL
+            ) STRICT
+            """,
         ):
             self._conn.execute(ddl)
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS search_docs_pending
+              ON search_docs(embedded_model) WHERE embedded_model IS NULL
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS search_docs_channel
+              ON search_docs(channel_id, anchor_ts)
+            """
+        )
 
     def upsert_device(self, device_id: str, label: str) -> None:
         now = _utc_now()
@@ -485,7 +574,7 @@ class SqliteRepository:
             )
             if streak >= threshold:
                 row = self._conn.execute(
-                    "SELECT deleted_state FROM messages WHERE channel_id=? AND ts=?",
+                    "SELECT deleted_state, thread_ts FROM messages WHERE channel_id=? AND ts=?",
                     (channel_id, ts),
                 ).fetchone()
                 if row and row["deleted_state"] == "none":
@@ -494,6 +583,27 @@ class SqliteRepository:
                         (channel_id, ts),
                     )
                     marked.append(ts)
+                    # Drop message docs / refresh aggregates so deleted text
+                    # cannot linger in thread/window ``doc_text``.
+                    try:
+                        from slack_cache_mcp.search.docs import SearchDocsBuilder
+
+                        builder = SearchDocsBuilder(self)
+                        builder.drop_message_doc(channel_id, ts)
+                        thread_root = row["thread_ts"] or ts
+                        builder.refresh_aggregates(
+                            channel_id,
+                            thread_root,
+                            message_ts=ts,
+                            previous_thread_ts=row["thread_ts"],
+                        )
+                        # Root deletion must clear parent previews on reply docs.
+                        if thread_root == ts:
+                            builder.refresh_reply_docs_after_parent_change(
+                                channel_id, ts
+                            )
+                    except Exception:
+                        pass
         self._conn.commit()
         return marked
 
@@ -741,20 +851,28 @@ class SqliteRepository:
                 """
                 INSERT INTO threads(
                   channel_id, thread_ts, reply_count_reported, replies_captured,
-                  last_reply_ts, updated_hlc
-                ) VALUES (?, ?, ?, 0, ?, ?)
+                  subscribed, last_reply_ts, updated_hlc
+                ) VALUES (?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(channel_id, thread_ts) DO UPDATE SET
                   reply_count_reported=MAX(
                     COALESCE(threads.reply_count_reported, 0),
                     COALESCE(excluded.reply_count_reported, 0)
                   ),
+                  subscribed=COALESCE(excluded.subscribed, threads.subscribed),
                   last_reply_ts=MAX(
                     COALESCE(threads.last_reply_ts, ''),
                     COALESCE(excluded.last_reply_ts, '')
                   ),
                   updated_hlc=excluded.updated_hlc
                 """,
-                (obs.channel_id, root, obs.reply_count, obs.latest_reply or obs.ts, hlc),
+                (
+                    obs.channel_id,
+                    root,
+                    obs.reply_count,
+                    1 if bool(obs.raw.get("_subscribed") or obs.raw.get("subscribed")) else None,
+                    obs.latest_reply or obs.ts,
+                    hlc,
+                ),
             )
         self._conn.commit()
         self.reproject_message(obs.channel_id, obs.ts)
@@ -816,11 +934,13 @@ class SqliteRepository:
         except (TypeError, KeyError, json.JSONDecodeError):
             has_files = 0
         # Upsert messages
+        previous_thread_ts: str | None = None
         existing = self._conn.execute(
-            "SELECT rowid FROM messages WHERE channel_id=? AND ts=?",
+            "SELECT rowid, thread_ts FROM messages WHERE channel_id=? AND ts=?",
             (channel_id, ts),
         ).fetchone()
         if existing:
+            previous_thread_ts = existing["thread_ts"]
             rowid = existing["rowid"]
             self._conn.execute("DELETE FROM messages_fts WHERE rowid=?", (rowid,))
             self._conn.execute("DELETE FROM messages_trigram WHERE rowid=?", (rowid,))
@@ -907,6 +1027,34 @@ class SqliteRepository:
             (rowid, chosen.search_text),
         )
         self._conn.commit()
+        # Keep message + aggregate search_docs in sync during normal ingest.
+        try:
+            from slack_cache_mcp.search.docs import SearchDocsBuilder
+
+            builder = SearchDocsBuilder(self)
+            thread_root = chosen.thread_ts or ts
+            is_root = thread_root == ts
+            is_new_msg = existing is None
+            text_changed = True
+            if deleted != "none":
+                builder.drop_message_doc(channel_id, ts)
+            else:
+                _doc_id, text_changed = builder.upsert_message_doc(channel_id, ts)
+            builder.refresh_aggregates(
+                channel_id,
+                thread_root,
+                message_ts=ts,
+                text_changed=text_changed or deleted != "none",
+                previous_thread_ts=previous_thread_ts,
+                is_new=is_new_msg,
+            )
+            # Always refresh reply previews on root reprojection: raw parent text
+            # can change even when normalized search-doc text does not.
+            if is_root:
+                builder.refresh_reply_docs_after_parent_change(channel_id, ts)
+            self._conn.commit()
+        except Exception:
+            pass
 
     def list_workspaces(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM workspaces ORDER BY name").fetchall()
@@ -1338,22 +1486,82 @@ class SqliteRepository:
         *,
         limit: int,
         filters: dict[str, Any] | None = None,
+        order: str = "DESC",
     ) -> list[dict[str, Any]]:
         """Filter-only search when the query has operators but no free text."""
         filt = dict(filters or {})
         if "deleted_mode" not in filt:
             filt["deleted_mode"] = "include" if filt.get("include_deleted") else "exclude"
         clause, fparams = _filter_clause(filt)
+        direction = "ASC" if str(order).upper() == "ASC" else "DESC"
         sql = f"""
         SELECT m.*
         FROM messages m
         WHERE 1=1
         {clause}
-        ORDER BY m.ts_num DESC
+        ORDER BY m.ts_num {direction}
         LIMIT ?
         """
         rows = self._conn.execute(sql, [*fparams, limit]).fetchall()
         return [self._msg_dict(r) for r in rows]
+
+    def rebuild_fts(self) -> dict[str, int]:
+        """Rebuild messages_fts and messages_trigram from the current messages view."""
+        self._conn.execute("DELETE FROM messages_fts")
+        self._conn.execute("DELETE FROM messages_trigram")
+        rows = self._conn.execute(
+            "SELECT rowid, search_text, user_id, channel_id FROM messages"
+        ).fetchall()
+        n = 0
+        for r in rows:
+            chan = r["channel_id"]
+            crow = self._conn.execute(
+                "SELECT name FROM channels WHERE channel_id=?", (chan,)
+            ).fetchone()
+            chan_name = crow["name"] if crow and crow["name"] else chan
+            self._conn.execute(
+                "INSERT INTO messages_fts(rowid, search_text, author, channel) VALUES (?, ?, ?, ?)",
+                (r["rowid"], r["search_text"], r["user_id"] or "", chan_name),
+            )
+            self._conn.execute(
+                "INSERT INTO messages_trigram(rowid, search_text) VALUES (?, ?)",
+                (r["rowid"], r["search_text"]),
+            )
+            n += 1
+        self._conn.commit()
+        return {"rows": n}
+
+    def embedding_coverage(self) -> dict[str, Any]:
+        from slack_cache_mcp.store.sqlite.vec import try_load_sqlite_vec
+
+        vec_ok = try_load_sqlite_vec(self._conn)
+        has_docs = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_docs'"
+        ).fetchone()
+        has_vec = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
+        ).fetchone()
+        has_blob = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_embeddings'"
+        ).fetchone()
+        pending = embedded = 0
+        if has_docs:
+            pending = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM search_docs WHERE embedded_model IS NULL"
+                ).fetchone()["c"]
+            )
+            embedded = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM search_docs WHERE embedded_model IS NOT NULL"
+                ).fetchone()["c"]
+            )
+        return {
+            "vec_available": bool(has_docs and (has_blob or (vec_ok and has_vec))),
+            "sqlite_vec": bool(vec_ok and has_vec),
+            "pending": pending,
+            "embedded": embedded,
+        }
 
     def upsert_file(self, f: FileMeta, hlc: str, seen_at: str) -> None:
         raw = json.dumps(f.raw, ensure_ascii=False)
@@ -1652,6 +1860,1087 @@ class SqliteRepository:
         sql += " ORDER BY channel_id, ts_num"
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
+    def upsert_search_doc(
+        self,
+        *,
+        kind: str,
+        workspace_key: str,
+        channel_id: str | None,
+        anchor_ts: str | None,
+        start_ts: str | None,
+        end_ts: str | None,
+        text: str,
+        message_rowid: int | None = None,
+    ) -> int:
+        text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        existing = self._conn.execute(
+            """
+            SELECT doc_id, text_sha256 FROM search_docs
+            WHERE kind=? AND workspace_key=?
+              AND channel_id IS ?
+              AND anchor_ts IS ?
+              AND start_ts IS ?
+              AND end_ts IS ?
+            """,
+            (kind, workspace_key, channel_id, anchor_ts, start_ts, end_ts),
+        ).fetchone()
+        if existing:
+            if existing["text_sha256"] == text_sha:
+                return int(existing["doc_id"])
+            self._conn.execute(
+                """
+                UPDATE search_docs SET
+                  text=?, text_sha256=?, embedded_model=NULL, embedded_at=NULL,
+                  message_rowid=COALESCE(?, message_rowid)
+                WHERE doc_id=?
+                """,
+                (text, text_sha, message_rowid, int(existing["doc_id"])),
+            )
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute(
+                    "DELETE FROM docs_vec WHERE doc_id=?", (int(existing["doc_id"]),)
+                )
+            return int(existing["doc_id"])
+        cur = self._conn.execute(
+            """
+            INSERT INTO search_docs(
+              kind, workspace_key, channel_id, anchor_ts, start_ts, end_ts,
+              text, text_sha256, message_rowid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                kind,
+                workspace_key,
+                channel_id,
+                anchor_ts,
+                start_ts,
+                end_ts,
+                text,
+                text_sha,
+                message_rowid,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+    def _hit_passes_filters(
+        self,
+        hit: dict[str, Any],
+        filt: dict[str, Any],
+        *,
+        kinds: list[str] | None,
+        doc_kind: str | None,
+    ) -> bool:
+        if kinds and doc_kind and doc_kind not in kinds:
+            return False
+        if filt.get("channel_ids") and hit.get("channel_id") not in filt["channel_ids"]:
+            return False
+        if filt.get("workspace_key") and hit.get("workspace_key") != filt["workspace_key"]:
+            return False
+        deleted_mode = filt.get("deleted_mode", "exclude")
+        ds = hit.get("deleted_state") or "none"
+        if deleted_mode == "exclude" and ds != "none":
+            return False
+        if deleted_mode == "only" and ds == "none":
+            return False
+        if filt.get("user_ids") and hit.get("user_id") not in filt["user_ids"]:
+            return False
+        if filt.get("after") is not None:
+            try:
+                if float(hit.get("ts") or 0) < float(filt["after"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if filt.get("before") is not None:
+            try:
+                if float(hit.get("ts") or 0) >= float(filt["before"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        # Re-check message-level predicates via a lightweight SQL probe when possible.
+        if hit.get("channel_id") and hit.get("ts"):
+            clause, params = _filter_clause(filt)
+            row = self._conn.execute(
+                f"SELECT 1 FROM messages m WHERE m.channel_id=? AND m.ts=? {clause}",
+                [hit["channel_id"], hit["ts"], *params],
+            ).fetchone()
+            if not row:
+                return False
+        return True
+
+    def search_vector(
+        self,
+        query_vec: Any,
+        *,
+        limit: int,
+        filters: dict[str, Any] | None = None,
+        kinds: list[str] | None = None,
+        model_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """KNN over docs_vec or numpy ``doc_embeddings`` fallback."""
+        from slack_cache_mcp.store.sqlite.vec import knn_docs, knn_docs_numpy, try_load_sqlite_vec
+
+        has_docs = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_docs'"
+        ).fetchone()
+        if not has_docs:
+            return []
+
+        filt = dict(filters or {})
+        if kinds and len(kinds) == 1:
+            filt["kind"] = kinds[0]
+        if model_id:
+            filt["model_id"] = model_id
+
+        has_vec = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='docs_vec'"
+        ).fetchone()
+        use_vec = bool(has_vec and try_load_sqlite_vec(self._conn))
+        blob_n = 0
+        with contextlib.suppress(sqlite3.OperationalError):
+            blob_n = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM doc_embeddings"
+                ).fetchone()["c"]
+            )
+
+        def _consume(
+            pairs: list[tuple[int, float]], *, out: list[dict[str, Any]], seen: set[int]
+        ) -> None:
+            for doc_id, distance in pairs:
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                # Prefer authoritative blob distance when present.
+                if blob_n > 0:
+                    brow = self._conn.execute(
+                        "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()
+                    if brow is not None:
+                        import numpy as np
+
+                        from slack_cache_mcp.search.embedder import cosine_similarity
+
+                        emb = np.frombuffer(brow["embedding"], dtype=np.float32)
+                        distance = 1.0 - float(
+                            cosine_similarity(
+                                np.asarray(query_vec, dtype=np.float32), emb
+                            )
+                        )
+                doc = self._conn.execute(
+                    "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+                ).fetchone()
+                if not doc:
+                    continue
+                if model_id and doc["embedded_model"] != model_id:
+                    continue
+                hit = self._doc_to_search_hit(dict(doc), distance=distance)
+                if hit is None:
+                    continue
+                if not self._hit_passes_filters(
+                    hit, filt, kinds=kinds, doc_kind=doc["kind"]
+                ):
+                    continue
+                out.append(hit)
+                if len(out) >= limit:
+                    return
+
+        def _eligible_count(candidates: dict[int, float], *, need: int) -> int:
+            n = 0
+            for doc_id, distance in sorted(candidates.items(), key=lambda x: x[1]):
+                doc = self._conn.execute(
+                    "SELECT * FROM search_docs WHERE doc_id=?", (doc_id,)
+                ).fetchone()
+                if not doc:
+                    continue
+                if model_id and doc["embedded_model"] != model_id:
+                    continue
+                hit = self._doc_to_search_hit(dict(doc), distance=distance)
+                if hit is None:
+                    continue
+                if not self._hit_passes_filters(
+                    hit, filt, kinds=kinds, doc_kind=doc["kind"]
+                ):
+                    continue
+                n += 1
+                if n >= need:
+                    return n
+            return n
+
+        best: dict[int, float] = {}
+        vec_k_max = 4096
+        if use_vec:
+            k_pool = min(max(limit * 20, 200), vec_k_max)
+            while True:
+                pairs = knn_docs(self._conn, query_vec, k=k_pool, filters=filt)
+                for doc_id, distance in pairs:
+                    prev = best.get(doc_id)
+                    if prev is None or distance < prev:
+                        best[doc_id] = distance
+                # Expand until enough *eligible* hits (post author/date filters).
+                if (
+                    _eligible_count(best, need=limit) >= limit
+                    or k_pool >= vec_k_max
+                    or len(pairs) < k_pool
+                ):
+                    break
+                k_pool = min(k_pool * 2, vec_k_max)
+            # Rescore vec candidates with authoritative blob distance (O(k)).
+            if blob_n > 0 and best:
+                import numpy as np
+
+                from slack_cache_mcp.search.embedder import cosine_similarity
+
+                q = np.asarray(query_vec, dtype=np.float32)
+                for doc_id in list(best):
+                    brow = self._conn.execute(
+                        "SELECT embedding FROM doc_embeddings WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()
+                    if brow is not None:
+                        emb = np.frombuffer(brow["embedding"], dtype=np.float32)
+                        best[doc_id] = 1.0 - float(cosine_similarity(q, emb))
+
+        # Blob scan when vec is unavailable, blob-only/divergent docs exist, or
+        # vec+filters still cannot fill the limit. Expand until eligible hits
+        # satisfy ``limit`` (author/date/has:* filters apply after distance rank).
+        from slack_cache_mcp.store.sqlite.vec import docs_vec_needs_reconcile
+
+        need_blob_scan = False
+        divergent = False
+        if blob_n > 0:
+            if not use_vec:
+                need_blob_scan = True
+            else:
+                blob_only = 0
+                with contextlib.suppress(sqlite3.OperationalError):
+                    blob_only = int(
+                        self._conn.execute(
+                            """
+                            SELECT COUNT(*) AS c FROM doc_embeddings e
+                            WHERE NOT EXISTS (
+                              SELECT 1 FROM docs_vec v WHERE v.doc_id = e.doc_id
+                            )
+                            """
+                        ).fetchone()["c"]
+                    )
+                divergent = docs_vec_needs_reconcile(self._conn)
+                if (
+                    blob_only > 0
+                    or divergent
+                    or _eligible_count(best, need=limit) < limit
+                ):
+                    need_blob_scan = True
+        if need_blob_scan:
+            # Any predicate not pushed into knn SQL can hide nearer blobs.
+            sql_keys = {
+                "workspace_key",
+                "channel_ids",
+                "kind",
+                "model_id",
+                "deleted_mode",
+                "include_deleted",
+            }
+            post_filter = any(
+                k not in sql_keys and v not in (None, False, [], "")
+                for k, v in filt.items()
+            )
+            # Unrestricted when no vec, post-filters, or known divergence;
+            # otherwise expand a bounded pool until eligible hits fill.
+            if not use_vec or post_filter or divergent:
+                pairs = knn_docs_numpy(
+                    self._conn,
+                    query_vec,
+                    k=None,
+                    filters=filt,
+                    kinds=kinds,
+                    model_id=model_id,
+                )
+                for doc_id, distance in pairs:
+                    prev = best.get(doc_id)
+                    if prev is None or distance < prev:
+                        best[doc_id] = distance
+            else:
+                blob_k = max(limit * 20, 200)
+                while True:
+                    pairs = knn_docs_numpy(
+                        self._conn,
+                        query_vec,
+                        k=blob_k,
+                        filters=filt,
+                        kinds=kinds,
+                        model_id=model_id,
+                    )
+                    for doc_id, distance in pairs:
+                        prev = best.get(doc_id)
+                        if prev is None or distance < prev:
+                            best[doc_id] = distance
+                    if (
+                        _eligible_count(best, need=limit) >= limit
+                        or blob_k >= blob_n
+                        or len(pairs) < blob_k
+                    ):
+                        break
+                    blob_k = min(blob_k * 2, blob_n)
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        ranked = sorted(best.items(), key=lambda x: x[1])
+        _consume(ranked, out=out, seen=seen)
+        return out
+
+    def _doc_to_search_hit(
+        self, doc: dict[str, Any], *, distance: float
+    ) -> dict[str, Any] | None:
+        score = 1.0 / (1.0 + max(0.0, float(distance)))
+        if doc["kind"] == "message" and doc.get("channel_id") and doc.get("anchor_ts"):
+            msg = self.get_message(channel=doc["channel_id"], ts=doc["anchor_ts"])
+            if not msg:
+                return None
+            return {**msg, "score": score, "doc_kind": "message", "doc_id": doc["doc_id"]}
+        # Non-message docs: surface as synthetic hits anchored when possible.
+        if doc.get("channel_id") and doc.get("anchor_ts") and doc["kind"] in {
+            "thread",
+            "window",
+        }:
+            msg = self.get_message(channel=doc["channel_id"], ts=doc["anchor_ts"])
+            if msg:
+                return {
+                    **msg,
+                    "score": score,
+                    "doc_kind": doc["kind"],
+                    "doc_id": doc["doc_id"],
+                    "doc_text": doc["text"][:500],
+                }
+        return {
+            "channel_id": doc.get("channel_id") or "",
+            "ts": doc.get("anchor_ts") or "",
+            "workspace_key": doc["workspace_key"],
+            "user_id": None,
+            "thread_ts": None,
+            "text": doc["text"][:500],
+            "subtype": None,
+            "edited_ts": None,
+            "deleted_state": "none",
+            "version_count": 1,
+            "ref": f"slk://{doc['workspace_key']}/{doc.get('channel_id') or '-'}/{doc.get('anchor_ts') or '-'}",
+            "score": score,
+            "doc_kind": doc["kind"],
+            "doc_id": doc["doc_id"],
+        }
+
+    def list_threads(
+        self,
+        *,
+        workspace: str | None = None,
+        channel: str | None = None,
+        subscribed_only: bool = False,
+        active_after: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        from slack_cache_mcp.search.query import parse_time_bound
+
+        sql = """
+            SELECT t.*,
+                   COALESCE(m.workspace_key, c.workspace_key) AS workspace_key,
+                   m.text AS root_text,
+                   m.user_id,
+                   (
+                     SELECT COUNT(*) FROM messages r
+                     WHERE r.channel_id=t.channel_id
+                       AND r.thread_ts=t.thread_ts
+                       AND r.ts!=t.thread_ts
+                   ) AS replies_captured_live
+            FROM threads t
+            LEFT JOIN messages m ON m.channel_id=t.channel_id AND m.ts=t.thread_ts
+            LEFT JOIN channels c ON c.channel_id=t.channel_id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+        if workspace:
+            sql += " AND COALESCE(m.workspace_key, c.workspace_key)=?"
+            params.append(workspace)
+        if channel:
+            sql += " AND t.channel_id=?"
+            params.append(channel)
+        if subscribed_only:
+            sql += " AND t.subscribed=1"
+        if active_after:
+            sql += " AND CAST(COALESCE(t.last_reply_ts, t.thread_ts) AS REAL) >= ?"
+            try:
+                params.append(float(active_after))
+            except ValueError:
+                params.append(parse_time_bound(active_after, end=False))
+        sql += " ORDER BY CAST(COALESCE(t.last_reply_ts, t.thread_ts) AS REAL) DESC LIMIT ?"
+        params.append(limit)
+        out: list[dict[str, Any]] = []
+        for r in self._conn.execute(sql, params).fetchall():
+            d = dict(r)
+            d["replies_captured"] = int(d.pop("replies_captured_live") or 0)
+            out.append(d)
+        return out
+
+    def whats_new(
+        self,
+        *,
+        since: str | None = None,
+        workspace: str | None = None,
+        limit: int = 50,
+        watermark_store: Path | None = None,
+    ) -> dict[str, Any]:
+        """Messages since watermark; advances a scoped, insertion-ordered cursor."""
+        meta_key = "whats_new_watermark" + (f":{workspace}" if workspace else "")
+        if not since:
+            since = self._read_whats_new_cursor(meta_key, watermark_store)
+        lim = min(limit, 200)
+        use_rowid = since.startswith("rowid:") or since.isdigit()
+        insert_bound: int | None = None
+        if use_rowid:
+            after_rowid = 0
+            if since.startswith("rowid:"):
+                with contextlib.suppress(ValueError):
+                    after_rowid = int(since.split(":", 1)[1])
+            else:
+                after_rowid = int(since)
+            sql = """
+                SELECT * FROM messages
+                WHERE deleted_state='none' AND rowid > ?
+            """
+            params: list[Any] = [after_rowid]
+            order = " ORDER BY rowid ASC LIMIT ?"
+        else:
+            # Finish legacy first_seen order (with ch/ts tie-break) before rowid.
+            # Carry an insertion boundary so concurrent inserts behind the cursor
+            # are drained via rowid after legacy completes (not skipped).
+            body = since[7:] if since.startswith("legacy:") else since
+            bound_parts = body.split("#rowbound:")
+            body_main = bound_parts[0]
+            if len(bound_parts) == 2:
+                with contextlib.suppress(ValueError):
+                    insert_bound = int(bound_parts[1])
+            if insert_bound is None:
+                insert_bound = self._max_message_rowid()
+            chunks = body_main.split("|")
+            cur_fs = chunks[0]
+            # Restrict legacy pages to the insertion boundary so concurrent
+            # inserts (rowid > bound) are not returned twice after the switch.
+            if len(chunks) >= 3:
+                sql = """
+                    SELECT * FROM messages
+                    WHERE deleted_state='none'
+                      AND rowid <= ?
+                      AND (
+                        first_seen > ?
+                        OR (first_seen = ? AND channel_id > ?)
+                        OR (first_seen = ? AND channel_id = ? AND ts > ?)
+                      )
+                """
+                params = [
+                    insert_bound,
+                    cur_fs,
+                    cur_fs,
+                    chunks[1],
+                    cur_fs,
+                    chunks[1],
+                    chunks[2],
+                ]
+            else:
+                sql = """
+                    SELECT * FROM messages
+                    WHERE first_seen >= ? AND deleted_state='none' AND rowid <= ?
+                """
+                params = [cur_fs, insert_bound]
+            order = " ORDER BY first_seen ASC, channel_id ASC, ts ASC LIMIT ?"
+        if workspace:
+            sql += " AND workspace_key=?"
+            params.append(workspace)
+        sql += order
+        params.append(lim + 1)
+        raw = list(self._conn.execute(sql, params).fetchall())
+        has_more = len(raw) > lim
+        page = raw[:lim]
+        rows = [self._msg_dict(r) | {"first_seen": r["first_seen"]} for r in page]
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            grouped.setdefault(r["channel_id"], []).append(r)
+        if page:
+            last = page[-1]
+            if use_rowid:
+                new_mark = f"rowid:{int(last['rowid'])}"
+            elif has_more:
+                new_mark = (
+                    f"legacy:{last['first_seen']}|{last['channel_id']}|{last['ts']}"
+                    f"#rowbound:{insert_bound}"
+                )
+            else:
+                # Legacy drained: resume from the insertion boundary captured when
+                # legacy pagination began so later inserts are not skipped.
+                new_mark = f"rowid:{int(insert_bound or 0)}"
+                # Clients that stop on has_more=false must be told more rows wait.
+                post_sql = (
+                    "SELECT 1 FROM messages WHERE deleted_state='none' AND rowid > ?"
+                )
+                post_params: list[Any] = [insert_bound]
+                if workspace:
+                    post_sql += " AND workspace_key=?"
+                    post_params.append(workspace)
+                post_sql += " LIMIT 1"
+                if self._conn.execute(post_sql, post_params).fetchone():
+                    has_more = True
+        else:
+            new_mark = since if use_rowid else f"rowid:{int(insert_bound or 0)}"
+            if not use_rowid and insert_bound is not None:
+                post_sql = (
+                    "SELECT 1 FROM messages WHERE deleted_state='none' AND rowid > ?"
+                )
+                post_params = [insert_bound]
+                if workspace:
+                    post_sql += " AND workspace_key=?"
+                    post_params.append(workspace)
+                post_sql += " LIMIT 1"
+                if self._conn.execute(post_sql, post_params).fetchone():
+                    has_more = True
+        if rows or not use_rowid:
+            self._write_whats_new_cursor(meta_key, new_mark, watermark_store)
+        return {
+            "since": since,
+            "watermark": new_mark,
+            "has_more": has_more,
+            "messages": rows,
+            "by_channel": grouped,
+        }
+
+    def _max_message_rowid(self) -> int:
+        row = self._conn.execute("SELECT MAX(rowid) AS r FROM messages").fetchone()
+        return int(row["r"] or 0)
+
+    def _dirty_window_map(self) -> dict[str, int]:
+        """channel_id -> dirty generation (list form treated as generation 1)."""
+        key = "window_dirty_channels"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        if not row:
+            return {}
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            parsed = json.loads(row["value"])
+            if isinstance(parsed, dict):
+                out: dict[str, int] = {}
+                for k, v in parsed.items():
+                    with contextlib.suppress(TypeError, ValueError):
+                        out[str(k)] = int(v)
+                return out
+            if isinstance(parsed, list):
+                return {str(c): 1 for c in parsed}
+        return {}
+
+    def _write_dirty_window_map(self, data: dict[str, int]) -> None:
+        key = "window_dirty_channels"
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, json.dumps(data)),
+        )
+
+    def _begin_immediate(self) -> bool:
+        """Start BEGIN IMMEDIATE. True if we opened it (caller may commit).
+
+        Only treats 'within a transaction' as already-locked; lock timeouts raise.
+        """
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            return True
+        except sqlite3.OperationalError as exc:
+            if "within a transaction" in str(exc).lower():
+                return False
+            raise
+
+    _EMBED_OP_LOCK_META_KEY = "embedding_op_lock"  # dual-protocol with older builds
+    _LEGACY_EMBED_OP_OWNER_RE = re.compile(r"^(?:cli-rebuild|daemon)-(\d+)$")
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        """Best-effort liveness for legacy-only meta holders during upgrades."""
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+
+            process_query_limited_information = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                process_query_limited_information, False, int(pid)
+            )
+            if not handle:
+                # Distinguish access-denied (live) from missing (dead).
+                err = ctypes.GetLastError()
+                return err == 5  # ERROR_ACCESS_DENIED
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _embed_lock_paths(self) -> list[Path]:
+        """Sidecar paths deduplicated by file identity (not string equality).
+
+        Includes an inode-keyed lock, path-string sidecars, and any existing
+        ``*embedding_op*.lock`` already in the DB directory (so an older build
+        holding a symlink alias sidecar blocks us instead of overlapping).
+        """
+        resolved_db = self.path.resolve()
+        parent = resolved_db.parent
+        candidates: list[Path] = []
+        with contextlib.suppress(OSError):
+            st = resolved_db.stat()
+            candidates.append(
+                parent / f".embedding_op.{st.st_dev}-{st.st_ino}.lock"
+            )
+        candidates.append(Path(str(resolved_db) + ".embedding_op.lock"))
+        candidates.append(Path(str(self.path) + ".embedding_op.lock"))
+        # Only this archive's basename sidecars — never other DBs in the dir.
+        stem = resolved_db.name
+        with contextlib.suppress(OSError):
+            direct = parent / f"{stem}.embedding_op.lock"
+            candidates.append(direct)
+        unique: list[Path] = []
+        for p in candidates:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not p.exists():
+                with contextlib.suppress(OSError):
+                    p.write_text("0", encoding="utf-8")
+            dup = False
+            for u in unique:
+                try:
+                    if os.path.samefile(p, u):
+                        dup = True
+                        break
+                except OSError:
+                    if p.resolve() == u.resolve():
+                        dup = True
+                        break
+            if not dup:
+                unique.append(p)
+        return unique
+
+    def _lock_embed_file(self, fh: TextIO) -> None:
+        """Exclusive, non-blocking byte-range / flock; raises OSError if busy."""
+        fh.seek(0)
+        if fh.read(1) == "":
+            fh.write("0")
+            fh.flush()
+        fh.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_embed_file(self, fh: TextIO) -> None:
+        fh.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+
+            with contextlib.suppress(OSError):
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            with contextlib.suppress(OSError):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _probe_file_locks_busy(self) -> bool:
+        """True if any dual-path sidecar is currently held by another process."""
+        for path in self._embed_lock_paths():
+            try:
+                fh = path.open("a+")
+            except OSError:
+                continue
+            try:
+                self._lock_embed_file(fh)
+            except OSError:
+                fh.close()
+                return True
+            with contextlib.suppress(Exception):
+                self._unlock_embed_file(fh)
+            with contextlib.suppress(Exception):
+                fh.close()
+        return False
+
+    def _parse_legacy_embed_meta(
+        self, raw: str | None
+    ) -> tuple[str, int | None, str | None] | None:
+        """Return ``(owner, pid, protocol)`` for a dual-protocol meta lock row."""
+        if not raw:
+            return None
+        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("owner"):
+                pid_raw = data.get("pid")
+                pid = int(pid_raw) if pid_raw is not None else None
+                if pid is None:
+                    m = self._LEGACY_EMBED_OP_OWNER_RE.match(str(data["owner"]))
+                    if m:
+                        pid = int(m.group(1))
+                protocol = (
+                    str(data["protocol"]) if data.get("protocol") else None
+                )
+                return str(data["owner"]), pid, protocol
+        m = self._LEGACY_EMBED_OP_OWNER_RE.match(raw)
+        if m:
+            return raw, int(m.group(1)), None
+        return raw, None, None
+
+    _EMBED_OP_LOCK_LEASE_S = 120.0
+
+    def _legacy_meta_blocks(self, owner: str, *, holding_files: bool) -> bool:
+        """True if another live holder still owns the meta lock row.
+
+        ``file+meta`` claims are authoritative only while the OS file lock is
+        held. When we already hold the files, prior ``file+meta`` rows are
+        superseded. Legacy-only rows still use PID liveness.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
+        ).fetchone()
+        parsed = self._parse_legacy_embed_meta(
+            str(row["value"]) if row else None
+        )
+        if not parsed:
+            return False
+        other, pid, protocol = parsed
+        if other == owner:
+            return False
+        if protocol == "file+meta":
+            if holding_files:
+                return False
+            return self._probe_file_locks_busy()
+        if pid is not None:
+            return self._process_alive(pid)
+        # Opaque legacy row without PID: preserve exclusion.
+        return True
+
+    def _claim_legacy_meta(
+        self, owner: str, *, holding_files: bool, lease_s: float | None = None
+    ) -> bool:
+        """Claim/refresh the meta lock under IMMEDIATE; False if blocked."""
+        lease = self._EMBED_OP_LOCK_LEASE_S if lease_s is None else float(lease_s)
+        started = self._begin_immediate()
+        try:
+            if self._legacy_meta_blocks(owner, holding_files=holding_files):
+                if started:
+                    self._conn.commit()
+                return False
+            # Short renewable expires_at so 918c1ec-era lease readers can
+            # recover after a crash; renew_embedding_op_lock refreshes it.
+            payload = json.dumps(
+                {
+                    "owner": owner,
+                    "pid": os.getpid(),
+                    "expires_at": time.time() + max(lease, 1.0),
+                    "protocol": "file+meta",
+                }
+            )
+            self._conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (self._EMBED_OP_LOCK_META_KEY, payload),
+            )
+            if started:
+                self._conn.commit()
+            return True
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def _clear_legacy_meta(self, owner: str) -> None:
+        started = self._begin_immediate()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (self._EMBED_OP_LOCK_META_KEY,),
+            ).fetchone()
+            parsed = self._parse_legacy_embed_meta(
+                str(row["value"]) if row else None
+            )
+            if parsed and parsed[0] == owner:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key=?",
+                    (self._EMBED_OP_LOCK_META_KEY,),
+                )
+            if started:
+                self._conn.commit()
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def _release_embed_file_lock(self) -> None:
+        owner = self._embed_lock_owner
+        fhs = list(self._embed_lock_fhs)
+        self._embed_lock_fhs = []
+        self._embed_lock_owner = None
+        for fh in fhs:
+            with contextlib.suppress(Exception):
+                self._unlock_embed_file(fh)
+            with contextlib.suppress(Exception):
+                fh.close()
+        if owner is not None:
+            with contextlib.suppress(Exception):
+                self._clear_legacy_meta(owner)
+
+    def embedding_op_lock_held(self) -> bool:
+        """True when the OS file lock or a live legacy meta holder is present."""
+        if self._embed_lock_fhs:
+            return True
+        with contextlib.suppress(Exception):
+            if self._legacy_meta_blocks(owner="", holding_files=False):
+                return True
+        return self._probe_file_locks_busy()
+
+    def embedding_op_lock_owned(self, owner: str) -> bool:
+        """True if this repository instance holds the lock for ``owner``."""
+        return bool(self._embed_lock_fhs) and self._embed_lock_owner == owner
+
+    def acquire_embedding_op_lock(
+        self, owner: str, *, lease_s: float | None = None
+    ) -> bool:
+        """Acquire crash-released OS file locks, then dual-protocol meta claim.
+
+        File locks are taken first so claim/steal races cannot leave an active
+        file holder without metadata. ``lease_s`` is ignored.
+        """
+        del lease_s
+        if self._embed_lock_fhs:
+            return self._embed_lock_owner == owner
+        fhs: list[TextIO] = []
+        claimed_meta = False
+        try:
+            for path in self._embed_lock_paths():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fh: TextIO = path.open("a+")
+                fhs.append(fh)
+                self._lock_embed_file(fh)
+            if not self._claim_legacy_meta(owner, holding_files=True):
+                raise OSError("embedding_op_meta_blocked")
+            claimed_meta = True
+            self._embed_lock_fhs = fhs
+            self._embed_lock_owner = owner
+            return True
+        except Exception:
+            for fh in fhs:
+                with contextlib.suppress(Exception):
+                    self._unlock_embed_file(fh)
+                with contextlib.suppress(Exception):
+                    fh.close()
+            if claimed_meta:
+                with contextlib.suppress(Exception):
+                    self._clear_legacy_meta(owner)
+            return False
+
+    def renew_embedding_op_lock(
+        self, owner: str, *, lease_s: float | None = None
+    ) -> bool:
+        """Fence + refresh short meta lease while the OS lock is held.
+
+        Ownership check and lease write happen under one IMMEDIATE transaction
+        so a legacy worker cannot slip in between.
+        """
+        if not self.embedding_op_lock_owned(owner):
+            return False
+        lease = self._EMBED_OP_LOCK_LEASE_S if lease_s is None else float(lease_s)
+        started = self._begin_immediate()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (self._EMBED_OP_LOCK_META_KEY,),
+            ).fetchone()
+            parsed = self._parse_legacy_embed_meta(
+                str(row["value"]) if row else None
+            )
+            # Missing or foreign row = lost ownership (do not recreate).
+            if not parsed or parsed[0] != owner:
+                if started:
+                    self._conn.commit()
+                return False
+            payload = json.dumps(
+                {
+                    "owner": owner,
+                    "pid": os.getpid(),
+                    "expires_at": time.time() + max(lease, 1.0),
+                    "protocol": "file+meta",
+                }
+            )
+            self._conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (self._EMBED_OP_LOCK_META_KEY, payload),
+            )
+            if started:
+                self._conn.commit()
+            return True
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def heartbeat_embedding_op_lock(self) -> bool:
+        """Renew the short meta lease if this instance holds the op lock.
+
+        Called from long rebuild/embed loops so 918c1ec-era lease readers
+        cannot steal mid-operation.
+        """
+        owner = self._embed_lock_owner
+        if not owner or not self._embed_lock_fhs:
+            return True
+        return self.renew_embedding_op_lock(owner)
+
+    def release_embedding_op_lock(self, owner: str) -> None:
+        """Release the OS file locks and dual-protocol meta row if owned."""
+        if self._embed_lock_owner != owner:
+            return
+        self._release_embed_file_lock()
+
+    def _ensure_dirty_seq_initialized(self) -> None:
+        """Seed ``window_dirty_seq`` above legacy map gens; never overwrite."""
+        key = "window_dirty_seq"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        if row:
+            return
+        existing_max = max(self._dirty_window_map().values(), default=0)
+        # INSERT OR IGNORE — a concurrent mark must not be clobbered by a
+        # stale legacy seed computed before that mark committed.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+            (key, str(existing_max)),
+        )
+
+    def _next_dirty_generation(self) -> int:
+        """Monotonic generation that never restarts after acknowledgements."""
+        self._ensure_dirty_seq_initialized()
+        key = "window_dirty_seq"
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        current = int(row["value"]) if row else 0
+        existing_max = max(self._dirty_window_map().values(), default=0)
+        n = max(current, existing_max) + 1
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, str(n)),
+        )
+        return n
+
+    def mark_windows_dirty(self, channel_id: str) -> None:
+        """Queue a channel for deferred window-doc rebuild (bump generation)."""
+        started = self._begin_immediate()
+        try:
+            data = self._dirty_window_map()
+            data[channel_id] = self._next_dirty_generation()
+            self._write_dirty_window_map(data)
+            if started:
+                self._conn.commit()
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def peek_dirty_window_channels(self) -> list[tuple[str, int]]:
+        """Return (channel_id, generation) without clearing."""
+        started = self._begin_immediate()
+        try:
+            self._ensure_dirty_seq_initialized()
+            out = list(self._dirty_window_map().items())
+            if started:
+                self._conn.commit()
+            return out
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def ack_dirty_window_channel(self, channel_id: str, generation: int) -> None:
+        """Ack only if ``generation`` still matches (newer marks stay dirty)."""
+        started = self._begin_immediate()
+        try:
+            self._ensure_dirty_seq_initialized()
+            data = self._dirty_window_map()
+            cur = data.get(channel_id)
+            if cur is not None and int(cur) == int(generation):
+                del data[channel_id]
+                self._write_dirty_window_map(data)
+            if started:
+                self._conn.commit()
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def _read_whats_new_cursor(self, meta_key: str, store: Path | None) -> str:
+        default = "1970-01-01T00:00:00Z"
+        if store is not None:
+            try:
+                data = json.loads(store.read_text(encoding="utf-8"))
+                val = data.get(meta_key)
+                if isinstance(val, str) and val:
+                    return val
+            except (OSError, json.JSONDecodeError):
+                pass
+        if not self.read_only:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (meta_key,)
+            ).fetchone()
+            if row:
+                return str(row["value"])
+        return default
+
+    def _write_whats_new_cursor(
+        self, meta_key: str, value: str, store: Path | None
+    ) -> None:
+        if store is not None:
+            data: dict[str, Any] = {}
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                data = json.loads(store.read_text(encoding="utf-8"))
+            data[meta_key] = value
+            store.parent.mkdir(parents=True, exist_ok=True)
+            store.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return
+        if self.read_only:
+            return
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (meta_key, value),
+        )
+        self._conn.commit()
+
     def scan_for_token_leak(self) -> list[str]:
         """Return table names where xox* bytes appear (should be empty)."""
         offenders: list[str] = []
@@ -1666,6 +2955,7 @@ class SqliteRepository:
             "saved_items",
             "canvases",
             "drafts",
+            "search_docs",
         ):
             try:
                 rows = self._conn.execute(f"SELECT * FROM {table}").fetchall()
