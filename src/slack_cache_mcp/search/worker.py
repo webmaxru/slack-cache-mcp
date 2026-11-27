@@ -315,37 +315,51 @@ def embed_pending(
                 # Set only after side-conn renew returns (connection closed).
                 _done.set()
 
+        # Protect the whole started-thread lifetime (start → embed → teardown)
+        # against Ctrl-C. Prefer done_beat over join(): CPython 3.12 can mark a
+        # thread stopped after an interrupted join while it is still running.
         beater: threading.Thread | None = None
-        if lock_owner is not None:
-            beater = threading.Thread(
-                target=_beat, name="embed-op-lock-beat", daemon=True
-            )
-            beater.start()
-        else:
-            done_beat.set()
-        try:
-            vectors = embedder.embed_documents(texts)
-        finally:
-            # Forbid further lease commits, then wait until the heartbeat exits
-            # before returning — callers release the OS lock immediately after.
-            # Defer Ctrl-C across the *entire* teardown (stop + gate + wait).
-            # Prefer done_beat over join(): CPython 3.12 can mark a thread
-            # stopped after an interrupted join while it is still running.
-            interrupted = False
-            while True:
-                try:
-                    stop_beat.set()
-                    with commit_gate:
-                        commit_allowed["ok"] = False
-                    done_beat.wait()
-                    if beater is not None:
-                        beater.join()
+        interrupted = False
+        thread_started = False
+        embed_finished = False
+        vectors: Any = None
+        while True:
+            try:
+                if not thread_started:
+                    if lock_owner is not None:
+                        beater = threading.Thread(
+                            target=_beat, name="embed-op-lock-beat", daemon=True
+                        )
+                        # Commit to teardown even if start() is interrupted.
+                        thread_started = True
+                        beater.start()
+                    else:
+                        done_beat.set()
+                        thread_started = True
+
+                if not embed_finished:
+                    vectors = embedder.embed_documents(texts)
+                    embed_finished = True
+
+                stop_beat.set()
+                with commit_gate:
+                    commit_allowed["ok"] = False
+                if beater is None and not done_beat.is_set():
+                    done_beat.set()
+                done_beat.wait()
+                if beater is not None:
+                    beater.join()
+                break
+            except KeyboardInterrupt:
+                interrupted = True
+                if not thread_started:
                     break
-                except KeyboardInterrupt:
-                    interrupted = True
-                    continue
-            if interrupted:
-                raise KeyboardInterrupt
+                # Skip re-embedding; retries only finish stop/gate/wait/join.
+                embed_finished = True
+                continue
+        if interrupted:
+            raise KeyboardInterrupt
+        assert vectors is not None
         if not beat_ok["ok"]:
             return {
                 "ok": False,
