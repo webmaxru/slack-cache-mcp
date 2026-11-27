@@ -88,3 +88,31 @@ CI uses `HashingEmbedder` with planted synonym groups so paraphrase queries prov
 
 ### Schema
 `SCHEMA_VERSION=4` adds `search_docs` (+ runtime `docs_vec`).
+
+## 2026-11-27 — M5 multi-device sync (local)
+
+### Age encryption via pyrage
+Bundle files use the age v1 X25519 recipient format through `pyrage` (Rust bindings). Signing is separate Ed25519 via `cryptography`. Envelope = zstd(JSONL change_log) + Ed25519 signature fields, then age-encrypted to all registered device age recipients (including self). Filename: `bundle-<device>-<fromseq>-<toseq>.jsonl.zst.age`.
+
+### Device key storage
+Ed25519 + age identity secrets prefer OS keyring (`slack-cache-mcp` / `device-{ed25519|age}-<id>`). File fallback `device.secrets` under the data dir (0600) for tests/recovery, mirroring vault key handling. Public halves live in `device.json` and `devices.public_key` (JSON `{"ed25519","age"}`).
+
+### Peer bootstrap
+Age encrypt requires recipients at export time. Peers exchange public identity via `slackcache sync show-device` + `sync peers add --from`. Import also refreshes the sender's public keys from the signed header after successful decrypt.
+
+### Outbox / apply
+`change_log` carries full sanitized payloads for `message_version`, `workspace`, `channel`, and `user`. Apply is idempotent on `(device_id, entity, entity_key, payload_sha256)` and re-sanitizes. `sync_cursors` tracks folder push/pull watermarks. `SCHEMA_VERSION=5`.
+
+### Convergence hash
+`state_hash` covers ordered projections of `messages`, `message_versions`, `channels`, `users`, and `workspaces` (not device-local drafts/paths). Property tests shuffle 2–4 devices and re-import duplicates.
+
+### Bundle trust + envelope v2
+Import rejects unknown senders and signing/age key mismatches against `sync peers add` registrations; header keys never overwrite a registered peer. Envelope format version 2 signs the canonical header+payload (not payload alone). Export runs `backfill_outbox` so upgraded M4 archives ship full sanitized facts. HLC watermark is persisted in `meta.hlc_watermark` and restored for ingest/import.
+
+### Copilot round-2..5 hardening
+- Device identity fails closed if `device.json` is missing keys or malformed; `device.secrets` only when keyring unconfirmed; create mode 0600.
+- `sync peers add` resets **all** push cursors. Decrypt failures are always errors (remove superseded folder bundles after full re-export).
+- Import rejects forged row authors and sighting payload `device_id` mismatches.
+- Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps; epoch bounds are ignored as unknown.
+- Directory upserts maintain `field_hlcs_json`. Unclocked values use sentinel `*`. Repair migration (policy `v7-*`) preserves real table clocks, restores dominating `(value, clock)` pairs only for unknown table clocks, bumps `directory_clock_epoch`, and rebuilds local directory outbox with `clock_epoch` + one-shot `clock_repair`. Receivers force-apply only facts that carry repair authority (higher epoch or `clock_repair`); lower-epoch clocks are null-fill only. Full re-exports write the new bundle before deleting older local files; incremental exports retain history. Bundle `from_seq`/`to_seq` use min/max sequence; import verifies all files then applies rows in global entity order with per-row failure isolation. Channel outbox emits legacy `aliases` plus `alias_records`; backfill repairs object-only rows.
+- Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.

@@ -416,6 +416,120 @@ def rebuild_cmd(
         raise typer.Exit(code=1)
 
 
+sync_app = typer.Typer(help="Multi-device sync (local age-encrypted bundles)", no_args_is_help=True)
+app.add_typer(sync_app, name="sync")
+
+
+@sync_app.command("init")
+def sync_init_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """Create/load local device identity (Ed25519 + age) and register in archive."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+    from slack_cache_mcp.sync.bundle import ensure_local_device
+
+    settings = load_settings(data_dir=data_dir)
+    repo = SqliteRepository(settings.archive_db)
+    identity = ensure_local_device(repo, settings.data_dir)
+    repo.close()
+    typer.echo(json.dumps(identity.public_info().to_dict(), indent=2))
+
+
+@sync_app.command("show-device")
+def sync_show_device_cmd(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """Print local device public identity (safe to share with peer laptops)."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.sync.device import load_or_create_device
+
+    settings = load_settings(data_dir=data_dir)
+    identity = load_or_create_device(settings.data_dir)
+    typer.echo(json.dumps(identity.public_info().to_dict(), indent=2))
+
+
+@sync_app.command("peers")
+def sync_peers_cmd(
+    action: str = typer.Argument("list", help="list|add"),
+    peer_json: Path | None = typer.Option(
+        None, "--from", help="Peer public identity JSON (from show-device)"
+    ),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+) -> None:
+    """List registered devices or add a peer public key for bundle encryption."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+    from slack_cache_mcp.sync.bundle import ensure_local_device, register_peer
+    from slack_cache_mcp.sync.device import peer_from_dict
+
+    settings = load_settings(data_dir=data_dir)
+    repo = SqliteRepository(settings.archive_db)
+    ensure_local_device(repo, settings.data_dir)
+    if action == "list":
+        typer.echo(json.dumps(repo.list_devices(), indent=2, default=str))
+        repo.close()
+        return
+    if action != "add":
+        typer.echo("action must be list|add", err=True)
+        raise typer.Exit(2)
+    if peer_json is None:
+        typer.echo("--from <peer.json> required for add", err=True)
+        raise typer.Exit(2)
+    data = json.loads(Path(peer_json).read_text(encoding="utf-8"))
+    peer = peer_from_dict(data)
+    register_peer(repo, peer)
+    repo.close()
+    typer.echo(json.dumps({"ok": True, "device_id": peer.device_id}, indent=2))
+
+
+@sync_app.command("export")
+def sync_export_cmd(
+    to_dir: Path = typer.Option(..., "--to", help="Folder for age-encrypted bundles"),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    peer: str = typer.Option("folder", "--peer", help="Push cursor peer name"),
+) -> None:
+    """Export local change_log since push cursor as ``bundle-*.jsonl.zst.age``."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+    from slack_cache_mcp.sync.bundle import ensure_local_device, export_bundle
+
+    settings = load_settings(data_dir=data_dir)
+    repo = SqliteRepository(settings.archive_db)
+    identity = ensure_local_device(repo, settings.data_dir)
+    result = export_bundle(repo, identity=identity, to_dir=to_dir, peer=peer)
+    repo.close()
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
+@sync_app.command("import")
+def sync_import_cmd(
+    from_dir: Path = typer.Option(..., "--from", help="Folder containing peer bundles"),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    peer: str = typer.Option("folder", "--peer", help="Pull cursor peer prefix"),
+) -> None:
+    """Import and apply peer age-encrypted bundles (idempotent)."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+    from slack_cache_mcp.sync.bundle import ensure_local_device, import_bundles
+
+    settings = load_settings(data_dir=data_dir)
+    repo = SqliteRepository(settings.archive_db)
+    identity = ensure_local_device(repo, settings.data_dir)
+    result = import_bundles(repo, identity=identity, from_dir=from_dir, peer=peer)
+    repo.close()
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise typer.Exit(1)
+
+
 models_app = typer.Typer(help="Local embedding model management", no_args_is_help=True)
 app.add_typer(models_app, name="models")
 

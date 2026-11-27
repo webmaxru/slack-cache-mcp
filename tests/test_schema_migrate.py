@@ -55,4 +55,5 @@ def test_migrate_adds_vault_path_and_bumps_version(tmp_path: Path) -> None:
         ).fetchall()
     }
     assert "suspected_streaks" in tables
+    assert "sync_cursors" in tables
     repo.close()
