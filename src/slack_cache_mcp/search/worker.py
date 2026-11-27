@@ -275,15 +275,21 @@ def embed_pending(
         commit_gate = threading.Lock()
         commit_allowed = {"ok": True}
 
+        beat_entered = threading.Event()
+
         def _beat(
             _stop: threading.Event = stop_beat,
             _done: threading.Event = done_beat,
+            _entered: threading.Event = beat_entered,
             _ok: dict[str, bool] = beat_ok,
             _owner: str | None = lock_owner,
             _path: str = db_path,
             _gate: threading.Lock = commit_gate,
             _allowed: dict[str, bool] = commit_allowed,
         ) -> None:
+            # Signal entry before any wait so interrupted start() can tell a
+            # launched thread from a never-started one.
+            _entered.set()
             # Last renew (or acquire) left ~120s; after a 30s sleep ~90s remain.
             # Busy retries must not outlive a still-valid lease window.
             try:
@@ -315,40 +321,47 @@ def embed_pending(
                 # Set only after side-conn renew returns (connection closed).
                 _done.set()
 
-        # Protect start → embed → teardown against Ctrl-C. Prefer done_beat over
-        # join(): CPython 3.12 can mark a thread stopped after an interrupted
-        # join while it is still running. Only treat the heartbeat as running
-        # after Thread.start() returns; always tear down on any embed error.
+        # One protected lifetime for start + embed; teardown always in finally.
+        # Prefer done_beat over join() (CPython 3.12 interrupted-join quirk).
         beater: threading.Thread | None = None
         interrupted = False
         vectors: Any = None
-
-        while True:
-            try:
-                if lock_owner is not None:
-                    t = threading.Thread(
-                        target=_beat, name="embed-op-lock-beat", daemon=True
-                    )
-                    t.start()
-                    beater = t  # only after start() returns successfully
-                else:
-                    done_beat.set()
-                break
-            except KeyboardInterrupt:
-                interrupted = True
-                # start() did not return → no running heartbeat to join
-                beater = None
-                break
+        launch_attempted = False
+        launch_thread: threading.Thread | None = None
 
         try:
+            while True:
+                try:
+                    if lock_owner is not None:
+                        launch_thread = threading.Thread(
+                            target=_beat, name="embed-op-lock-beat", daemon=True
+                        )
+                        launch_attempted = True
+                        launch_thread.start()
+                        beater = launch_thread
+                    else:
+                        done_beat.set()
+                    break
+                except KeyboardInterrupt:
+                    interrupted = True
+                    # start() may have launched the OS thread before returning.
+                    if launch_attempted and launch_thread is not None:
+                        if beat_entered.wait(timeout=2.0):
+                            beater = launch_thread
+                        else:
+                            # Never entered _beat — unblock teardown.
+                            beater = None
+                            if not done_beat.is_set():
+                                done_beat.set()
+                    break
+
             if not interrupted:
                 try:
                     vectors = embedder.embed_documents(texts)
                 except KeyboardInterrupt:
                     interrupted = True
         finally:
-            # Runs for embed errors AND KeyboardInterrupt — forbid renews and
-            # wait until the side-conn heartbeat has closed.
+            # Any exit path (embed error, Ctrl-C between start and embed, etc.).
             while True:
                 try:
                     stop_beat.set()
