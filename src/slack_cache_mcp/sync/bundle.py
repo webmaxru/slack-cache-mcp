@@ -44,7 +44,9 @@ def register_peer(repo: SqliteRepository, peer: DevicePublicInfo) -> None:
         sort_keys=True,
     )
     repo.upsert_device(peer.device_id, peer.label, public_key=public_key)
-    repo.set_sync_cursor("folder", "push", "0")
+    # Recipient set changed: any push cursor may omit history the new peer needs,
+    # and older bundles omit their age recipient — force full re-export everywhere.
+    repo.reset_push_cursors()
 
 
 def list_age_recipients(
@@ -210,7 +212,22 @@ def import_bundles(
             if to_seq is not None:
                 repo.set_sync_cursor(f"{peer}:{sender_id}", "pull", str(to_seq))
         except Exception as exc:
-            errors.append({"path": str(path), "error": str(exc)})
+            msg = str(exc)
+            # Older folder bundles encrypted before a late peer was added cannot be
+            # decrypted by that peer; treat as superseded rather than hard failure.
+            lower = msg.lower()
+            if any(
+                needle in lower
+                for needle in (
+                    "no matching identity",
+                    "failed to decrypt",
+                    "decryption failed",
+                    "incorrect mac",
+                )
+            ):
+                total_skipped += 1
+                continue
+            errors.append({"path": str(path), "error": msg})
 
     # Persist merged HLC so subsequent local ingest dominates imported clocks.
     tick = hlc_clock.now()

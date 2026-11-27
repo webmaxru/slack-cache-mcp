@@ -109,11 +109,10 @@ Age encrypt requires recipients at export time. Peers exchange public identity v
 ### Bundle trust + envelope v2
 Import rejects unknown senders and signing/age key mismatches against `sync peers add` registrations; header keys never overwrite a registered peer. Envelope format version 2 signs the canonical header+payload (not payload alone). Export runs `backfill_outbox` so upgraded M4 archives ship full sanitized facts. HLC watermark is persisted in `meta.hlc_watermark` and restored for ingest/import.
 
-### Copilot round-2 hardening
-- Device identity fails closed if `device.json` exists without recoverable private keys; `device.secrets` is written only when keyring storage is unconfirmed; file create uses mode 0600.
-- `sync peers add` resets the folder push cursor so late peers get a full re-export under the new recipient set.
-- Import rejects change_log rows whose `device_id` ≠ authenticated sender.
-- Apply reprojects inside the same transaction as the outbox marker; message_version apply does not write sightings (sighting entity carries `last_seen`).
-- Directory LWW uses per-field clocks in `field_hlcs_json`; channel `workspace_key` participates in that merge.
-- Backfill skips entity keys that already have outbox rows and reuses each directory row’s original `updated_hlc`; user workspace associations + local sightings are included.
+### Copilot round-2/3 hardening
+- Device identity fails closed if `device.json` is missing keys or malformed; `device.secrets` only when keyring unconfirmed; create mode 0600.
+- `sync peers add` resets **all** push cursors; import treats undecryptable superseded bundles as skips, not hard errors.
+- Import rejects forged row authors and sighting payload `device_id` mismatches.
+- Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps.
+- Directory upserts always maintain `field_hlcs_json`; backfill covers missing fields and ships per-field clocks in payloads.
 - Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.

@@ -188,8 +188,11 @@ def load_or_create_device(
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             device_id = str(meta["device_id"])
             stored_label = str(meta.get("label") or label)
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            device_id = None
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"existing device.json at {meta_path} is unreadable or malformed; "
+                "refusing to create a new identity"
+            ) from exc
 
     ed_b64: str | None = None
     age_secret: str | None = None

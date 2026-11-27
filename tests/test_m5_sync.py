@@ -410,6 +410,17 @@ def test_device_refuses_silent_key_rotation(tmp_path: Path) -> None:
         assert "refusing to rotate" in str(exc)
 
 
+def test_device_refuses_corrupt_metadata(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "device.json").write_text("{not-json", encoding="utf-8")
+    try:
+        load_or_create_device(data, prefer_keyring=False)
+        raise AssertionError("expected RuntimeError for corrupt device.json")
+    except RuntimeError as exc:
+        assert "malformed" in str(exc)
+
+
 def test_sparse_directory_lww_order_independent(tmp_path: Path) -> None:
     """name old@1, new@2, null@3 converges regardless of delivery order."""
 
@@ -497,8 +508,10 @@ def test_register_peer_resets_push_cursor(tmp_path: Path) -> None:
     repo = SqliteRepository(tmp_path / "a.db")
     identity = ensure_local_device(repo, tmp_path / "a")
     repo.set_sync_cursor("folder", "push", "42")
+    repo.set_sync_cursor("usb-stick", "push", "99")
     other = load_or_create_device(tmp_path / "b", prefer_keyring=False)
     register_peer(repo, other.public_info())
     assert repo.get_sync_cursor("folder", "push") == "0"
+    assert repo.get_sync_cursor("usb-stick", "push") == "0"
     assert identity.device_id
     repo.close()

@@ -410,6 +410,28 @@ class SqliteRepository:
         )
         self._conn.commit()
 
+    def reset_push_cursors(self) -> int:
+        """Reset every push cursor so the next export re-sends full history."""
+        cur = self._conn.execute(
+            """
+            UPDATE sync_cursors SET cursor='0', updated_at=?
+            WHERE direction='push'
+            """,
+            (_utc_now(),),
+        )
+        # Ensure the default folder peer exists even if never exported.
+        self._conn.execute(
+            """
+            INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+            VALUES ('folder', 'push', '0', ?)
+            ON CONFLICT(peer, direction) DO UPDATE SET
+              cursor='0', updated_at=excluded.updated_at
+            """,
+            (_utc_now(),),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
     def change_log_count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) AS c FROM change_log").fetchone()["c"])
 
@@ -561,6 +583,39 @@ class SqliteRepository:
         ).fetchone()
         return row is not None
 
+    def _outbox_covers_fields(
+        self,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        required: dict[str, Any],
+    ) -> bool:
+        """True when union of outbox payloads already carries every non-null required field."""
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM change_log
+            WHERE device_id=? AND entity=? AND entity_key=?
+            """,
+            (device_id, entity, entity_key),
+        ).fetchall()
+        if not rows:
+            return False
+        merged: dict[str, Any] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for key, value in payload.items():
+                if value is not None:
+                    merged[key] = value
+        for key, value in required.items():
+            if value is not None and merged.get(key) is None:
+                return False
+        return True
+
     def backfill_outbox(self, *, device_id: str, hlc: str) -> dict[str, int]:
         """Write missing sanitized outbox facts from archive tables (M4→M5 upgrade).
 
@@ -587,7 +642,16 @@ class SqliteRepository:
             return str(value) if value else fallback
 
         for r in self._conn.execute("SELECT * FROM workspaces").fetchall():
-            if self._has_entity_outbox(device_id, "workspace", r["workspace_key"]):
+            required = {
+                "team_id": r["team_id"],
+                "enterprise_id": r["enterprise_id"],
+                "name": r["name"],
+                "domain": r["domain"],
+                "self_user_id": r["self_user_id"],
+            }
+            if self._outbox_covers_fields(
+                device_id, "workspace", r["workspace_key"], required
+            ):
                 continue
             ws = Workspace(
                 workspace_key=r["workspace_key"],
@@ -599,6 +663,10 @@ class SqliteRepository:
                 self_is_guest=bool(r["self_is_guest"]),
                 raw=json.loads(r["raw_json"] or "{}"),
             )
+            field_hlcs = _load_field_hlcs(r["field_hlcs_json"])
+            for key, val in required.items():
+                if val is not None and key not in field_hlcs:
+                    field_hlcs[key] = _row_hlc(r, hlc)
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -615,11 +683,19 @@ class SqliteRepository:
                     "raw": ws.raw,
                     "first_seen": r["first_seen"],
                     "last_seen": r["last_seen"],
+                    "field_hlcs": field_hlcs,
                 },
             ):
                 counts["workspaces"] += 1
         for r in self._conn.execute("SELECT * FROM channels").fetchall():
-            if self._has_entity_outbox(device_id, "channel", r["channel_id"]):
+            required = {
+                "workspace_key": r["workspace_key"],
+                "name": r["name"],
+                "topic": r["topic"],
+                "purpose": r["purpose"],
+                "im_user_id": r["im_user_id"],
+            }
+            if self._outbox_covers_fields(device_id, "channel", r["channel_id"], required):
                 continue
             ch = Channel(
                 channel_id=r["channel_id"],
@@ -635,6 +711,10 @@ class SqliteRepository:
                 im_user_id=r["im_user_id"],
                 raw=json.loads(r["raw_json"] or "{}"),
             )
+            field_hlcs = _load_field_hlcs(r["field_hlcs_json"])
+            for key, val in required.items():
+                if val is not None and key not in field_hlcs:
+                    field_hlcs[key] = _row_hlc(r, hlc)
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -655,11 +735,20 @@ class SqliteRepository:
                     "raw": ch.raw,
                     "first_seen": r["first_seen"],
                     "last_seen": r["last_seen"],
+                    "field_hlcs": field_hlcs,
                 },
             ):
                 counts["channels"] += 1
         for r in self._conn.execute("SELECT * FROM users").fetchall():
-            if self._has_entity_outbox(device_id, "user", r["user_id"]):
+            required = {
+                "name": r["name"],
+                "real_name": r["real_name"],
+                "display_name": r["display_name"],
+                "title": r["title"],
+                "tz": r["tz"],
+                "team_id": r["team_id"],
+            }
+            if self._outbox_covers_fields(device_id, "user", r["user_id"], required):
                 continue
             ws_keys = [
                 row["workspace_key"]
@@ -685,6 +774,10 @@ class SqliteRepository:
                 raw=json.loads(r["raw_json"] or "{}"),
                 workspace_key=ws_keys[0] if ws_keys else None,
             )
+            field_hlcs = _load_field_hlcs(r["field_hlcs_json"])
+            for key, val in required.items():
+                if val is not None and key not in field_hlcs:
+                    field_hlcs[key] = _row_hlc(r, hlc)
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -709,6 +802,7 @@ class SqliteRepository:
                     "workspace_keys": ws_keys,
                     "first_seen": r["first_seen"],
                     "last_seen": r["last_seen"],
+                    "field_hlcs": field_hlcs,
                 },
             ):
                 counts["users"] += 1
@@ -1125,153 +1219,106 @@ class SqliteRepository:
         *,
         device_id: str | None = None,
         write_change_log: bool = True,
-        hlc_lww: bool = False,
+        hlc_lww: bool = True,
         commit: bool = True,
+        incoming_field_hlcs: dict[str, str] | None = None,
     ) -> None:
         raw = json.dumps(ws.raw, ensure_ascii=False)
-        if hlc_lww:
-            existing = self._conn.execute(
-                "SELECT * FROM workspaces WHERE workspace_key=?",
+        _ = hlc_lww  # always maintain per-field clocks
+        existing = self._conn.execute(
+            "SELECT * FROM workspaces WHERE workspace_key=?",
+            (ws.workspace_key,),
+        ).fetchone()
+        if existing is None:
+            field_hlcs: dict[str, str] = {}
+            for key, val in (
+                ("team_id", ws.team_id),
+                ("enterprise_id", ws.enterprise_id),
+                ("name", ws.name),
+                ("domain", ws.domain),
+                ("self_user_id", ws.self_user_id),
+            ):
+                if val is not None:
+                    field_hlcs[key] = (incoming_field_hlcs or {}).get(key, hlc)
+            self._conn.execute(
+                """
+                INSERT INTO workspaces(
+                  workspace_key, team_id, enterprise_id, name, domain, self_user_id,
+                  self_is_guest, raw_json, first_seen, last_seen, updated_hlc,
+                  field_hlcs_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ws.workspace_key,
+                    ws.team_id,
+                    ws.enterprise_id,
+                    ws.name,
+                    ws.domain,
+                    ws.self_user_id,
+                    1 if ws.self_is_guest else 0,
+                    raw,
+                    seen_at,
+                    seen_at,
+                    hlc,
+                    _dump_field_hlcs(field_hlcs),
+                ),
+            )
+        else:
+            field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
+
+            def _take(field: str, current: Any, incoming: Any) -> Any:
+                clock_in = (incoming_field_hlcs or {}).get(field, hlc)
+                value, clock = _merge_sparse_field(
+                    current, field_hlcs.get(field), incoming, clock_in
+                )
+                if clock:
+                    field_hlcs[field] = clock
+                else:
+                    field_hlcs.pop(field, None)
+                return value
+
+            team_id = _take("team_id", existing["team_id"], ws.team_id)
+            enterprise_id = _take(
+                "enterprise_id", existing["enterprise_id"], ws.enterprise_id
+            )
+            name = _take("name", existing["name"], ws.name)
+            domain = _take("domain", existing["domain"], ws.domain)
+            self_user_id = _take(
+                "self_user_id", existing["self_user_id"], ws.self_user_id
+            )
+            row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
+            self_is_guest = (
+                (1 if ws.self_is_guest else 0) if row_wins else existing["self_is_guest"]
+            )
+            raw_json = raw if row_wins else existing["raw_json"]
+            updated_hlc = hlc if row_wins else existing["updated_hlc"]
+            self._conn.execute(
+                """
+                UPDATE workspaces SET
+                  team_id=?, enterprise_id=?, name=?, domain=?, self_user_id=?,
+                  self_is_guest=?, raw_json=?, last_seen=MAX(last_seen, ?),
+                  updated_hlc=?, field_hlcs_json=?
+                WHERE workspace_key=?
+                """,
+                (
+                    team_id,
+                    enterprise_id,
+                    name,
+                    domain,
+                    self_user_id,
+                    self_is_guest,
+                    raw_json,
+                    seen_at,
+                    updated_hlc,
+                    _dump_field_hlcs(field_hlcs),
+                    ws.workspace_key,
+                ),
+            )
+        if write_change_log and device_id:
+            stored = self._conn.execute(
+                "SELECT field_hlcs_json FROM workspaces WHERE workspace_key=?",
                 (ws.workspace_key,),
             ).fetchone()
-            if existing is None:
-                field_hlcs: dict[str, str] = {}
-                for key, val in (
-                    ("team_id", ws.team_id),
-                    ("enterprise_id", ws.enterprise_id),
-                    ("name", ws.name),
-                    ("domain", ws.domain),
-                    ("self_user_id", ws.self_user_id),
-                ):
-                    if val is not None:
-                        field_hlcs[key] = hlc
-                self._conn.execute(
-                    """
-                    INSERT INTO workspaces(
-                      workspace_key, team_id, enterprise_id, name, domain, self_user_id,
-                      self_is_guest, raw_json, first_seen, last_seen, updated_hlc,
-                      field_hlcs_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        ws.workspace_key,
-                        ws.team_id,
-                        ws.enterprise_id,
-                        ws.name,
-                        ws.domain,
-                        ws.self_user_id,
-                        1 if ws.self_is_guest else 0,
-                        raw,
-                        seen_at,
-                        seen_at,
-                        hlc,
-                        _dump_field_hlcs(field_hlcs),
-                    ),
-                )
-            else:
-                field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
-
-                def _take(field: str, current: Any, incoming: Any) -> Any:
-                    value, clock = _merge_sparse_field(
-                        current, field_hlcs.get(field), incoming, hlc
-                    )
-                    if clock:
-                        field_hlcs[field] = clock
-                    else:
-                        field_hlcs.pop(field, None)
-                    return value
-
-                team_id = _take("team_id", existing["team_id"], ws.team_id)
-                enterprise_id = _take(
-                    "enterprise_id", existing["enterprise_id"], ws.enterprise_id
-                )
-                name = _take("name", existing["name"], ws.name)
-                domain = _take("domain", existing["domain"], ws.domain)
-                self_user_id = _take(
-                    "self_user_id", existing["self_user_id"], ws.self_user_id
-                )
-                row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
-                self_is_guest = (
-                    (1 if ws.self_is_guest else 0) if row_wins else existing["self_is_guest"]
-                )
-                raw_json = raw if row_wins else existing["raw_json"]
-                updated_hlc = hlc if row_wins else existing["updated_hlc"]
-                self._conn.execute(
-                    """
-                    UPDATE workspaces SET
-                      team_id=?, enterprise_id=?, name=?, domain=?, self_user_id=?,
-                      self_is_guest=?, raw_json=?, last_seen=MAX(last_seen, ?),
-                      updated_hlc=?, field_hlcs_json=?
-                    WHERE workspace_key=?
-                    """,
-                    (
-                        team_id,
-                        enterprise_id,
-                        name,
-                        domain,
-                        self_user_id,
-                        self_is_guest,
-                        raw_json,
-                        seen_at,
-                        updated_hlc,
-                        _dump_field_hlcs(field_hlcs),
-                        ws.workspace_key,
-                    ),
-                )
-            if write_change_log and device_id:
-                self.append_entity_change(
-                    hlc=hlc,
-                    device_id=device_id,
-                    entity="workspace",
-                    entity_key=ws.workspace_key,
-                    payload={
-                        "workspace_key": ws.workspace_key,
-                        "team_id": ws.team_id,
-                        "enterprise_id": ws.enterprise_id,
-                        "name": ws.name,
-                        "domain": ws.domain,
-                        "self_user_id": ws.self_user_id,
-                        "self_is_guest": ws.self_is_guest,
-                        "raw": ws.raw,
-                        "first_seen": seen_at,
-                        "last_seen": seen_at,
-                    },
-                )
-            if commit:
-                self._conn.commit()
-            return
-        self._conn.execute(
-            """
-            INSERT INTO workspaces(
-              workspace_key, team_id, enterprise_id, name, domain, self_user_id,
-              self_is_guest, raw_json, first_seen, last_seen, updated_hlc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workspace_key) DO UPDATE SET
-              team_id=COALESCE(excluded.team_id, workspaces.team_id),
-              enterprise_id=COALESCE(excluded.enterprise_id, workspaces.enterprise_id),
-              name=COALESCE(excluded.name, workspaces.name),
-              domain=COALESCE(excluded.domain, workspaces.domain),
-              self_user_id=COALESCE(excluded.self_user_id, workspaces.self_user_id),
-              self_is_guest=excluded.self_is_guest,
-              raw_json=excluded.raw_json,
-              last_seen=excluded.last_seen,
-              updated_hlc=excluded.updated_hlc
-            """,
-            (
-                ws.workspace_key,
-                ws.team_id,
-                ws.enterprise_id,
-                ws.name,
-                ws.domain,
-                ws.self_user_id,
-                1 if ws.self_is_guest else 0,
-                raw,
-                seen_at,
-                seen_at,
-                hlc,
-            ),
-        )
-        if write_change_log and device_id:
             self.append_entity_change(
                 hlc=hlc,
                 device_id=device_id,
@@ -1288,6 +1335,9 @@ class SqliteRepository:
                     "raw": ws.raw,
                     "first_seen": seen_at,
                     "last_seen": seen_at,
+                    "field_hlcs": _load_field_hlcs(
+                        stored["field_hlcs_json"] if stored else None
+                    ),
                 },
             )
         if commit:
@@ -1301,10 +1351,12 @@ class SqliteRepository:
         *,
         device_id: str | None = None,
         write_change_log: bool = True,
-        hlc_lww: bool = False,
+        hlc_lww: bool = True,
         commit: bool = True,
+        incoming_field_hlcs: dict[str, str] | None = None,
     ) -> None:
         raw = json.dumps(ch.raw, ensure_ascii=False)
+        _ = incoming_field_hlcs
         if hlc_lww:
             existing = self._conn.execute(
                 "SELECT * FROM channels WHERE channel_id=?",
@@ -1539,11 +1591,13 @@ class SqliteRepository:
         *,
         device_id: str | None = None,
         write_change_log: bool = True,
-        hlc_lww: bool = False,
+        hlc_lww: bool = True,
         commit: bool = True,
         workspace_keys: list[str] | None = None,
+        incoming_field_hlcs: dict[str, str] | None = None,
     ) -> None:
         raw = json.dumps(user.raw, ensure_ascii=False)
+        _ = incoming_field_hlcs
         assoc_keys = list(workspace_keys or [])
         if user.workspace_key and user.workspace_key not in assoc_keys:
             assoc_keys.append(user.workspace_key)
@@ -1792,19 +1846,34 @@ class SqliteRepository:
         snapshot_id: str,
         state_sha256: str,
         commit: bool = True,
+        first_seen: str | None = None,
+        bump_count: bool = True,
     ) -> None:
-        self._conn.execute(
+        first = first_seen or seen_at
+        if bump_count:
+            conflict_sql = """
+              last_seen=MAX(message_sightings.last_seen, excluded.last_seen),
+              first_seen=MIN(message_sightings.first_seen, excluded.first_seen),
+              sightings=message_sightings.sightings + 1,
+              last_snapshot_id=excluded.last_snapshot_id,
+              last_state_sha256=excluded.last_state_sha256
             """
+        else:
+            conflict_sql = """
+              last_seen=MAX(message_sightings.last_seen, excluded.last_seen),
+              first_seen=MIN(message_sightings.first_seen, excluded.first_seen),
+              last_snapshot_id=excluded.last_snapshot_id,
+              last_state_sha256=excluded.last_state_sha256
+            """
+        self._conn.execute(
+            f"""
             INSERT INTO message_sightings(
               channel_id, ts, content_sha256, device_id, source,
               first_seen, last_seen, sightings, first_snapshot_id, last_snapshot_id,
               last_state_sha256
             ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             ON CONFLICT(channel_id, ts, content_sha256, device_id, source) DO UPDATE SET
-              last_seen=excluded.last_seen,
-              sightings=message_sightings.sightings + 1,
-              last_snapshot_id=excluded.last_snapshot_id,
-              last_state_sha256=excluded.last_state_sha256
+              {conflict_sql}
             """,
             (
                 channel_id,
@@ -1812,12 +1881,38 @@ class SqliteRepository:
                 content_sha256,
                 device_id,
                 source,
-                seen_at,
+                first,
                 seen_at,
                 snapshot_id,
                 snapshot_id,
                 state_sha256,
             ),
+        )
+        if commit:
+            self._conn.commit()
+
+    def merge_version_sighting_times(
+        self,
+        *,
+        channel_id: str,
+        ts: str,
+        content_sha256: str,
+        first_seen: str,
+        last_seen: str,
+        commit: bool = True,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE message_versions SET
+              first_seen=CASE
+                WHEN first_seen IS NULL OR first_seen='' OR first_seen > ?
+                THEN ? ELSE first_seen END,
+              last_seen=CASE
+                WHEN last_seen IS NULL OR last_seen='' OR last_seen < ?
+                THEN ? ELSE last_seen END
+            WHERE channel_id=? AND ts=? AND content_sha256=?
+            """,
+            (first_seen, first_seen, last_seen, last_seen, channel_id, ts, content_sha256),
         )
         if commit:
             self._conn.commit()
@@ -1924,8 +2019,6 @@ class SqliteRepository:
                 "reply_count": obs.reply_count,
                 "latest_reply": obs.latest_reply,
                 "reply_users": obs.reply_users,
-                "first_seen": seen_at,
-                "last_seen": seen_at,
             }
             entity_key = f"{obs.channel_id}|{obs.ts}|{obs.content_sha256}"
             self.append_entity_change(
@@ -1993,7 +2086,9 @@ class SqliteRepository:
             self.reproject_message(obs.channel_id, obs.ts)
         return existed is None
 
-    def reproject_message(self, channel_id: str, ts: str, *, commit: bool = True) -> None:
+    def reproject_message(
+        self, channel_id: str, ts: str, *, commit: bool = True
+    ) -> dict[str, Any] | None:
         rows = self._conn.execute(
             """
             SELECT * FROM message_versions WHERE channel_id=? AND ts=?
@@ -2001,7 +2096,7 @@ class SqliteRepository:
             (channel_id, ts),
         ).fetchall()
         if not rows:
-            return
+            return None
         versions = [
             VersionCandidate(
                 channel_id=r["channel_id"],
@@ -2022,7 +2117,7 @@ class SqliteRepository:
         ]
         chosen = choose_current(versions)
         if chosen is None:
-            return
+            return None
         deleted = deleted_state_for(versions, chosen)
         reply_count, latest_reply, reply_users = max_merge_thread_meta(versions)
         # workspace from channel table
@@ -2141,6 +2236,12 @@ class SqliteRepository:
             "INSERT INTO messages_trigram(rowid, search_text) VALUES (?, ?)",
             (rowid, chosen.search_text),
         )
+        meta = {
+            "previous_thread_ts": previous_thread_ts,
+            "is_new_msg": existing is None,
+            "thread_ts": chosen.thread_ts,
+            "deleted_state": deleted,
+        }
         if commit:
             self._conn.commit()
             self.refresh_message_search_docs(
@@ -2149,6 +2250,7 @@ class SqliteRepository:
                 previous_thread_ts=previous_thread_ts,
                 is_new_msg=existing is None,
             )
+        return meta
 
     def refresh_message_search_docs(
         self,
@@ -2157,6 +2259,7 @@ class SqliteRepository:
         *,
         previous_thread_ts: str | None = None,
         is_new_msg: bool | None = None,
+        commit: bool = True,
     ) -> None:
         """Best-effort search_docs refresh after a durable message projection."""
         try:
@@ -2190,7 +2293,8 @@ class SqliteRepository:
             )
             if is_root:
                 builder.refresh_reply_docs_after_parent_change(channel_id, ts)
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
         except Exception:
             pass
 

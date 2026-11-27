@@ -80,9 +80,6 @@ def apply_change_row(
             ts = str(payload.get("ts") or "")
             if ch and ts:
                 reproject.add((ch, ts))
-                # Project inside the same transaction so a later-row failure
-                # rolls back both the fact and the projection marker.
-                repo.reproject_message(ch, ts, commit=False)
         elif entity == "workspace":
             _apply_workspace(repo, payload, hlc=hlc)
         elif entity == "channel":
@@ -91,16 +88,25 @@ def apply_change_row(
             if ch:
                 for ts in repo.list_known_message_ts(ch):
                     reproject.add((ch, ts))
-                    repo.reproject_message(ch, ts, commit=False)
         elif entity == "user":
             _apply_user(repo, payload, hlc=hlc)
         elif entity == "sighting":
-            _apply_sighting(repo, payload)
+            _apply_sighting(repo, payload, authenticated_device_id=device_id)
             ch = str(payload.get("channel_id") or "")
             ts = str(payload.get("ts") or "")
             if ch and ts:
                 reproject.add((ch, ts))
-                repo.reproject_message(ch, ts, commit=False)
+        # Project + search-docs inside the same transaction so retries cannot
+        # skip committed markers while leaving search/docs missing.
+        for ch, ts in sorted(reproject):
+            meta = repo.reproject_message(ch, ts, commit=False) or {}
+            repo.refresh_message_search_docs(
+                ch,
+                ts,
+                previous_thread_ts=meta.get("previous_thread_ts"),
+                is_new_msg=bool(meta.get("is_new_msg")),
+                commit=False,
+            )
         repo._conn.commit()  # noqa: SLF001
     except Exception:
         with contextlib.suppress(Exception):
@@ -125,9 +131,6 @@ def apply_change_rows(
             touched.update(keys)
         else:
             skipped += 1
-    # Search-doc refresh after durable commits (best-effort; facts already projected).
-    for channel_id, ts in sorted(touched):
-        repo.refresh_message_search_docs(channel_id, ts)
     return {"applied": applied, "skipped": skipped, "reprojected": len(touched)}
 
 
@@ -162,7 +165,11 @@ def _apply_message_version(
         latest_reply=payload.get("latest_reply"),
         reply_users=list(payload.get("reply_users") or []),
     )
-    seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    first_seen = str(payload.get("first_seen") or "")
+    last_seen = str(payload.get("last_seen") or first_seen or "")
+    # Prefer real bounds when present; avoid inventing 1970 when both missing —
+    # sightings later repair version timestamps via merge_version_sighting_times.
+    seen_at = last_seen or first_seen or "1970-01-01T00:00:00Z"
     repo.ingest_observation(
         obs,
         device_id=device_id,
@@ -175,6 +182,15 @@ def _apply_message_version(
         commit=False,
         reproject=False,
     )
+    if first_seen or last_seen:
+        repo.merge_version_sighting_times(
+            channel_id=obs.channel_id,
+            ts=obs.ts,
+            content_sha256=obs.content_sha256,
+            first_seen=first_seen or seen_at,
+            last_seen=last_seen or seen_at,
+            commit=False,
+        )
 
 
 def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
@@ -193,8 +209,20 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
         raw=clean_raw,
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    field_hlcs = payload.get("field_hlcs")
+    incoming_field_hlcs = (
+        {str(k): str(v) for k, v in field_hlcs.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(field_hlcs, dict)
+        else None
+    )
     repo.upsert_workspace(
-        ws, hlc, seen_at, write_change_log=False, hlc_lww=True, commit=False
+        ws,
+        hlc,
+        seen_at,
+        write_change_log=False,
+        hlc_lww=True,
+        commit=False,
+        incoming_field_hlcs=incoming_field_hlcs,
     )
 
 
@@ -263,15 +291,40 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
     )
 
 
-def _apply_sighting(repo: SqliteRepository, payload: dict[str, Any]) -> None:
+def _apply_sighting(
+    repo: SqliteRepository,
+    payload: dict[str, Any],
+    *,
+    authenticated_device_id: str,
+) -> None:
+    payload_device = str(payload.get("device_id") or "")
+    if payload_device != authenticated_device_id:
+        raise ValueError(
+            "sighting payload device_id does not match authenticated sender"
+        )
+    first_seen = str(payload.get("first_seen") or payload.get("last_seen") or "")
+    last_seen = str(payload.get("last_seen") or payload.get("first_seen") or "")
+    if not last_seen:
+        raise ValueError("sighting payload missing last_seen/first_seen")
     repo.upsert_sighting_only(
         channel_id=str(payload["channel_id"]),
         ts=str(payload["ts"]),
         content_sha256=str(payload["content_sha256"]),
-        device_id=str(payload["device_id"]),
+        device_id=authenticated_device_id,
         source=str(payload.get("source") or "sync"),
-        seen_at=str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z"),
+        seen_at=last_seen,
+        first_seen=first_seen or last_seen,
         snapshot_id=str(payload.get("snapshot_id") or "sync"),
         state_sha256=str(payload.get("state_sha256") or "sync"),
+        commit=False,
+        bump_count=False,
+    )
+    # Merge sighting times into the version row used by projection.
+    repo.merge_version_sighting_times(
+        channel_id=str(payload["channel_id"]),
+        ts=str(payload["ts"]),
+        content_sha256=str(payload["content_sha256"]),
+        first_seen=first_seen or last_seen,
+        last_seen=last_seen,
         commit=False,
     )
