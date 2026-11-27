@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -150,9 +152,9 @@ def export_bundle(
     ciphertext = age_encrypt(envelope, recipients)
     name = f"bundle-{identity.device_id}-{from_seq}-{to_seq}.jsonl.zst.age"
     path = to_dir / name
-    # Atomic publish: write temp then replace so a crash cannot truncate an
-    # existing same-named bundle. Full re-exports then drop older local files.
-    tmp_path = to_dir / f".{name}.tmp"
+    # Atomic publish: unique temp then replace so concurrent exporters cannot
+    # clobber each other, and a crash cannot truncate an existing bundle.
+    tmp_path = to_dir / f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     tmp_path.write_bytes(ciphertext)
     tmp_path.replace(path)
     if since_seq <= 0:
