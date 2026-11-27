@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 from pathlib import Path
@@ -166,87 +167,98 @@ def run_daemon(
                             )
                         else:
                             _run._embedder = fresh  # type: ignore[attr-defined]
-                        # Skip search-index mutations while a CLI rebuild holds
-                        # the embedding op lock (survives nested SQLite commits).
-                        if repo.embedding_op_lock_held():
+                        # Acquire the same leased op lock as CLI rebuild so a
+                        # daemon already mid-cycle cannot embed/promote under us.
+                        lock_owner = f"daemon-{os.getpid()}"
+                        if not repo.acquire_embedding_op_lock(
+                            lock_owner, lease_s=120.0
+                        ):
                             log_event(logger, "embed_skip_op_lock")
                         else:
-                            # Drain deferred channel window rebuilds (ingest marks dirty).
                             try:
-                                from slack_cache_mcp.search.docs import SearchDocsBuilder
-
-                                rebuilt = SearchDocsBuilder(repo).rebuild_dirty_windows()
-                                if rebuilt:
-                                    log_event(
-                                        logger,
-                                        "window_docs_rebuild",
-                                        channels=len(rebuilt),
-                                        windows=sum(rebuilt.values()),
-                                    )
-                            except Exception as win_exc:
-                                log_event(
-                                    logger,
-                                    "window_docs_rebuild_error",
-                                    error=type(win_exc).__name__,
-                                )
-                            # One-time backfill: upgraded archives may have empty
-                            # search_docs while messages already exist.
-                            try:
-                                n_docs = int(
-                                    repo._conn.execute(  # noqa: SLF001
-                                        "SELECT COUNT(*) AS c FROM search_docs"
-                                    ).fetchone()["c"]
-                                )
-                                n_msgs = int(
-                                    repo._conn.execute(  # noqa: SLF001
-                                        "SELECT COUNT(*) AS c FROM messages"
-                                    ).fetchone()["c"]
-                                )
-                                flag = repo._conn.execute(  # noqa: SLF001
-                                    "SELECT value FROM meta WHERE key='search_docs_backfill'"
-                                ).fetchone()
-                                if n_msgs > 0 and (n_docs == 0 or not flag):
+                                # Drain deferred channel window rebuilds.
+                                try:
                                     from slack_cache_mcp.search.docs import (
                                         SearchDocsBuilder,
                                     )
 
-                                    counts = SearchDocsBuilder(repo).rebuild_all()
-                                    repo._conn.execute(  # noqa: SLF001
-                                        """
-                                        INSERT INTO meta(key, value) VALUES ('search_docs_backfill', '1')
-                                        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                                        """
+                                    rebuilt = (
+                                        SearchDocsBuilder(repo).rebuild_dirty_windows()
                                     )
-                                    repo._conn.commit()  # noqa: SLF001
+                                    if rebuilt:
+                                        log_event(
+                                            logger,
+                                            "window_docs_rebuild",
+                                            channels=len(rebuilt),
+                                            windows=sum(rebuilt.values()),
+                                        )
+                                except Exception as win_exc:
                                     log_event(
                                         logger,
-                                        "search_docs_backfill",
-                                        **{k: int(v) for k, v in counts.items()},
+                                        "window_docs_rebuild_error",
+                                        error=type(win_exc).__name__,
                                     )
-                            except Exception as bf_exc:
+                                # One-time backfill: upgraded archives may have empty
+                                # search_docs while messages already exist.
+                                try:
+                                    n_docs = int(
+                                        repo._conn.execute(  # noqa: SLF001
+                                            "SELECT COUNT(*) AS c FROM search_docs"
+                                        ).fetchone()["c"]
+                                    )
+                                    n_msgs = int(
+                                        repo._conn.execute(  # noqa: SLF001
+                                            "SELECT COUNT(*) AS c FROM messages"
+                                        ).fetchone()["c"]
+                                    )
+                                    flag = repo._conn.execute(  # noqa: SLF001
+                                        "SELECT value FROM meta WHERE key='search_docs_backfill'"
+                                    ).fetchone()
+                                    if n_msgs > 0 and (n_docs == 0 or not flag):
+                                        from slack_cache_mcp.search.docs import (
+                                            SearchDocsBuilder,
+                                        )
+
+                                        counts = SearchDocsBuilder(repo).rebuild_all()
+                                        repo._conn.execute(  # noqa: SLF001
+                                            """
+                                            INSERT INTO meta(key, value) VALUES ('search_docs_backfill', '1')
+                                            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                                            """
+                                        )
+                                        repo._conn.commit()  # noqa: SLF001
+                                        log_event(
+                                            logger,
+                                            "search_docs_backfill",
+                                            **{k: int(v) for k, v in counts.items()},
+                                        )
+                                except Exception as bf_exc:
+                                    log_event(
+                                        logger,
+                                        "search_docs_backfill_error",
+                                        error=type(bf_exc).__name__,
+                                    )
+                                active = getattr(_run, "_embedder", None)
+                                if active is None:
+                                    emb_result = {
+                                        "ok": False,
+                                        "embedded": 0,
+                                        "error": "embedder_unavailable",
+                                    }
+                                else:
+                                    emb_result = embed_pending(
+                                        repo, active, limit=2_048
+                                    )
                                 log_event(
                                     logger,
-                                    "search_docs_backfill_error",
-                                    error=type(bf_exc).__name__,
+                                    "embed_batch",
+                                    embedded=emb_result.get("embedded"),
+                                    model=emb_result.get("model_id"),
+                                    ok=emb_result.get("ok"),
                                 )
-                            active = getattr(_run, "_embedder", None)
-                            if active is None:
-                                emb_result = {
-                                    "ok": False,
-                                    "embedded": 0,
-                                    "error": "embedder_unavailable",
-                                }
-                            else:
-                                emb_result = embed_pending(
-                                    repo, active, limit=2_048
-                                )
-                            log_event(
-                                logger,
-                                "embed_batch",
-                                embedded=emb_result.get("embedded"),
-                                model=emb_result.get("model_id"),
-                                ok=emb_result.get("ok"),
-                            )
+                            finally:
+                                with contextlib.suppress(Exception):
+                                    repo.release_embedding_op_lock(lock_owner)
                     except Exception as emb_exc:
                         log_event(
                             logger,

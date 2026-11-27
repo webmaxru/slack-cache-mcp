@@ -215,10 +215,14 @@ def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
 
 
 def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
-    """Meta lock survives commits and blocks a second owner."""
-    assert archive.acquire_embedding_op_lock("owner-a") is True
+    """Leased lock survives commits, blocks a second owner, and expires."""
+    import json
+    import time
+
+    assert archive.acquire_embedding_op_lock("owner-a", lease_s=60.0) is True
     archive._conn.commit()  # noqa: SLF001
     assert archive.embedding_op_lock_held() is True
+    assert archive.embedding_op_lock_owned("owner-a") is True
     assert archive.acquire_embedding_op_lock("owner-b") is False
     archive.release_embedding_op_lock("owner-b")  # no-op for other owner
     assert archive.embedding_op_lock_held() is True
@@ -226,6 +230,21 @@ def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
     assert archive.embedding_op_lock_held() is False
     assert archive.acquire_embedding_op_lock("owner-b") is True
     archive.release_embedding_op_lock("owner-b")
+    # Expired lease is stealable (crash recovery).
+    archive._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO meta(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (
+            archive._EMBED_OP_LOCK_KEY,  # noqa: SLF001
+            json.dumps({"owner": "dead", "expires_at": time.time() - 10}),
+        ),
+    )
+    archive._conn.commit()  # noqa: SLF001
+    assert archive.embedding_op_lock_held() is False
+    assert archive.acquire_embedding_op_lock("owner-c") is True
+    archive.release_embedding_op_lock("owner-c")
 
 
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:

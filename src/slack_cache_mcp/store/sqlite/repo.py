@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -2440,35 +2441,81 @@ class SqliteRepository:
             raise
 
     _EMBED_OP_LOCK_KEY = "embedding_op_lock"
+    _EMBED_OP_LOCK_DEFAULT_LEASE_S = 900.0
+
+    def _parse_embedding_op_lock(
+        self, raw: str | None
+    ) -> tuple[str, float] | None:
+        """Return ``(owner, expires_at_unix)`` or None if absent/unusable."""
+        if not raw:
+            return None
+        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+            data = json.loads(raw)
+            if (
+                isinstance(data, dict)
+                and data.get("owner")
+                and data.get("expires_at") is not None
+            ):
+                return str(data["owner"]), float(data["expires_at"])
+        # Legacy plain-owner rows (no lease) are treated as expired so a
+        # crashed holder cannot block the archive forever.
+        return None
 
     def embedding_op_lock_held(self) -> bool:
-        """True when a CLI rebuild holds the cross-process embedding op lock."""
+        """True when a non-expired embedding op lease is present."""
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
         ).fetchone()
-        return bool(row and str(row["value"]))
+        parsed = self._parse_embedding_op_lock(
+            str(row["value"]) if row else None
+        )
+        return bool(parsed and parsed[1] > time.time())
 
-    def acquire_embedding_op_lock(self, owner: str) -> bool:
-        """Acquire exclusive meta lock for destructive embed rebuilds.
+    def embedding_op_lock_owned(self, owner: str) -> bool:
+        """True if ``owner`` currently holds a non-expired lease."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
+        ).fetchone()
+        parsed = self._parse_embedding_op_lock(
+            str(row["value"]) if row else None
+        )
+        return bool(
+            parsed and parsed[0] == owner and parsed[1] > time.time()
+        )
 
-        Survives nested SQLite commits inside ``rebuild_all`` / ``embed_pending``
-        so a concurrent daemon cannot promote the model mid-rebuild.
+    def acquire_embedding_op_lock(
+        self, owner: str, *, lease_s: float | None = None
+    ) -> bool:
+        """Acquire exclusive leased lock for search-index mutations.
+
+        Survives nested SQLite commits inside ``rebuild_all`` / ``embed_pending``.
+        Expired leases are stealable so a killed holder cannot block forever.
         """
+        lease = (
+            self._EMBED_OP_LOCK_DEFAULT_LEASE_S if lease_s is None else float(lease_s)
+        )
         started = self._begin_immediate()
         try:
+            now = time.time()
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
             ).fetchone()
-            if row and str(row["value"]) and str(row["value"]) != owner:
+            parsed = self._parse_embedding_op_lock(
+                str(row["value"]) if row else None
+            )
+            if parsed and parsed[0] != owner and parsed[1] > now:
                 if started:
                     self._conn.commit()
                 return False
+            payload = json.dumps(
+                {"owner": owner, "expires_at": now + max(lease, 1.0)}
+            )
             self._conn.execute(
                 """
                 INSERT INTO meta(key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
                 """,
-                (self._EMBED_OP_LOCK_KEY, owner),
+                (self._EMBED_OP_LOCK_KEY, payload),
             )
             if started:
                 self._conn.commit()
@@ -2486,7 +2533,16 @@ class SqliteRepository:
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
             ).fetchone()
-            if row and str(row["value"]) == owner:
+            parsed = self._parse_embedding_op_lock(
+                str(row["value"]) if row else None
+            )
+            # Allow release by owner even after expiry (cleanup).
+            if parsed and parsed[0] == owner:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
+                )
+            elif row and not parsed:
+                # Legacy unscoped row — clear so the archive recovers.
                 self._conn.execute(
                     "DELETE FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
                 )

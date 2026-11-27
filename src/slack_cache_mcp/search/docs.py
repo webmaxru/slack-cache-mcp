@@ -356,26 +356,42 @@ class SearchDocsBuilder:
     def _upsert_window_buckets(
         self, channel_id: str, plan: dict[str, Any], generation: int
     ) -> bool:
-        """Upsert planned buckets in small commits. False if dirty gen raced away."""
+        """Upsert planned buckets in short locked batches.
+
+        Validates the dirty generation under BEGIN IMMEDIATE *before* each
+        batch write so a concurrent rebuild cannot be overwritten by a stale
+        plan that later acks and clears the dirty marker.
+        """
         workspace_key = plan["workspace_key"]
         if workspace_key is None:
             return True
-        for i, b in enumerate(plan["buckets"], start=1):
-            self.repo.upsert_search_doc(
-                kind="window",
-                workspace_key=workspace_key,
-                channel_id=channel_id,
-                anchor_ts=b["anchor_ts"],
-                start_ts=b["start_ts"],
-                end_ts=b["end_ts"],
-                text=b["text"],
-            )
-            if i % WINDOW_PUBLISH_BATCH == 0:
-                self.repo._conn.commit()  # noqa: SLF001
+        buckets: list[dict[str, str]] = plan["buckets"]
+        for start in range(0, len(buckets), WINDOW_PUBLISH_BATCH):
+            chunk = buckets[start : start + WINDOW_PUBLISH_BATCH]
+            started = self.repo._begin_immediate()  # noqa: SLF001
+            try:
                 cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
                 if cur is None or int(cur) != int(generation):
+                    if started:
+                        self.repo._conn.commit()  # noqa: SLF001
                     return False
-        self.repo._conn.commit()  # noqa: SLF001
+                for b in chunk:
+                    self.repo.upsert_search_doc(
+                        kind="window",
+                        workspace_key=workspace_key,
+                        channel_id=channel_id,
+                        anchor_ts=b["anchor_ts"],
+                        start_ts=b["start_ts"],
+                        end_ts=b["end_ts"],
+                        text=b["text"],
+                    )
+                if started:
+                    self.repo._conn.commit()  # noqa: SLF001
+            except Exception:
+                if started:
+                    with contextlib.suppress(Exception):
+                        self.repo._conn.rollback()  # noqa: SLF001
+                raise
         return True
 
     def _finalize_window_plan(self, channel_id: str, plan: dict[str, Any]) -> int:

@@ -296,13 +296,38 @@ def rebuild_cmd(
         )
 
     try:
-        # Validate model + take cross-process op lock *before* projection mutates
-        # derived docs/embeddings. Nested commits inside rebuild_all/embed_pending
-        # release SQLite locks; the meta lock keeps the daemon from promoting.
+        # Acquire the leased op lock first, then re-check demotion under that
+        # ownership before projection can mutate derived embeddings.
         if do_all or embeddings:
             assert emb is not None
+            if not repo.acquire_embedding_op_lock(lock_owner):
+                result["ok"] = False
+                result["embeddings"] = {
+                    "ok": False,
+                    "embedded": 0,
+                    "error": "embedding_op_lock_held",
+                }
+                repo.close()
+                typer.echo(json.dumps(result, indent=2, default=str))
+                raise typer.Exit(code=1)
+            lock_held = True
             started = repo._begin_immediate()  # noqa: SLF001
             try:
+                if not repo.embedding_op_lock_owned(lock_owner):
+                    if started:
+                        repo._conn.rollback()  # noqa: SLF001
+                    result["ok"] = False
+                    result["embeddings"] = {
+                        "ok": False,
+                        "embedded": 0,
+                        "error": "embedding_op_lock_lost",
+                    }
+                    with contextlib.suppress(Exception):
+                        repo.release_embedding_op_lock(lock_owner)
+                    lock_held = False
+                    repo.close()
+                    typer.echo(json.dumps(result, indent=2, default=str))
+                    raise typer.Exit(code=1)
                 prev = repo._conn.execute(  # noqa: SLF001
                     "SELECT value FROM meta WHERE key='embedding_model'"
                 ).fetchone()
@@ -319,19 +344,8 @@ def rebuild_cmd(
                     with contextlib.suppress(Exception):
                         repo._conn.rollback()  # noqa: SLF001
                 raise
-            if not repo.acquire_embedding_op_lock(lock_owner):
-                result["ok"] = False
-                result["embeddings"] = {
-                    "ok": False,
-                    "embedded": 0,
-                    "error": "embedding_op_lock_held",
-                }
-                repo.close()
-                typer.echo(json.dumps(result, indent=2, default=str))
-                raise typer.Exit(code=1)
-            lock_held = True
 
-        # Projection after preflight so a refused demotion cannot clear embeddings.
+        # Projection only after lock + demotion check succeeded.
         if do_all or projection:
             rows = repo._conn.execute(  # noqa: SLF001
                 "SELECT DISTINCT channel_id, ts FROM message_versions"
