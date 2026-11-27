@@ -269,6 +269,89 @@ def test_doctor_skips_edge_session_storage(tmp_path: Path) -> None:
     assert report["http_cache"].get("skipped") == "edge_idb_only"
 
 
+def test_edge_beta_override_classified_win_edge(tmp_path: Path) -> None:
+    edge = tmp_path / "Microsoft" / "Edge Beta" / "User Data" / "Default"
+    build_edge_browser_profile(edge)
+    found = discover_profiles(overrides=[edge])
+    assert len(found) == 1
+    assert found[0].kind == "win-edge"
+
+
+def test_edge_snapshot_rejects_symlink_escape(tmp_path: Path) -> None:
+    src = build_edge_browser_profile(tmp_path / "Edge" / "User Data" / "Default")
+    outside = tmp_path / "outside_secret.txt"
+    outside.write_text("xoxc-FAKE-TOKEN", encoding="utf-8")
+    blob_dir = src / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob" / "1" / "00"
+    link = blob_dir / "escape"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        # Windows without symlink privilege — skip rather than false-fail.
+        import pytest
+
+        pytest.skip("symlinks unavailable")
+    mirror = tmp_path / "mirror"
+    stats = snapshot_profile(src, mirror, require_stable_blobs=False, allowlist=ALLOWLIST_EDGE_IDB)
+    assert not (mirror / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob" / "1" / "00" / "escape").exists()
+    assert any("symlink" in e for e in stats.errors)
+
+
+def test_edge_purge_removes_prior_desktop_allowlist_leftovers(tmp_path: Path) -> None:
+    src = build_edge_browser_profile(tmp_path / "Edge" / "User Data" / "Default")
+    mirror = tmp_path / "mirror"
+    # Simulate a prior mistaken desktop-allowlist ingest.
+    (mirror / "Local Storage" / "leveldb").mkdir(parents=True)
+    (mirror / "Local Storage" / "leveldb" / "CURRENT").write_text("bait", encoding="utf-8")
+    (mirror / "Session Storage").mkdir(parents=True)
+    other = mirror / "IndexedDB" / "https_other.example_0.indexeddb.leveldb"
+    other.mkdir(parents=True)
+    (other / "CURRENT").write_text("other", encoding="utf-8")
+    stats = snapshot_profile(src, mirror, require_stable_blobs=False, allowlist=ALLOWLIST_EDGE_IDB)
+    assert stats.copied > 0
+    assert not (mirror / "Local Storage").exists()
+    assert not (mirror / "Session Storage").exists()
+    assert not other.exists()
+
+
+def test_list_edge_sighted_ts_excludes_historical(tmp_path: Path) -> None:
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+
+    db = tmp_path / "archive.db"
+    repo = SqliteRepository(db)
+    repo._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO message_sightings(
+          channel_id, ts, content_sha256, device_id, source,
+          first_seen, last_seen, sightings
+        ) VALUES
+          ('C1', '1.0', 'sha-live', 'd', 'edge.idb.blob',
+           '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1),
+          ('C1', '2.0', 'sha-hist', 'd', 'edge.idb.leveldb.historical',
+           '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1)
+        """
+    )
+    repo._conn.commit()  # noqa: SLF001
+    assert repo.list_edge_sighted_ts("C1", {"1.0", "2.0"}) == {"1.0"}
+    repo.close()
+
+
+def test_daemon_reconciles_new_edge_watch_roots(tmp_path: Path) -> None:
+    from slack_cache_mcp.daemon import _watch_root_key, _watch_roots
+
+    edge = tmp_path / "Microsoft" / "Edge" / "User Data" / "Default"
+    # Before Slack IDB exists: no watch roots.
+    edge.mkdir(parents=True)
+    assert _watch_roots(edge, edge_browser=True) == []
+    build_edge_browser_profile(edge)
+    roots = _watch_roots(edge, edge_browser=True)
+    assert len(roots) == 2
+    keys = {_watch_root_key(r) for r in roots}
+    assert len(keys) == 2
+    # Desktop extras must never be watched for Edge.
+    assert all("Local Storage" not in str(r) for r in roots)
+    assert all(r.name.endswith((".blob", ".leveldb")) or ".indexeddb." in r.name for r in roots)
+
+
 def test_full_synthetic_desktop_still_works(tmp_path: Path) -> None:
     """Regression: standard desktop fixture ingest unchanged."""
     profile = build_synthetic_profile(tmp_path / "profile")

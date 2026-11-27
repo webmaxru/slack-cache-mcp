@@ -34,6 +34,7 @@ from slack_cache_mcp.desktop.slack import (
 from slack_cache_mcp.desktop.snapshot import (
     ALLOWLIST_DESKTOP,
     ALLOWLIST_EDGE_IDB,
+    SnapshotStats,
     snapshot_profile,
 )
 from slack_cache_mcp.domain.models import Channel, MessageObservation, Workspace
@@ -284,24 +285,8 @@ def _ingest_profile(
 
     edge_mode = profile.is_edge_browser
     allowlist = ALLOWLIST_EDGE_IDB if edge_mode else ALLOWLIST_DESKTOP
-    stats = snapshot_profile(
-        profile.path,
-        mirror,
-        include_http_cache=settings.capture_http_cache and not edge_mode,
-        include_notifications=settings.capture_notifications and not edge_mode,
-        http_cache_max_bytes=settings.http_cache_max_bytes,
-        allowlist=allowlist,
-    )
-    repo.upsert_source(
-        source_id,
-        device_id,
-        profile.kind,
-        redact_path(profile.path),
-        None,
-    )
+    stats = SnapshotStats()
     snapshot_id = str(ulid.new())
-    repo.begin_snapshot(snapshot_id, source_id, trigger)
-
     states_decoded = 0
     decode_errors = 0
     messages_ingested = 0
@@ -329,7 +314,26 @@ def _ingest_profile(
         for k, v in kw.items():
             bucket[k] = bucket.get(k, 0) + v
 
+    # Snapshot + ingest under one try/finally so Edge raw IDB is always scrubbed,
+    # even when setup or decode raises before the main body completes.
     try:
+        stats = snapshot_profile(
+            profile.path,
+            mirror,
+            include_http_cache=settings.capture_http_cache and not edge_mode,
+            include_notifications=settings.capture_notifications and not edge_mode,
+            http_cache_max_bytes=settings.http_cache_max_bytes,
+            allowlist=allowlist,
+        )
+        repo.upsert_source(
+            source_id,
+            device_id,
+            profile.kind,
+            redact_path(profile.path),
+            None,
+        )
+        repo.begin_snapshot(snapshot_id, source_id, trigger)
+
         teams = localstate.load_local_config_teams(mirror)
         root_ws = rootstate.load_root_workspaces(mirror)
         idb_backend_kind = detect_idb_backend(mirror)
@@ -337,7 +341,8 @@ def _ingest_profile(
         blob_root = mirror / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
         if blob_root.is_dir():
             for bf in sorted(blob_root.rglob("*")):
-                if not bf.is_file():
+                # Never follow symlinks (Edge allowlist: reject escapes out of Slack IDB).
+                if bf.is_symlink() or not bf.is_file():
                     continue
                 info, val = decode_blob_file(bf)
                 if info.error or not isinstance(val, dict):
@@ -609,51 +614,52 @@ def _ingest_profile(
                 device_id=device_id,
             )
             known_keys.add(key)
+
+        for src_name, counts in yield_counts.items():
+            repo.record_source_yield(
+                snapshot_id,
+                src_name,
+                messages=int(counts.get("messages", 0)),
+                files=int(counts.get("files", 0)),
+                canvases=int(counts.get("canvases", 0)),
+                reactions=int(counts.get("reactions", 0)),
+                saved_items=int(counts.get("saved_items", 0)),
+                drafts=int(counts.get("drafts", 0)),
+                cache_entries=int(counts.get("cache_entries", 0)),
+                errors=int(counts.get("errors", 0)),
+            )
+
+        repo.finish_snapshot(
+            snapshot_id,
+            files_copied=stats.copied,
+            bytes_copied=stats.bytes,
+            states_decoded=states_decoded,
+            decode_errors=decode_errors,
+            stats_json=json.dumps(
+                {
+                    "skipped_lock": stats.skipped_lock,
+                    "skipped_unchanged": stats.skipped_unchanged,
+                    "skipped_known_generations": skipped_known,
+                    "generations_new": generations_new,
+                    "vault_writes": vault_writes,
+                    "suspected_marked": suspected_marked,
+                    "errors": stats.errors[:20],
+                    "messages_ingested": messages_ingested,
+                    "primary": profile.primary,
+                    "trigger": trigger,
+                    "idb_backend": idb_backend_kind,
+                    "source_yield": yield_counts,
+                    "allowlist": allowlist,
+                    "kind": profile.kind,
+                }
+            ),
+        )
     finally:
         _scrub_credential_scratch(mirror)
         if edge_mode:
             # Raw Edge IndexedDB blobs can hold tokens inside Redux; drop after sanitize/vault.
             _scrub_edge_raw_idb(mirror)
 
-    for src_name, counts in yield_counts.items():
-        repo.record_source_yield(
-            snapshot_id,
-            src_name,
-            messages=int(counts.get("messages", 0)),
-            files=int(counts.get("files", 0)),
-            canvases=int(counts.get("canvases", 0)),
-            reactions=int(counts.get("reactions", 0)),
-            saved_items=int(counts.get("saved_items", 0)),
-            drafts=int(counts.get("drafts", 0)),
-            cache_entries=int(counts.get("cache_entries", 0)),
-            errors=int(counts.get("errors", 0)),
-        )
-
-    repo.finish_snapshot(
-        snapshot_id,
-        files_copied=stats.copied,
-        bytes_copied=stats.bytes,
-        states_decoded=states_decoded,
-        decode_errors=decode_errors,
-        stats_json=json.dumps(
-            {
-                "skipped_lock": stats.skipped_lock,
-                "skipped_unchanged": stats.skipped_unchanged,
-                "skipped_known_generations": skipped_known,
-                "generations_new": generations_new,
-                "vault_writes": vault_writes,
-                "suspected_marked": suspected_marked,
-                "errors": stats.errors[:20],
-                "messages_ingested": messages_ingested,
-                "primary": profile.primary,
-                "trigger": trigger,
-                "idb_backend": idb_backend_kind,
-                "source_yield": yield_counts,
-                "allowlist": allowlist,
-                "kind": profile.kind,
-            }
-        ),
-    )
     return {
         "source": redact_path(profile.path),
         "kind": profile.kind,

@@ -11,6 +11,7 @@ from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend
 from slack_cache_mcp.desktop.chromium.idb_values import decode_blob_file, idb_origin_dir_name
 from slack_cache_mcp.desktop.locate import discover_profiles, redact_path
 from slack_cache_mcp.desktop.slack import localstate, redux, session_scan
+from slack_cache_mcp.desktop.snapshot import _resolved_under
 
 
 def run_doctor(settings: Settings) -> dict[str, Any]:
@@ -33,9 +34,12 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
         edge_only = p.is_edge_browser
         backend = detect_idb_backend(p.path, slack_origin_only=edge_only)
         blob_root = p.path / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
-        if blob_root.is_dir():
+        if blob_root.is_dir() and not blob_root.is_symlink():
             for bf in blob_root.rglob("*"):
-                if not bf.is_file():
+                # Never follow symlink escapes (esp. Edge Slack-origin trees).
+                if bf.is_symlink() or not bf.is_file():
+                    continue
+                if edge_only and not _resolved_under(bf, blob_root):
                     continue
                 info, val = decode_blob_file(bf)
                 key = f"blink={info.blink_version},v8={info.v8_version}"

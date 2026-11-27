@@ -1438,7 +1438,11 @@ class SqliteRepository:
         return int(row["c"]) if row else 0
 
     def list_edge_sighted_ts(self, channel_id: str, candidates: set[str]) -> set[str]:
-        """Return subset of ``candidates`` that have at least one ``edge.*`` sighting."""
+        """Return subset of ``candidates`` with a *live* ``edge.*`` sighting.
+
+        Excludes historical/deleted LevelDB provenance (``%historical%``) so stale
+        Edge tombstones cannot block desktop suspected-deletion.
+        """
         if not candidates:
             return set()
         out: set[str] = set()
@@ -1450,7 +1454,10 @@ class SqliteRepository:
             rows = self._conn.execute(
                 f"""
                 SELECT DISTINCT ts FROM message_sightings
-                WHERE channel_id=? AND source LIKE 'edge.%' AND ts IN ({placeholders})
+                WHERE channel_id=?
+                  AND source LIKE 'edge.%'
+                  AND source NOT LIKE '%historical%'
+                  AND ts IN ({placeholders})
                 """,
                 (channel_id, *chunk),
             ).fetchall()

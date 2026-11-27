@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import shutil
@@ -118,6 +119,80 @@ FORBIDDEN_BROWSER_NAME_PARTS = frozenset(
 )
 
 
+def _resolved_under(path: Path, root: Path) -> bool:
+    """True when ``path`` resolves to a real file/dir strictly under ``root`` (no symlink escape)."""
+    try:
+        if path.is_symlink():
+            return False
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+        return root_resolved in resolved.parents or resolved == root_resolved
+    except OSError:
+        return False
+
+
+def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> None:
+    """Remove mirror files/dirs outside the Slack-origin IDB trees; prune manifest entries."""
+    allowed_resolved: list[Path] = []
+    for root in allowed_roots:
+        with contextlib.suppress(OSError):
+            if root.exists():
+                allowed_resolved.append(root.resolve())
+    idb = mirror / "IndexedDB"
+    if idb.is_dir():
+        for child in list(idb.iterdir()):
+            keep = False
+            with contextlib.suppress(OSError):
+                cres = child.resolve()
+                keep = any(cres == a or a in cres.parents or cres in a.parents for a in allowed_resolved)
+            if not keep:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        child.unlink()
+    # Drop any non-IndexedDB top-level leftovers from a prior desktop-allowlist mistake.
+    for name in (
+        "Local Storage",
+        "Session Storage",
+        "Cache",
+        "Cookies",
+        "Local State",
+        "Login Data",
+        "Network",
+        "storage",
+        "Notifications",
+    ):
+        p = mirror / name
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            with contextlib.suppress(OSError):
+                p.unlink()
+    manifest_path = mirror / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return
+    origin = idb_origin_dir_name()
+    keep_prefixes = (
+        f"IndexedDB/{origin}.blob/",
+        f"IndexedDB/{origin}.leveldb/",
+    )
+    for key in list(files):
+        ks = str(key).replace("\\", "/")
+        if not any(ks.startswith(pref) or ks == pref.rstrip("/") for pref in keep_prefixes):
+            files.pop(key, None)
+    data["files"] = files
+    data["allowlist"] = ALLOWLIST_EDGE_IDB
+    _save_manifest(manifest_path, data)
+
+
 def snapshot_profile(
     source: Path,
     mirror: Path,
@@ -153,6 +228,14 @@ def snapshot_profile(
         # Opt-in flags are ignored for browser sources (no HTTP cache / notif from Edge).
         include_http_cache = False
         include_notifications = False
+        # Drop leftovers if this mirror was previously ingested under the desktop allowlist.
+        _purge_edge_mirror_extras(
+            mirror,
+            [mirror / "IndexedDB" / f"{origin}.blob", mirror / "IndexedDB" / f"{origin}.leveldb"],
+        )
+        # Reload manifest after purge.
+        manifest = _load_manifest(manifest_path)
+        files_meta = dict(manifest.get("files") or {})
     else:
         allow_trees = [
             source / "IndexedDB",
@@ -179,13 +262,19 @@ def snapshot_profile(
             allow_files.append(source / "Notifications" / "notifications_win.json")
             allow_files.append(source / "notifications_win.json")
 
-    def handle_file(src_file: Path, rel: Path, *, is_blob: bool) -> None:
+    def handle_file(src_file: Path, rel: Path, *, is_blob: bool, allow_root: Path | None) -> None:
         nonlocal stats
         if src_file.name == "LOCK":
             stats.skipped_lock += 1
             return
         rel_s = rel.as_posix()
         if allowlist == ALLOWLIST_EDGE_IDB:
+            # Never follow symlinks out of the Slack-origin IDB trees.
+            if src_file.is_symlink() or (
+                allow_root is not None and not _resolved_under(src_file, allow_root)
+            ):
+                stats.errors.append(f"{rel_s}: symlink or escaped allow root")
+                return
             # Defence in depth: refuse any credential-shaped relative path.
             parts = set(rel.parts)
             if parts & FORBIDDEN_BROWSER_NAME_PARTS:
@@ -234,6 +323,10 @@ def snapshot_profile(
             stats.missing.append(tree.name)
             continue
         for p in tree.rglob("*"):
+            if p.is_symlink():
+                if allowlist == ALLOWLIST_EDGE_IDB:
+                    stats.errors.append(f"{p.relative_to(source).as_posix()}: symlink skipped")
+                continue
             if not p.is_file():
                 continue
             rel = p.relative_to(source)
@@ -248,13 +341,18 @@ def snapshot_profile(
                     stats.errors.append(f"{rel.as_posix()}: http cache size cap")
                     continue
                 cache_bytes += sz
-            handle_file(p, rel, is_blob=is_blob)
+            handle_file(
+                p,
+                rel,
+                is_blob=is_blob,
+                allow_root=tree if allowlist == ALLOWLIST_EDGE_IDB else None,
+            )
 
     for f in allow_files:
         if not f.exists():
             stats.missing.append(f.as_posix())
             continue
-        handle_file(f, f.relative_to(source), is_blob=False)
+        handle_file(f, f.relative_to(source), is_blob=False, allow_root=None)
 
     # Note: files that disappear from source are NOT removed from mirror.
     stats.files = files_meta

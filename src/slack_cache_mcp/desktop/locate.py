@@ -14,6 +14,16 @@ from slack_cache_mcp.desktop.chromium.idb_values import idb_origin_dir_name
 # Browser Chromium sources use IndexedDB-only snapshot allowlists (never credentials).
 BROWSER_EDGE_KINDS = frozenset({"win-edge"})
 
+# Microsoft Edge channel install directory names under %LOCALAPPDATA%\Microsoft\.
+_EDGE_CHANNEL_DIRS = frozenset(
+    {
+        "edge",
+        "edge beta",
+        "edge dev",
+        "edge sxs",  # Canary
+    }
+)
+
 
 @dataclass(frozen=True)
 class SlackProfile:
@@ -31,6 +41,9 @@ class SlackProfile:
 def _is_valid_profile(path: Path) -> bool:
     origin = idb_origin_dir_name()
     idb_current = path / "IndexedDB" / f"{origin}.leveldb" / "CURRENT"
+    # Reject symlink CURRENT (must be a real file under the Slack origin tree).
+    if idb_current.is_symlink():
+        return False
     root_state = path / "storage" / "root-state.json"
     return idb_current.is_file() or root_state.is_file()
 
@@ -41,6 +54,8 @@ def _idb_mtime(path: Path) -> int:
     newest = 0
     if idb.is_dir():
         for p in idb.rglob("*"):
+            if p.is_symlink():
+                continue
             if p.is_file():
                 try:
                     newest = max(newest, p.stat().st_mtime_ns)
@@ -50,36 +65,46 @@ def _idb_mtime(path: Path) -> int:
 
 
 def windows_edge_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
-    """Microsoft Edge Default profile when Slack https_app IndexedDB is present (M5.1).
+    """Microsoft Edge channel Default profiles (Stable/Beta/Dev/Canary).
 
     Chrome User Data is intentionally out of scope for M5.1.
     """
     e = env if env is not None else dict(os.environ)
     local = Path(e["LOCALAPPDATA"]) if e.get("LOCALAPPDATA") else local_appdata()
-    # Edge Chromium user-data Default — Slack web app.slack.com IDB lives here.
-    edge_default = local / "Microsoft" / "Edge" / "User Data" / "Default"
-    return [(edge_default, "win-edge")]
+    microsoft = local / "Microsoft"
+    out: list[tuple[Path, str]] = []
+    # Known channel folder names (literal casing as installed on Windows).
+    for channel in ("Edge", "Edge Beta", "Edge Dev", "Edge SxS"):
+        out.append((microsoft / channel / "User Data" / "Default", "win-edge"))
+    return out
+
+
+def _is_edge_channel_dir(name: str) -> bool:
+    n = name.lower()
+    return n in _EDGE_CHANNEL_DIRS or n.startswith("edge ")
 
 
 def _path_looks_like_edge_user_data(path: Path) -> bool:
-    """True when path (or a resolved target) is under Edge/User Data (symlink-safe)."""
+    """True when path (or a resolved target) is under an Edge*/User Data tree."""
     candidates = [Path(path)]
     with contextlib.suppress(OSError):
         candidates.append(Path(path).resolve())
     for cand in candidates:
-        parts_lower = [p.lower() for p in cand.parts]
-        try:
-            edge_idx = parts_lower.index("edge")
-        except ValueError:
-            continue
-        # .../Edge/User Data/...
-        if edge_idx + 1 < len(parts_lower) and parts_lower[edge_idx + 1] == "user data":
-            return True
+        parts = list(cand.parts)
+        parts_lower = [p.lower() for p in parts]
+        for i, part in enumerate(parts_lower):
+            # .../<Edge channel>/User Data/...
+            if _is_edge_channel_dir(part) and i + 1 < len(parts_lower):
+                if parts_lower[i + 1] == "user data":
+                    return True
+            # .../User Data/... preceded by an Edge channel dir
+            if part == "user data" and i > 0 and _is_edge_channel_dir(parts_lower[i - 1]):
+                return True
     return False
 
 
 def infer_override_kind(path: Path) -> str:
-    """Classify a config/CLI override path (Edge Default → win-edge; else override)."""
+    """Classify a config/CLI override path (any Edge channel → win-edge; else override)."""
     if _path_looks_like_edge_user_data(path):
         return "win-edge"
     return "override"
