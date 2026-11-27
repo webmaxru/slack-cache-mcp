@@ -52,6 +52,10 @@ def _ts_num(ts: str) -> float:
 # Sentinel field clock for migrated values with unknown provenance. Stable across
 # later unrelated row-HLC bumps; remote observations never overwrite it.
 _UNKNOWN_FIELD_HLC = "*"
+# Bumped by directory clock repair; peers with a lower epoch have their field
+# clocks ignored, and a higher epoch force-applies values (receiver-side repair).
+_DIRECTORY_CLOCK_EPOCH_META = "directory_clock_epoch"
+_DIRECTORY_CLOCK_EPOCH_REPAIR = 1
 
 
 def _hlc_dominates(incoming: str, existing: str | None) -> bool:
@@ -93,17 +97,6 @@ def _real_field_hlc(clock: str | None) -> str | None:
     if not clock or clock == _UNKNOWN_FIELD_HLC:
         return None
     return clock
-
-
-def _prefer_real_hlc(left: str | None, right: str | None) -> str | None:
-    """Pick the dominating real field clock; ``*`` / empty never win."""
-    a = _real_field_hlc(left)
-    b = _real_field_hlc(right)
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return a if _hlc_dominates(a, b) else b
 
 
 def _merge_sparse_field(
@@ -414,20 +407,65 @@ class SqliteRepository:
                 )
         self._pin_unknown_directory_field_hlcs()
 
-    def _pin_unknown_directory_field_hlcs(self) -> None:
-        """Preserve known field clocks; pin only unknown non-null fields to ``*``.
+    def directory_clock_epoch(self) -> int:
+        raw = self.get_meta(_DIRECTORY_CLOCK_EPOCH_META)
+        if raw is None:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
 
-        Recovery protocol after earlier migrations that invented or wiped clocks:
-        1. Collect the best real field HLC from table state and ``change_log`` payloads.
-        2. Write that map back (missing non-null fields → ``*``).
-        3. Mark ``v5-pending-outbox-purge`` so the next ``backfill_outbox`` drops
-           local directory outbox rows (fabricated facts) and rebuilds them from
-           the repaired table clocks. Peer ``change_log`` markers are kept.
+    def set_directory_clock_epoch(self, epoch: int, *, commit: bool = False) -> None:
+        self.set_meta(_DIRECTORY_CLOCK_EPOCH_META, str(int(epoch)), commit=commit)
+
+    def invalidate_directory_field_clocks(self, *, commit: bool = False) -> None:
+        """Pin every non-null directory field to ``*`` (epoch repair)."""
+        specs: list[tuple[str, str, tuple[str, ...]]] = [
+            (
+                "workspaces",
+                "workspace_key",
+                ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
+            ),
+            (
+                "channels",
+                "channel_id",
+                ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
+            ),
+            (
+                "users",
+                "user_id",
+                ("team_id", "name", "real_name", "display_name", "title", "tz"),
+            ),
+        ]
+        for table, pk, fields in specs:
+            for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
+                repaired = {
+                    field: _UNKNOWN_FIELD_HLC for field in fields if row[field] is not None
+                }
+                self._conn.execute(
+                    f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                    (_dump_field_hlcs(repaired), row[pk]),
+                )
+        if commit:
+            self._conn.commit()
+
+    def _pin_unknown_directory_field_hlcs(self) -> None:
+        """Repair directory provenance via value+clock recovery, then epoch bump.
+
+        1. Restore each field's value from the ``(value, clock)`` pair that holds
+           the dominating real clock in ``change_log`` (never attach a clock to a
+           mismatched current value).
+        2. Bump ``directory_clock_epoch`` and pin all field clocks to ``*`` so
+           fabricated historical clocks cannot be re-exported as trusted.
+        3. Mark ``v6-pending-outbox-purge`` so the next ``backfill_outbox`` drops
+           local directory outbox rows and rebuilds them with the new epoch.
+           Peer ``change_log`` markers are kept. Receivers honour the epoch.
         """
         policy = self.get_meta("field_hlcs_policy")
         if policy in (
-            "v5-preserve-known-rebuild-outbox",
-            "v5-pending-outbox-purge",
+            "v6-epoch-repair",
+            "v6-pending-outbox-purge",
         ):
             return
         specs: list[tuple[str, str, str, tuple[str, ...]]] = [
@@ -450,7 +488,8 @@ class SqliteRepository:
                 ("team_id", "name", "real_name", "display_name", "title", "tz"),
             ),
         ]
-        recovered: dict[tuple[str, str, str], str] = {}
+        # Best (value, clock) per field from outbox history — clock and value stay paired.
+        recovered: dict[tuple[str, str, str], tuple[Any, str]] = {}
         for entity in ("workspace", "channel", "user"):
             for row in self._conn.execute(
                 "SELECT entity_key, payload_json FROM change_log WHERE entity=?",
@@ -471,29 +510,36 @@ class SqliteRepository:
                     real = _real_field_hlc(clock)
                     if real is None:
                         continue
+                    value = payload.get(field)
+                    if value is None:
+                        continue
                     key = (entity, str(row["entity_key"]), field)
-                    preferred = _prefer_real_hlc(recovered.get(key), real)
-                    if preferred is not None:
-                        recovered[key] = preferred
+                    prev = recovered.get(key)
+                    if prev is None or _hlc_dominates(real, prev[1]):
+                        recovered[key] = (value, real)
 
         for table, entity, pk, fields in specs:
             for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
-                current = _load_field_hlcs(row["field_hlcs_json"])
-                repaired: dict[str, str] = {}
+                updates: dict[str, Any] = {}
                 for field in fields:
-                    if row[field] is None:
+                    pair = recovered.get((entity, str(row[pk]), field))
+                    if pair is None:
                         continue
-                    best = _prefer_real_hlc(
-                        current.get(field),
-                        recovered.get((entity, str(row[pk]), field)),
+                    value, _clock = pair
+                    if row[field] != value:
+                        updates[field] = value
+                if updates:
+                    assignments = ", ".join(f"{col}=?" for col in updates)
+                    self._conn.execute(
+                        f"UPDATE {table} SET {assignments} WHERE {pk}=?",
+                        (*updates.values(), row[pk]),
                     )
-                    repaired[field] = best if best is not None else _UNKNOWN_FIELD_HLC
-                self._conn.execute(
-                    f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
-                    (_dump_field_hlcs(repaired), row[pk]),
-                )
-        # Defer local directory outbox purge until export (needs device_id).
-        self.set_meta("field_hlcs_policy", "v5-pending-outbox-purge", commit=False)
+        # Invalidate all clocks (fabricated or not); epoch carries repair authority.
+        self.invalidate_directory_field_clocks(commit=False)
+        current_epoch = self.directory_clock_epoch()
+        if current_epoch < _DIRECTORY_CLOCK_EPOCH_REPAIR:
+            self.set_directory_clock_epoch(_DIRECTORY_CLOCK_EPOCH_REPAIR, commit=False)
+        self.set_meta("field_hlcs_policy", "v6-pending-outbox-purge", commit=False)
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -753,7 +799,7 @@ class SqliteRepository:
         from slack_cache_mcp.domain.models import Channel, User, Workspace
 
         policy = self.get_meta("field_hlcs_policy")
-        if policy == "v5-pending-outbox-purge":
+        if policy in ("v6-pending-outbox-purge", "v5-pending-outbox-purge"):
             # Drop fabricated local directory facts; peer markers stay for idempotency.
             self._conn.execute(
                 """
@@ -778,9 +824,7 @@ class SqliteRepository:
                 """,
                 (_utc_now(),),
             )
-            self.set_meta(
-                "field_hlcs_policy", "v5-preserve-known-rebuild-outbox", commit=False
-            )
+            self.set_meta("field_hlcs_policy", "v6-epoch-repair", commit=False)
             self._conn.commit()
 
         self.delete_incomplete_local_message_outbox(device_id)
@@ -844,6 +888,7 @@ class SqliteRepository:
                     "first_seen": r["first_seen"],
                     "last_seen": r["last_seen"],
                     "field_hlcs": field_hlcs,
+                    "clock_epoch": self.directory_clock_epoch(),
                 },
             ):
                 counts["workspaces"] += 1
@@ -973,6 +1018,7 @@ class SqliteRepository:
                     "first_seen": r["first_seen"],
                     "last_seen": r["last_seen"],
                     "field_hlcs": field_hlcs,
+                    "clock_epoch": self.directory_clock_epoch(),
                 },
             ):
                 counts["channels"] += 1
@@ -1068,6 +1114,7 @@ class SqliteRepository:
                     "first_seen": r["first_seen"],
                     "last_seen": r["last_seen"],
                     "field_hlcs": field_hlcs,
+                    "clock_epoch": self.directory_clock_epoch(),
                 },
             ):
                 counts["users"] += 1
@@ -1487,6 +1534,8 @@ class SqliteRepository:
         hlc_lww: bool = True,
         commit: bool = True,
         incoming_field_hlcs: dict[str, str] | None = None,
+        force_fields: bool = False,
+        fill_nulls_only: bool = False,
     ) -> None:
         raw = json.dumps(ws.raw, ensure_ascii=False)
         _ = hlc_lww  # always maintain per-field clocks
@@ -1536,6 +1585,21 @@ class SqliteRepository:
             field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
             def _take(field: str, current: Any, incoming: Any) -> Any:
+                if fill_nulls_only:
+                    if current is not None or incoming is None:
+                        return current
+                    field_hlcs[field] = _UNKNOWN_FIELD_HLC
+                    return incoming
+                if force_fields:
+                    if incoming is None:
+                        return current
+                    forced = (
+                        incoming_field_hlcs.get(field)
+                        if incoming_field_hlcs is not None
+                        else None
+                    )
+                    field_hlcs[field] = forced if forced else _UNKNOWN_FIELD_HLC
+                    return incoming
                 if incoming_field_hlcs is not None:
                     clock_in: str | None = incoming_field_hlcs.get(field)
                     replace_unknown = False
@@ -1621,6 +1685,7 @@ class SqliteRepository:
                             for k, v in _load_field_hlcs(stored["field_hlcs_json"]).items()
                             if v and v != _UNKNOWN_FIELD_HLC
                         },
+                        "clock_epoch": self.directory_clock_epoch(),
                     },
                 )
         if commit:
@@ -1637,6 +1702,8 @@ class SqliteRepository:
         hlc_lww: bool = True,
         commit: bool = True,
         incoming_field_hlcs: dict[str, str] | None = None,
+        force_fields: bool = False,
+        fill_nulls_only: bool = False,
     ) -> None:
         raw = json.dumps(ch.raw, ensure_ascii=False)
         if hlc_lww:
@@ -1697,6 +1764,21 @@ class SqliteRepository:
                 field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
                 def _take(field: str, current: Any, incoming: Any) -> Any:
+                    if fill_nulls_only:
+                        if current is not None or incoming is None:
+                            return current
+                        field_hlcs[field] = _UNKNOWN_FIELD_HLC
+                        return incoming
+                    if force_fields:
+                        if incoming is None:
+                            return current
+                        forced = (
+                            incoming_field_hlcs.get(field)
+                            if incoming_field_hlcs is not None
+                            else None
+                        )
+                        field_hlcs[field] = forced if forced else _UNKNOWN_FIELD_HLC
+                        return incoming
                     if incoming_field_hlcs is not None:
                         clock_in: str | None = incoming_field_hlcs.get(field)
                         replace_unknown = False
@@ -1831,6 +1913,7 @@ class SqliteRepository:
                                 ).items()
                                 if v and v != _UNKNOWN_FIELD_HLC
                             },
+                            "clock_epoch": self.directory_clock_epoch(),
                         },
                     )
             if commit:
@@ -1927,6 +2010,8 @@ class SqliteRepository:
         commit: bool = True,
         workspace_keys: list[str] | None = None,
         incoming_field_hlcs: dict[str, str] | None = None,
+        force_fields: bool = False,
+        fill_nulls_only: bool = False,
     ) -> None:
         raw = json.dumps(user.raw, ensure_ascii=False)
         assoc_keys = list(workspace_keys or [])
@@ -1986,6 +2071,21 @@ class SqliteRepository:
                 field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
                 def _take(field: str, current: Any, incoming: Any) -> Any:
+                    if fill_nulls_only:
+                        if current is not None or incoming is None:
+                            return current
+                        field_hlcs[field] = _UNKNOWN_FIELD_HLC
+                        return incoming
+                    if force_fields:
+                        if incoming is None:
+                            return current
+                        forced = (
+                            incoming_field_hlcs.get(field)
+                            if incoming_field_hlcs is not None
+                            else None
+                        )
+                        field_hlcs[field] = forced if forced else _UNKNOWN_FIELD_HLC
+                        return incoming
                     if incoming_field_hlcs is not None:
                         clock_in: str | None = incoming_field_hlcs.get(field)
                         replace_unknown = False
@@ -2115,6 +2215,7 @@ class SqliteRepository:
                                 ).items()
                                 if v and v != _UNKNOWN_FIELD_HLC
                             },
+                            "clock_epoch": self.directory_clock_epoch(),
                         },
                     )
             if commit:

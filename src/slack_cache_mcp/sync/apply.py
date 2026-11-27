@@ -214,6 +214,28 @@ def _apply_message_version(
     )
 
 
+def _directory_clock_mode(
+    repo: SqliteRepository, payload: dict[str, Any], incoming_field_hlcs: dict[str, str]
+) -> tuple[dict[str, str], bool, bool]:
+    """Resolve field-clock handling from ``clock_epoch`` vs local repair epoch.
+
+    Returns ``(clocks, force_fields, fill_nulls_only)``.
+    """
+    try:
+        incoming_epoch = int(payload.get("clock_epoch") or 0)
+    except (TypeError, ValueError):
+        incoming_epoch = 0
+    local_epoch = repo.directory_clock_epoch()
+    if incoming_epoch < local_epoch:
+        # Obsolete / pre-repair facts: never trust their clocks; only fill nulls.
+        return {}, False, True
+    if incoming_epoch > local_epoch:
+        repo.set_directory_clock_epoch(incoming_epoch, commit=False)
+        repo.invalidate_directory_field_clocks(commit=False)
+        return incoming_field_hlcs, True, False
+    return incoming_field_hlcs, False, False
+
+
 def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
@@ -236,6 +258,9 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
         if isinstance(field_hlcs, dict)
         else {}
     )
+    clocks, force_fields, fill_nulls_only = _directory_clock_mode(
+        repo, payload, incoming_field_hlcs
+    )
     repo.upsert_workspace(
         ws,
         hlc,
@@ -243,7 +268,9 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
         write_change_log=False,
         hlc_lww=True,
         commit=False,
-        incoming_field_hlcs=incoming_field_hlcs,
+        incoming_field_hlcs=clocks,
+        force_fields=force_fields,
+        fill_nulls_only=fill_nulls_only,
     )
 
 
@@ -273,6 +300,9 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         if isinstance(field_hlcs, dict)
         else {}
     )
+    clocks, force_fields, fill_nulls_only = _directory_clock_mode(
+        repo, payload, incoming_field_hlcs
+    )
     repo.upsert_channel(
         ch,
         hlc,
@@ -280,7 +310,9 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         write_change_log=False,
         hlc_lww=True,
         commit=False,
-        incoming_field_hlcs=incoming_field_hlcs,
+        incoming_field_hlcs=clocks,
+        force_fields=force_fields,
+        fill_nulls_only=fill_nulls_only,
     )
     # Union observations independent of the LWW projection.
     for wk in payload.get("workspace_keys") or []:
@@ -356,6 +388,9 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         if isinstance(field_hlcs, dict)
         else {}
     )
+    clocks, force_fields, fill_nulls_only = _directory_clock_mode(
+        repo, payload, incoming_field_hlcs
+    )
     repo.upsert_user(
         user,
         hlc,
@@ -364,7 +399,9 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         hlc_lww=True,
         commit=False,
         workspace_keys=keys,
-        incoming_field_hlcs=incoming_field_hlcs,
+        incoming_field_hlcs=clocks,
+        force_fields=force_fields,
+        fill_nulls_only=fill_nulls_only,
     )
 
 

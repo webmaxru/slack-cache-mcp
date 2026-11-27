@@ -556,7 +556,7 @@ def test_export_sequence_bounds_independent_of_entity_order(tmp_path: Path) -> N
     )
     repo.set_sync_cursor("folder", "push", "0")
     # Skip migration purge side-effects for this bounds check.
-    repo.set_meta("field_hlcs_policy", "v5-preserve-known-rebuild-outbox")
+    repo.set_meta("field_hlcs_policy", "v6-epoch-repair")
     exported = export_bundle(repo, identity=identity, to_dir=folder)
     assert exported["ok"] is True
     assert exported["exported"] >= 2
@@ -567,8 +567,8 @@ def test_export_sequence_bounds_independent_of_entity_order(tmp_path: Path) -> N
     repo.close()
 
 
-def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) -> None:
-    """v5 recovery keeps real clocks, stars only gaps, rebuilds local directory outbox."""
+def test_field_hlcs_migration_restores_value_clock_pairs_and_epoch(tmp_path: Path) -> None:
+    """v6 restores dominating (value, clock) pairs, stars clocks, bumps epoch, rebuilds outbox."""
     from slack_cache_mcp.store.sqlite.repo import _UNKNOWN_FIELD_HLC, _load_field_hlcs
 
     db = tmp_path / "a.db"
@@ -576,6 +576,7 @@ def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) 
     identity = ensure_local_device(repo, tmp_path / "a")
     good = "1700000000000-20-new"
     fabricated = "1700000000000-30-old"
+    # Table holds wrong value after a bad LWW; outbox still has the good pair.
     repo._conn.execute(  # noqa: SLF001
         """
         INSERT INTO workspaces(
@@ -586,17 +587,16 @@ def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) 
         (
             "W1",
             "T1",
-            "kept",
+            "wrong",
             "U1",
             "2026-11-27T12:00:00Z",
             "2026-11-27T12:00:00Z",
-            good,
+            fabricated,
             json.dumps({"name": _UNKNOWN_FIELD_HLC, "team_id": good}),
         ),
     )
-    # Outbox still has the pre-star real name clock plus a fabricated domain clock.
     repo.append_entity_change(
-        hlc=fabricated,
+        hlc=good,
         device_id=identity.device_id,
         entity="workspace",
         entity_key="W1",
@@ -604,11 +604,10 @@ def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) 
             "workspace_key": "W1",
             "team_id": "T1",
             "name": "kept",
-            "domain": "invented.example",
             "self_user_id": "U1",
             "self_is_guest": False,
             "raw": {},
-            "field_hlcs": {"name": good, "domain": fabricated, "team_id": good},
+            "field_hlcs": {"name": good, "team_id": good},
         },
     )
     repo.set_meta("field_hlcs_policy", "v4-star-all-fields")
@@ -617,20 +616,19 @@ def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) 
 
     repo2 = SqliteRepository(db)
     row = repo2._conn.execute(  # noqa: SLF001
-        "SELECT field_hlcs_json, name, domain FROM workspaces WHERE workspace_key='W1'"
+        "SELECT field_hlcs_json, name FROM workspaces WHERE workspace_key='W1'"
     ).fetchone()
     assert row is not None
+    assert row["name"] == "kept"  # value restored with its clock pair
     clocks = _load_field_hlcs(row["field_hlcs_json"])
-    assert clocks.get("team_id") == good
-    assert clocks.get("name") == good  # recovered from outbox
-    assert clocks.get("self_user_id") == _UNKNOWN_FIELD_HLC
-    assert repo2.get_meta("field_hlcs_policy") == "v5-pending-outbox-purge"
+    assert clocks.get("name") == _UNKNOWN_FIELD_HLC  # clocks invalidated after restore
+    assert clocks.get("team_id") == _UNKNOWN_FIELD_HLC
+    assert repo2.directory_clock_epoch() >= 1
+    assert repo2.get_meta("field_hlcs_policy") == "v6-pending-outbox-purge"
 
-    before = repo2.change_log_count()
-    assert before >= 1
     rebuilt = repo2.backfill_outbox(device_id=identity.device_id, hlc=good)
     assert rebuilt["workspaces"] >= 1
-    assert repo2.get_meta("field_hlcs_policy") == "v5-preserve-known-rebuild-outbox"
+    assert repo2.get_meta("field_hlcs_policy") == "v6-epoch-repair"
     rows = repo2._conn.execute(  # noqa: SLF001
         """
         SELECT payload_json FROM change_log
@@ -641,10 +639,10 @@ def test_field_hlcs_migration_preserves_known_and_purges_outbox(tmp_path: Path) 
     assert rows
     for r in rows:
         payload = json.loads(r["payload_json"])
+        assert payload.get("name") == "kept"
+        assert payload.get("clock_epoch") == repo2.directory_clock_epoch()
         fh = payload.get("field_hlcs") or {}
         assert fabricated not in fh.values()
+        assert good not in fh.values()  # starred — not re-exported as trusted
         assert _UNKNOWN_FIELD_HLC not in fh.values()
-        assert fh.get("team_id") == good
-        assert fh.get("name") == good
-        assert "domain" not in fh  # null on table → not exported as clocked
     repo2.close()
