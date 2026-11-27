@@ -108,10 +108,14 @@ def _merge_sparse_field(
         return incoming_val, incoming_hlc if incoming_hlc is not None else _UNKNOWN_FIELD_HLC
     pinned = existing_field_hlc if existing_field_hlc is not None else _UNKNOWN_FIELD_HLC
     if pinned == _UNKNOWN_FIELD_HLC:
-        if replace_unknown and incoming_hlc and incoming_hlc != _UNKNOWN_FIELD_HLC:
+        # Convergent: any real HLC wins over unknown (local or peer). Two unknowns
+        # pick the lexicographically greater value for order-independence.
+        if incoming_hlc and incoming_hlc != _UNKNOWN_FIELD_HLC:
             return incoming_val, incoming_hlc
+        if str(incoming_val) > str(existing_val):
+            return incoming_val, _UNKNOWN_FIELD_HLC
         return existing_val, _UNKNOWN_FIELD_HLC
-    if incoming_hlc is None:
+    if incoming_hlc is None or incoming_hlc == _UNKNOWN_FIELD_HLC:
         return existing_val, pinned
     if _hlc_dominates(incoming_hlc, pinned):
         return incoming_val, incoming_hlc
@@ -393,7 +397,9 @@ class SqliteRepository:
         self._pin_unknown_directory_field_hlcs()
 
     def _pin_unknown_directory_field_hlcs(self) -> None:
-        """Pin ``*`` on non-null directory fields that still lack a clock."""
+        """Pin ``*`` on non-null directory fields; reset bad row-HLC seeds once."""
+        policy = self.get_meta("field_hlcs_policy")
+        reset_seeds = policy != "v2-unknown-star"
         specs: list[tuple[str, str, tuple[str, ...]]] = [
             (
                 "workspaces",
@@ -414,11 +420,18 @@ class SqliteRepository:
         for table, pk, fields in specs:
             for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
                 current = _load_field_hlcs(row["field_hlcs_json"])
+                row_hlc = str(row["updated_hlc"] or "")
                 changed = False
                 for field in fields:
                     if row[field] is None:
                         continue
-                    if field not in current:
+                    clock = current.get(field)
+                    if clock is None:
+                        current[field] = _UNKNOWN_FIELD_HLC
+                        changed = True
+                    elif reset_seeds and clock == row_hlc:
+                        # Earlier seeding attributed the whole-row HLC to retained
+                        # fields; drop that invented provenance.
                         current[field] = _UNKNOWN_FIELD_HLC
                         changed = True
                 if changed:
@@ -426,6 +439,8 @@ class SqliteRepository:
                         f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
                         (_dump_field_hlcs(current), row[pk]),
                     )
+        if reset_seeds:
+            self.set_meta("field_hlcs_policy", "v2-unknown-star", commit=False)
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -792,14 +807,13 @@ class SqliteRepository:
                 for wk in payload.get("workspace_keys") or []:
                     if isinstance(wk, str):
                         covered_ws.add(wk)
-            records = list(payload.get("alias_records") or [])
-            for alias in records:
-                if isinstance(alias, dict) and isinstance(alias.get("name"), str):
-                    name = alias["name"]
-                    seen = str(alias.get("first_seen") or "")
-                    prev = covered_alias_seen.get(name)
-                    if prev is None or (seen and (not prev or seen < prev)):
-                        covered_alias_seen[name] = seen
+                for alias in payload.get("alias_records") or []:
+                    if isinstance(alias, dict) and isinstance(alias.get("name"), str):
+                        name = alias["name"]
+                        seen = str(alias.get("first_seen") or "")
+                        prev = covered_alias_seen.get(name)
+                        if prev is None or (seen and (not prev or seen < prev)):
+                            covered_alias_seen[name] = seen
             # Dual-format coverage: require string aliases list AND earliest first_seen.
             has_string_aliases = False
             for prow2 in self._conn.execute(
@@ -813,9 +827,9 @@ class SqliteRepository:
                     p2 = json.loads(prow2["payload_json"])
                 except (TypeError, json.JSONDecodeError):
                     continue
-                if isinstance(p2, dict) and any(
-                    isinstance(a, str) for a in (p2.get("aliases") or [])
-                ):
+                if not isinstance(p2, dict):
+                    continue
+                if any(isinstance(a, str) for a in (p2.get("aliases") or [])):
                     has_string_aliases = True
                     break
             aliases_covered = has_string_aliases or not aliases
@@ -1405,8 +1419,12 @@ class SqliteRepository:
                 ("domain", ws.domain),
                 ("self_user_id", ws.self_user_id),
             ):
-                if val is not None:
-                    field_hlcs[key] = (incoming_field_hlcs or {}).get(key, hlc)
+                if val is None:
+                    continue
+                if incoming_field_hlcs is not None:
+                    field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
+                else:
+                    field_hlcs[key] = hlc
             self._conn.execute(
                 """
                 INSERT INTO workspaces(
@@ -1543,9 +1561,14 @@ class SqliteRepository:
                 (ch.channel_id,),
             ).fetchone()
             if existing is None:
-                field_hlcs: dict[str, str] = {
-                    "workspace_key": (incoming_field_hlcs or {}).get("workspace_key", hlc)
-                }
+                if incoming_field_hlcs is not None:
+                    field_hlcs = {
+                        "workspace_key": incoming_field_hlcs.get(
+                            "workspace_key", _UNKNOWN_FIELD_HLC
+                        )
+                    }
+                else:
+                    field_hlcs = {"workspace_key": hlc}
                 for key, val in (
                     ("name", ch.name),
                     ("topic", ch.topic),
@@ -1553,8 +1576,12 @@ class SqliteRepository:
                     ("im_user_id", ch.im_user_id),
                     ("context_team_id", ch.context_team_id),
                 ):
-                    if val is not None:
-                        field_hlcs[key] = (incoming_field_hlcs or {}).get(key, hlc)
+                    if val is None:
+                        continue
+                    if incoming_field_hlcs is not None:
+                        field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
+                    else:
+                        field_hlcs[key] = hlc
                 self._conn.execute(
                     """
                     INSERT INTO channels(
@@ -1827,7 +1854,7 @@ class SqliteRepository:
                 (user.user_id,),
             ).fetchone()
             if existing is None:
-                field_hlcs: dict[str, str] = {}
+                field_hlcs = {}
                 for key, val in (
                     ("name", user.name),
                     ("real_name", user.real_name),
@@ -1836,8 +1863,12 @@ class SqliteRepository:
                     ("tz", user.tz),
                     ("team_id", user.team_id),
                 ):
-                    if val is not None:
-                        field_hlcs[key] = (incoming_field_hlcs or {}).get(key, hlc)
+                    if val is None:
+                        continue
+                    if incoming_field_hlcs is not None:
+                        field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
+                    else:
+                        field_hlcs[key] = hlc
                 self._conn.execute(
                     """
                     INSERT INTO users(
