@@ -251,11 +251,13 @@ def _directory_clock_mode(
     if incoming_epoch < local_epoch and not clock_repair:
         # Obsolete / pre-repair facts: never trust their clocks; only fill nulls.
         return {}, False, True
-    if clock_repair or incoming_epoch > local_epoch:
-        # Per-fact repair authority only — do not invalidate unrelated entities.
-        if incoming_epoch > local_epoch:
-            repo.set_directory_clock_epoch(incoming_epoch, commit=False)
+    if incoming_epoch > local_epoch:
+        repo.set_directory_clock_epoch(incoming_epoch, commit=False)
+        # Newer epoch still force-applies this fact only.
         return incoming_field_hlcs, True, False
+    if clock_repair:
+        # Same-epoch repairs compete via normal field LWW (deterministic order).
+        return incoming_field_hlcs, False, False
     return incoming_field_hlcs, False, False
 
 

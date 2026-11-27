@@ -814,13 +814,15 @@ class SqliteRepository:
         from slack_cache_mcp.domain.models import Channel, User, Workspace
 
         policy = self.get_meta("field_hlcs_policy")
-        emit_clock_repair = False
-        if policy in (
+        emit_clock_repair = policy in (
             "v7-pending-outbox-purge",
             "v6-pending-outbox-purge",
             "v5-pending-outbox-purge",
-        ):
+        )
+        if emit_clock_repair:
             # Drop fabricated local directory facts; peer markers stay for idempotency.
+            # Keep policy as *-pending until rebuild finishes so a crash retries with
+            # clock_repair authority instead of ordinary backfill.
             self._conn.execute(
                 """
                 DELETE FROM change_log
@@ -844,9 +846,7 @@ class SqliteRepository:
                 """,
                 (_utc_now(),),
             )
-            self.set_meta("field_hlcs_policy", "v7-epoch-repair", commit=False)
             self._conn.commit()
-            emit_clock_repair = True
 
         self.delete_incomplete_local_message_outbox(device_id)
         counts = {
@@ -1210,6 +1210,8 @@ class SqliteRepository:
                 },
             ):
                 counts["sightings"] += 1
+        if emit_clock_repair:
+            self.set_meta("field_hlcs_policy", "v7-epoch-repair", commit=True)
         return counts
 
     def list_change_log_since(

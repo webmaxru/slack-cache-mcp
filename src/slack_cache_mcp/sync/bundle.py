@@ -150,9 +150,11 @@ def export_bundle(
     ciphertext = age_encrypt(envelope, recipients)
     name = f"bundle-{identity.device_id}-{from_seq}-{to_seq}.jsonl.zst.age"
     path = to_dir / name
-    # Publish the replacement first; only then drop older local bundles after a
-    # full re-export (cursor was 0). Incremental exports retain prior history.
-    path.write_bytes(ciphertext)
+    # Atomic publish: write temp then replace so a crash cannot truncate an
+    # existing same-named bundle. Full re-exports then drop older local files.
+    tmp_path = to_dir / f".{name}.tmp"
+    tmp_path.write_bytes(ciphertext)
+    tmp_path.replace(path)
     if since_seq <= 0:
         for stale in to_dir.glob(f"bundle-{identity.device_id}-*.jsonl.zst.age"):
             if stale.name != name:
