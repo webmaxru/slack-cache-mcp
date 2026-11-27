@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
   raw_json TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  updated_hlc TEXT NOT NULL
+  updated_hlc TEXT NOT NULL,
+  field_hlcs_json TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS channels (
   raw_json TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  updated_hlc TEXT NOT NULL
+  updated_hlc TEXT NOT NULL,
+  field_hlcs_json TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS channel_workspaces (
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS users (
   raw_json TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  updated_hlc TEXT NOT NULL
+  updated_hlc TEXT NOT NULL,
+  field_hlcs_json TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS user_workspaces (

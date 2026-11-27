@@ -394,3 +394,111 @@ def test_apply_rows_sanitizes_payload(tmp_path: Path) -> None:
     assert stats["applied"] == 1
     assert repo.scan_for_token_leak() == []
     repo.close()
+
+
+def test_device_refuses_silent_key_rotation(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    first = load_or_create_device(data, prefer_keyring=False)
+    secrets = data / "device.secrets"
+    assert secrets.is_file()
+    secrets.unlink()
+    try:
+        load_or_create_device(data, prefer_keyring=False)
+        raise AssertionError("expected RuntimeError for missing keys")
+    except RuntimeError as exc:
+        assert first.device_id in str(exc)
+        assert "refusing to rotate" in str(exc)
+
+
+def test_sparse_directory_lww_order_independent(tmp_path: Path) -> None:
+    """name old@1, new@2, null@3 converges regardless of delivery order."""
+
+    def apply_order(order: list[tuple[str, str | None]]) -> str | None:
+        repo = SqliteRepository(tmp_path / f"{'-'.join(h for h, _ in order)}.db")
+        ensure_local_device(repo, tmp_path / "id")
+        for hlc, name in order:
+            repo.upsert_workspace(
+                Workspace(
+                    workspace_key="W1",
+                    team_id="T1",
+                    enterprise_id=None,
+                    name=name,
+                    domain=None,
+                    self_user_id=None,
+                    self_is_guest=False,
+                    raw={},
+                ),
+                hlc,
+                "2026-11-27T12:00:00Z",
+                hlc_lww=True,
+            )
+        row = repo._conn.execute(  # noqa: SLF001
+            "SELECT name FROM workspaces WHERE workspace_key='W1'"
+        ).fetchone()
+        name = row["name"] if row else None
+        repo.close()
+        return name
+
+    # Synthetic HLCs with identical wall; counter encodes order.
+    h1 = "1700000000000-1-D1"
+    h2 = "1700000000000-2-D1"
+    h3 = "1700000000000-3-D1"
+    chronological = apply_order([(h1, "old"), (h2, "new"), (h3, None)])
+    shuffled = apply_order([(h3, None), (h1, "old"), (h2, "new")])
+    assert chronological == "new"
+    assert shuffled == "new"
+
+
+def test_import_rejects_forged_row_author(tmp_path: Path) -> None:
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    folder = tmp_path / "usb"
+    folder.mkdir()
+    repo_a = SqliteRepository(dir_a / "archive.db")
+    repo_b = SqliteRepository(dir_b / "archive.db")
+    id_a = ensure_local_device(repo_a, dir_a)
+    id_b = ensure_local_device(repo_b, dir_b)
+    register_peer(repo_b, id_a.public_info())
+    from slack_cache_mcp.sync.crypto import age_encrypt, build_signed_envelope
+
+    envelope = build_signed_envelope(
+        identity=id_a,
+        from_seq=1,
+        to_seq=1,
+        rows=[
+            {
+                "seq": 1,
+                "hlc": "1700000000000-1-A",
+                "device_id": id_b.device_id,
+                "entity": "workspace",
+                "entity_key": "W-forged",
+                "op": "upsert",
+                "payload_json": {
+                    "workspace_key": "W-forged",
+                    "team_id": "T9",
+                    "name": "forged",
+                    "self_is_guest": False,
+                    "raw": {},
+                },
+                "payload_sha256": "deadbeef",
+            }
+        ],
+    )
+    path = folder / f"bundle-{id_a.device_id}-1-1.jsonl.zst.age"
+    path.write_bytes(age_encrypt(envelope, [id_b.age_recipient, id_a.age_recipient]))
+    result = import_bundles(repo_b, identity=id_b, from_dir=folder)
+    assert result["ok"] is False
+    assert any("does not match authenticated sender" in e["error"] for e in result["errors"])
+    repo_a.close()
+    repo_b.close()
+
+
+def test_register_peer_resets_push_cursor(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "a.db")
+    identity = ensure_local_device(repo, tmp_path / "a")
+    repo.set_sync_cursor("folder", "push", "42")
+    other = load_or_create_device(tmp_path / "b", prefer_keyring=False)
+    register_peer(repo, other.public_info())
+    assert repo.get_sync_cursor("folder", "push") == "0"
+    assert identity.device_id
+    repo.close()

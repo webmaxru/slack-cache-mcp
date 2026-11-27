@@ -34,12 +34,17 @@ def ensure_local_device(repo: SqliteRepository, data_dir: Path) -> DeviceIdentit
 
 
 def register_peer(repo: SqliteRepository, peer: DevicePublicInfo) -> None:
-    """Explicit trust operation: register/replace a peer's public keys."""
+    """Explicit trust operation: register/replace a peer's public keys.
+
+    Resets the folder push cursor so the next export re-sends history encrypted
+    to the updated recipient set (late peers cannot decrypt older bundles).
+    """
     public_key = json.dumps(
         {"ed25519": peer.ed25519_public_b64, "age": peer.age_recipient},
         sort_keys=True,
     )
     repo.upsert_device(peer.device_id, peer.label, public_key=public_key)
+    repo.set_sync_cursor("folder", "push", "0")
 
 
 def list_age_recipients(
@@ -192,6 +197,11 @@ def import_bundles(
             if str(header.get("age_recipient") or "") != expected_age:
                 raise ValueError("bundle age_recipient does not match registered peer")
             # Do NOT overwrite registered keys from the header (impersonation defense).
+            for row in rows:
+                if str(row.get("device_id") or "") != sender_id:
+                    raise ValueError(
+                        "change_log row device_id does not match authenticated sender"
+                    )
             stats = apply_change_rows(repo, rows, hlc_clock=hlc_clock)
             total_applied += int(stats["applied"])
             total_skipped += int(stats["skipped"])

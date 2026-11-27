@@ -141,15 +141,30 @@ def _read_secrets_file(path: Path) -> dict[str, str] | None:
 
 
 def _write_secrets_file(path: Path, ed_b64: str, age_secret: str) -> None:
+    """Write private keys with restrictive mode from creation (POSIX 0600)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    payload = (
         json.dumps(
             {"ed25519_private": ed_b64, "age_identity": age_secret},
             indent=2,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
+    ).encode("utf-8")
+    # Create/truncate with 0600 so a permissive umask cannot expose the file
+    # between write_text and chmod. On Windows the mode is advisory.
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
     )
+    try:
+        os.write(fd, payload)
+        fchmod = getattr(os, "fchmod", None)
+        if callable(fchmod):
+            with contextlib.suppress(OSError):
+                fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
 
@@ -197,17 +212,33 @@ def load_or_create_device(
             age_identity=x25519.Identity.from_str(age_secret),
         )
 
-    # Create fresh identity (or replace corrupted material).
-    device_id = device_id or str(ulid.new())
+    # Existing public identity without recoverable private keys: fail closed.
+    # Silently minting new keys under the same device_id would invalidate peers
+    # and make prior bundles unreadable.
+    if device_id is not None:
+        raise RuntimeError(
+            f"device {device_id} is registered in device.json but private keys "
+            "are missing from keyring and device.secrets; refusing to rotate identity"
+        )
+
+    # Create fresh identity.
+    device_id = str(ulid.new())
     ed_key = Ed25519PrivateKey.generate()
     age_id = x25519.Identity.generate()
     ed_b64 = _ed25519_private_to_b64(ed_key)
     age_secret = str(age_id)
 
+    keyring_ok = False
     if prefer_keyring:
         _store_keyring_secret("ed25519", device_id, ed_b64)
         _store_keyring_secret("age", device_id, age_secret)
-    _write_secrets_file(secrets_path, ed_b64, age_secret)
+        keyring_ok = (
+            _load_keyring_secret("ed25519", device_id) == ed_b64
+            and _load_keyring_secret("age", device_id) == age_secret
+        )
+    # File is a fallback only when keyring did not confirm storage (tests / recovery).
+    if not keyring_ok:
+        _write_secrets_file(secrets_path, ed_b64, age_secret)
 
     identity = DeviceIdentity(
         device_id=device_id,

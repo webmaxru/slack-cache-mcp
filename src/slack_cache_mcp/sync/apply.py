@@ -80,6 +80,9 @@ def apply_change_row(
             ts = str(payload.get("ts") or "")
             if ch and ts:
                 reproject.add((ch, ts))
+                # Project inside the same transaction so a later-row failure
+                # rolls back both the fact and the projection marker.
+                repo.reproject_message(ch, ts, commit=False)
         elif entity == "workspace":
             _apply_workspace(repo, payload, hlc=hlc)
         elif entity == "channel":
@@ -88,10 +91,16 @@ def apply_change_row(
             if ch:
                 for ts in repo.list_known_message_ts(ch):
                     reproject.add((ch, ts))
+                    repo.reproject_message(ch, ts, commit=False)
         elif entity == "user":
             _apply_user(repo, payload, hlc=hlc)
         elif entity == "sighting":
             _apply_sighting(repo, payload)
+            ch = str(payload.get("channel_id") or "")
+            ts = str(payload.get("ts") or "")
+            if ch and ts:
+                reproject.add((ch, ts))
+                repo.reproject_message(ch, ts, commit=False)
         repo._conn.commit()  # noqa: SLF001
     except Exception:
         with contextlib.suppress(Exception):
@@ -116,8 +125,9 @@ def apply_change_rows(
             touched.update(keys)
         else:
             skipped += 1
+    # Search-doc refresh after durable commits (best-effort; facts already projected).
     for channel_id, ts in sorted(touched):
-        repo.reproject_message(channel_id, ts)
+        repo.refresh_message_search_docs(channel_id, ts)
     return {"applied": applied, "skipped": skipped, "reprojected": len(touched)}
 
 
@@ -161,6 +171,7 @@ def _apply_message_version(
         seen_at=seen_at,
         hlc=hlc,
         write_change_log=False,
+        write_sighting=False,
         commit=False,
         reproject=False,
     )
@@ -235,8 +246,20 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         workspace_key=payload.get("workspace_key"),
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    workspace_keys = payload.get("workspace_keys")
+    keys = (
+        [str(k) for k in workspace_keys]
+        if isinstance(workspace_keys, list)
+        else None
+    )
     repo.upsert_user(
-        user, hlc, seen_at, write_change_log=False, hlc_lww=True, commit=False
+        user,
+        hlc,
+        seen_at,
+        write_change_log=False,
+        hlc_lww=True,
+        commit=False,
+        workspace_keys=keys,
     )
 
 
