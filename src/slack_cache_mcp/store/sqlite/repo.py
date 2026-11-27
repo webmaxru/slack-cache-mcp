@@ -690,6 +690,7 @@ class SqliteRepository:
         for r in self._conn.execute("SELECT * FROM channels").fetchall():
             required = {
                 "workspace_key": r["workspace_key"],
+                "context_team_id": r["context_team_id"],
                 "name": r["name"],
                 "topic": r["topic"],
                 "purpose": r["purpose"],
@@ -748,8 +749,6 @@ class SqliteRepository:
                 "tz": r["tz"],
                 "team_id": r["team_id"],
             }
-            if self._outbox_covers_fields(device_id, "user", r["user_id"], required):
-                continue
             ws_keys = [
                 row["workspace_key"]
                 for row in self._conn.execute(
@@ -757,6 +756,35 @@ class SqliteRepository:
                     (r["user_id"],),
                 ).fetchall()
             ]
+            required_with_assoc = {
+                **required,
+                "workspace_keys": ws_keys or None,
+            }
+            if self._outbox_covers_fields(
+                device_id, "user", r["user_id"], required_with_assoc
+            ):
+                # Association coverage: every workspace_key must appear in some payload.
+                covered_ws: set[str] = set()
+                for prow in self._conn.execute(
+                    """
+                    SELECT payload_json FROM change_log
+                    WHERE device_id=? AND entity='user' AND entity_key=?
+                    """,
+                    (device_id, r["user_id"]),
+                ).fetchall():
+                    try:
+                        payload = json.loads(prow["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if isinstance(payload.get("workspace_key"), str):
+                        covered_ws.add(payload["workspace_key"])
+                    for wk in payload.get("workspace_keys") or []:
+                        if isinstance(wk, str):
+                            covered_ws.add(wk)
+                if set(ws_keys).issubset(covered_ws):
+                    continue
             user = User(
                 user_id=r["user_id"],
                 team_id=r["team_id"],
@@ -1315,31 +1343,32 @@ class SqliteRepository:
                 ),
             )
         if write_change_log and device_id:
+            # Emit the merged stored row + its field clocks (not the possibly-losing
+            # incoming observation), so peers cannot accept a rejected value@winning clock.
             stored = self._conn.execute(
-                "SELECT field_hlcs_json FROM workspaces WHERE workspace_key=?",
+                "SELECT * FROM workspaces WHERE workspace_key=?",
                 (ws.workspace_key,),
             ).fetchone()
-            self.append_entity_change(
-                hlc=hlc,
-                device_id=device_id,
-                entity="workspace",
-                entity_key=ws.workspace_key,
-                payload={
-                    "workspace_key": ws.workspace_key,
-                    "team_id": ws.team_id,
-                    "enterprise_id": ws.enterprise_id,
-                    "name": ws.name,
-                    "domain": ws.domain,
-                    "self_user_id": ws.self_user_id,
-                    "self_is_guest": ws.self_is_guest,
-                    "raw": ws.raw,
-                    "first_seen": seen_at,
-                    "last_seen": seen_at,
-                    "field_hlcs": _load_field_hlcs(
-                        stored["field_hlcs_json"] if stored else None
-                    ),
-                },
-            )
+            if stored is not None:
+                self.append_entity_change(
+                    hlc=str(stored["updated_hlc"] or hlc),
+                    device_id=device_id,
+                    entity="workspace",
+                    entity_key=ws.workspace_key,
+                    payload={
+                        "workspace_key": stored["workspace_key"],
+                        "team_id": stored["team_id"],
+                        "enterprise_id": stored["enterprise_id"],
+                        "name": stored["name"],
+                        "domain": stored["domain"],
+                        "self_user_id": stored["self_user_id"],
+                        "self_is_guest": bool(stored["self_is_guest"]),
+                        "raw": json.loads(stored["raw_json"] or "{}"),
+                        "first_seen": stored["first_seen"],
+                        "last_seen": stored["last_seen"],
+                        "field_hlcs": _load_field_hlcs(stored["field_hlcs_json"]),
+                    },
+                )
         if commit:
             self._conn.commit()
 
@@ -1356,14 +1385,15 @@ class SqliteRepository:
         incoming_field_hlcs: dict[str, str] | None = None,
     ) -> None:
         raw = json.dumps(ch.raw, ensure_ascii=False)
-        _ = incoming_field_hlcs
         if hlc_lww:
             existing = self._conn.execute(
                 "SELECT * FROM channels WHERE channel_id=?",
                 (ch.channel_id,),
             ).fetchone()
             if existing is None:
-                field_hlcs: dict[str, str] = {"workspace_key": hlc}
+                field_hlcs: dict[str, str] = {
+                    "workspace_key": (incoming_field_hlcs or {}).get("workspace_key", hlc)
+                }
                 for key, val in (
                     ("name", ch.name),
                     ("topic", ch.topic),
@@ -1372,7 +1402,7 @@ class SqliteRepository:
                     ("context_team_id", ch.context_team_id),
                 ):
                     if val is not None:
-                        field_hlcs[key] = hlc
+                        field_hlcs[key] = (incoming_field_hlcs or {}).get(key, hlc)
                 self._conn.execute(
                     """
                     INSERT INTO channels(
@@ -1404,8 +1434,9 @@ class SqliteRepository:
                 field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
                 def _take(field: str, current: Any, incoming: Any) -> Any:
+                    clock_in = (incoming_field_hlcs or {}).get(field, hlc)
                     value, clock = _merge_sparse_field(
-                        current, field_hlcs.get(field), incoming, hlc
+                        current, field_hlcs.get(field), incoming, clock_in
                     )
                     if clock:
                         field_hlcs[field] = clock
@@ -1479,28 +1510,34 @@ class SqliteRepository:
                     (ch.channel_id, ch.name, seen_at),
                 )
             if write_change_log and device_id:
-                self.append_entity_change(
-                    hlc=hlc,
-                    device_id=device_id,
-                    entity="channel",
-                    entity_key=ch.channel_id,
-                    payload={
-                        "channel_id": ch.channel_id,
-                        "workspace_key": ch.workspace_key,
-                        "context_team_id": ch.context_team_id,
-                        "name": ch.name,
-                        "kind": ch.kind,
-                        "is_ext_shared": ch.is_ext_shared,
-                        "is_archived": ch.is_archived,
-                        "is_member": ch.is_member,
-                        "topic": ch.topic,
-                        "purpose": ch.purpose,
-                        "im_user_id": ch.im_user_id,
-                        "raw": ch.raw,
-                        "first_seen": seen_at,
-                        "last_seen": seen_at,
-                    },
-                )
+                stored = self._conn.execute(
+                    "SELECT * FROM channels WHERE channel_id=?",
+                    (ch.channel_id,),
+                ).fetchone()
+                if stored is not None:
+                    self.append_entity_change(
+                        hlc=str(stored["updated_hlc"] or hlc),
+                        device_id=device_id,
+                        entity="channel",
+                        entity_key=ch.channel_id,
+                        payload={
+                            "channel_id": stored["channel_id"],
+                            "workspace_key": stored["workspace_key"],
+                            "context_team_id": stored["context_team_id"],
+                            "name": stored["name"],
+                            "kind": stored["kind"],
+                            "is_ext_shared": bool(stored["is_ext_shared"]),
+                            "is_archived": bool(stored["is_archived"]),
+                            "is_member": bool(stored["is_member"]),
+                            "topic": stored["topic"],
+                            "purpose": stored["purpose"],
+                            "im_user_id": stored["im_user_id"],
+                            "raw": json.loads(stored["raw_json"] or "{}"),
+                            "first_seen": stored["first_seen"],
+                            "last_seen": stored["last_seen"],
+                            "field_hlcs": _load_field_hlcs(stored["field_hlcs_json"]),
+                        },
+                    )
             if commit:
                 self._conn.commit()
             return
@@ -1597,7 +1634,6 @@ class SqliteRepository:
         incoming_field_hlcs: dict[str, str] | None = None,
     ) -> None:
         raw = json.dumps(user.raw, ensure_ascii=False)
-        _ = incoming_field_hlcs
         assoc_keys = list(workspace_keys or [])
         if user.workspace_key and user.workspace_key not in assoc_keys:
             assoc_keys.append(user.workspace_key)
@@ -1617,7 +1653,7 @@ class SqliteRepository:
                     ("team_id", user.team_id),
                 ):
                     if val is not None:
-                        field_hlcs[key] = hlc
+                        field_hlcs[key] = (incoming_field_hlcs or {}).get(key, hlc)
                 self._conn.execute(
                     """
                     INSERT INTO users(
@@ -1651,8 +1687,9 @@ class SqliteRepository:
                 field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
                 def _take(field: str, current: Any, incoming: Any) -> Any:
+                    clock_in = (incoming_field_hlcs or {}).get(field, hlc)
                     value, clock = _merge_sparse_field(
-                        current, field_hlcs.get(field), incoming, hlc
+                        current, field_hlcs.get(field), incoming, clock_in
                     )
                     if clock:
                         field_hlcs[field] = clock
@@ -1727,32 +1764,45 @@ class SqliteRepository:
                     (user.user_id, wk),
                 )
             if write_change_log and device_id:
-                self.append_entity_change(
-                    hlc=hlc,
-                    device_id=device_id,
-                    entity="user",
-                    entity_key=user.user_id,
-                    payload={
-                        "user_id": user.user_id,
-                        "team_id": user.team_id,
-                        "name": user.name,
-                        "real_name": user.real_name,
-                        "display_name": user.display_name,
-                        "title": user.title,
-                        "email": None,
-                        "is_bot": user.is_bot,
-                        "is_deleted": user.is_deleted,
-                        "is_restricted": user.is_restricted,
-                        "is_ultra_restricted": user.is_ultra_restricted,
-                        "is_external": user.is_external,
-                        "tz": user.tz,
-                        "raw": user.raw,
-                        "workspace_key": user.workspace_key,
-                        "workspace_keys": assoc_keys,
-                        "first_seen": seen_at,
-                        "last_seen": seen_at,
-                    },
-                )
+                stored = self._conn.execute(
+                    "SELECT * FROM users WHERE user_id=?",
+                    (user.user_id,),
+                ).fetchone()
+                ws_stored = [
+                    row["workspace_key"]
+                    for row in self._conn.execute(
+                        "SELECT workspace_key FROM user_workspaces WHERE user_id=?",
+                        (user.user_id,),
+                    ).fetchall()
+                ]
+                if stored is not None:
+                    self.append_entity_change(
+                        hlc=str(stored["updated_hlc"] or hlc),
+                        device_id=device_id,
+                        entity="user",
+                        entity_key=user.user_id,
+                        payload={
+                            "user_id": stored["user_id"],
+                            "team_id": stored["team_id"],
+                            "name": stored["name"],
+                            "real_name": stored["real_name"],
+                            "display_name": stored["display_name"],
+                            "title": stored["title"],
+                            "email": None,
+                            "is_bot": bool(stored["is_bot"]),
+                            "is_deleted": bool(stored["is_deleted"]),
+                            "is_restricted": bool(stored["is_restricted"]),
+                            "is_ultra_restricted": bool(stored["is_ultra_restricted"]),
+                            "is_external": bool(stored["is_external"]),
+                            "tz": stored["tz"],
+                            "raw": json.loads(stored["raw_json"] or "{}"),
+                            "workspace_key": ws_stored[0] if ws_stored else None,
+                            "workspace_keys": ws_stored,
+                            "first_seen": stored["first_seen"],
+                            "last_seen": stored["last_seen"],
+                            "field_hlcs": _load_field_hlcs(stored["field_hlcs_json"]),
+                        },
+                    )
             if commit:
                 self._conn.commit()
             return
@@ -1901,14 +1951,17 @@ class SqliteRepository:
         last_seen: str,
         commit: bool = True,
     ) -> None:
+        # Treat the epoch sentinel as "unknown" so a later real sighting can replace it.
         self._conn.execute(
             """
             UPDATE message_versions SET
               first_seen=CASE
-                WHEN first_seen IS NULL OR first_seen='' OR first_seen > ?
+                WHEN first_seen IS NULL OR first_seen='' OR first_seen='1970-01-01T00:00:00Z'
+                  OR first_seen > ?
                 THEN ? ELSE first_seen END,
               last_seen=CASE
-                WHEN last_seen IS NULL OR last_seen='' OR last_seen < ?
+                WHEN last_seen IS NULL OR last_seen='' OR last_seen='1970-01-01T00:00:00Z'
+                  OR last_seen < ?
                 THEN ? ELSE last_seen END
             WHERE channel_id=? AND ts=? AND content_sha256=?
             """,
@@ -1916,6 +1969,34 @@ class SqliteRepository:
         )
         if commit:
             self._conn.commit()
+
+    def reconcile_version_times_from_sightings(
+        self,
+        *,
+        channel_id: str,
+        ts: str,
+        content_sha256: str,
+        commit: bool = True,
+    ) -> None:
+        """After a version arrives, pull bounds from any earlier sighting rows."""
+        row = self._conn.execute(
+            """
+            SELECT MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen
+            FROM message_sightings
+            WHERE channel_id=? AND ts=? AND content_sha256=?
+            """,
+            (channel_id, ts, content_sha256),
+        ).fetchone()
+        if row is None or not row["last_seen"]:
+            return
+        self.merge_version_sighting_times(
+            channel_id=channel_id,
+            ts=ts,
+            content_sha256=content_sha256,
+            first_seen=str(row["first_seen"] or row["last_seen"]),
+            last_seen=str(row["last_seen"]),
+            commit=commit,
+        )
 
     def ingest_observation(
         self,
@@ -2296,6 +2377,10 @@ class SqliteRepository:
             if commit:
                 self._conn.commit()
         except Exception:
+            # In transactional apply (commit=False), propagate so the outbox marker
+            # rolls back and retry can rebuild search docs.
+            if not commit:
+                raise
             pass
 
     def list_workspaces(self) -> list[dict[str, Any]]:

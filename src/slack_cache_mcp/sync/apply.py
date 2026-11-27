@@ -191,6 +191,13 @@ def _apply_message_version(
             last_seen=last_seen or seen_at,
             commit=False,
         )
+    # Sightings may have arrived earlier; pull their bounds onto this version.
+    repo.reconcile_version_times_from_sightings(
+        channel_id=obs.channel_id,
+        ts=obs.ts,
+        content_sha256=obs.content_sha256,
+        commit=False,
+    )
 
 
 def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
@@ -246,8 +253,20 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         raw=clean_raw,
     )
     seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    field_hlcs = payload.get("field_hlcs")
+    incoming_field_hlcs = (
+        {str(k): str(v) for k, v in field_hlcs.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(field_hlcs, dict)
+        else None
+    )
     repo.upsert_channel(
-        ch, hlc, seen_at, write_change_log=False, hlc_lww=True, commit=False
+        ch,
+        hlc,
+        seen_at,
+        write_change_log=False,
+        hlc_lww=True,
+        commit=False,
+        incoming_field_hlcs=incoming_field_hlcs,
     )
 
 
@@ -280,6 +299,12 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         if isinstance(workspace_keys, list)
         else None
     )
+    field_hlcs = payload.get("field_hlcs")
+    incoming_field_hlcs = (
+        {str(k): str(v) for k, v in field_hlcs.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(field_hlcs, dict)
+        else None
+    )
     repo.upsert_user(
         user,
         hlc,
@@ -288,6 +313,7 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         hlc_lww=True,
         commit=False,
         workspace_keys=keys,
+        incoming_field_hlcs=incoming_field_hlcs,
     )
 
 
