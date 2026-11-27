@@ -25,13 +25,32 @@ def embed_pending(
     batch_size: int = 64,
     limit: int | None = None,
     allow_hashing_demotion: bool = False,
+    lock_owner: str | None = None,
 ) -> dict[str, Any]:
     """Embed search_docs rows pending for the active model.
 
     ``allow_hashing_demotion`` must be True for an intentional rebuild that
     switches a persisted ONNX index to hashing (e.g. CLI ``rebuild --embeddings``
     with ``SLACKCACHE_EMBEDDER=hashing``). Daemon auto-fallback leaves it False.
+
+    When ``lock_owner`` is set, renew the embedding op lease before destructive
+    model switches and periodically during the embed loop.
     """
+    def _fence() -> dict[str, Any] | None:
+        if lock_owner is None:
+            return None
+        if not repo.renew_embedding_op_lock(lock_owner):
+            return {
+                "ok": False,
+                "embedded": 0,
+                "model_id": embedder.model_id,
+                "error": "embedding_op_lock_lost",
+            }
+        return None
+
+    lost = _fence()
+    if lost is not None:
+        return lost
     prev = repo._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='embedding_model'"
     ).fetchone()
@@ -56,6 +75,9 @@ def embed_pending(
     if (prev and prev["value"] != embedder.model_id) or (
         prev_dim and int(prev_dim["value"]) != int(embedder.dim)
     ):
+        lost = _fence()
+        if lost is not None:
+            return lost
         repo._conn.execute(  # noqa: SLF001
             "UPDATE search_docs SET embedded_model=NULL, embedded_at=NULL"
         )
@@ -95,6 +117,11 @@ def embed_pending(
     rows = list(repo._conn.execute(sql, params).fetchall())  # noqa: SLF001
     embedded = 0
     for i in range(0, len(rows), batch_size):
+        if i > 0 and i % (batch_size * 8) == 0:
+            lost = _fence()
+            if lost is not None:
+                lost["embedded"] = embedded
+                return lost
         batch = rows[i : i + batch_size]
         texts = [r["text"] for r in batch]
         vectors = embedder.embed_documents(texts)

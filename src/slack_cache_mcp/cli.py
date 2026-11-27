@@ -345,8 +345,27 @@ def rebuild_cmd(
                         repo._conn.rollback()  # noqa: SLF001
                 raise
 
+        def _fence_lock() -> None:
+            nonlocal lock_held
+            if not lock_held:
+                return
+            if not repo.renew_embedding_op_lock(lock_owner):
+                result["ok"] = False
+                result["embeddings"] = {
+                    "ok": False,
+                    "embedded": 0,
+                    "error": "embedding_op_lock_lost",
+                }
+                with contextlib.suppress(Exception):
+                    repo.release_embedding_op_lock(lock_owner)
+                lock_held = False
+                repo.close()
+                typer.echo(json.dumps(result, indent=2, default=str))
+                raise typer.Exit(code=1)
+
         # Projection only after lock + demotion check succeeded.
         if do_all or projection:
+            _fence_lock()
             rows = repo._conn.execute(  # noqa: SLF001
                 "SELECT DISTINCT channel_id, ts FROM message_versions"
             ).fetchall()
@@ -354,9 +373,11 @@ def rebuild_cmd(
                 repo.reproject_message(r["channel_id"], r["ts"])
             result["projection_rebuilt"] = len(rows)
         if do_all or fts:
+            _fence_lock()
             result["fts"] = repo.rebuild_fts()
         if do_all or embeddings:
             assert emb is not None
+            _fence_lock()
             prev2 = repo._conn.execute(  # noqa: SLF001
                 "SELECT value FROM meta WHERE key='embedding_model'"
             ).fetchone()
@@ -368,8 +389,12 @@ def rebuild_cmd(
             for ch, gen in dirty_before:
                 repo.ack_dirty_window_channel(ch, gen)
             result["search_docs"] = counts
+            _fence_lock()
             emb_result = embed_pending(
-                repo, emb, allow_hashing_demotion=explicit_hashing
+                repo,
+                emb,
+                allow_hashing_demotion=explicit_hashing,
+                lock_owner=lock_owner,
             )
             result["embeddings"] = emb_result
             if isinstance(emb_result, dict) and emb_result.get("ok") is False:

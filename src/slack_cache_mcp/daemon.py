@@ -171,7 +171,7 @@ def run_daemon(
                         # daemon already mid-cycle cannot embed/promote under us.
                         lock_owner = f"daemon-{os.getpid()}"
                         if not repo.acquire_embedding_op_lock(
-                            lock_owner, lease_s=120.0
+                            lock_owner, lease_s=900.0
                         ):
                             log_event(logger, "embed_skip_op_lock")
                         else:
@@ -198,6 +198,8 @@ def run_daemon(
                                         "window_docs_rebuild_error",
                                         error=type(win_exc).__name__,
                                     )
+                                    with contextlib.suppress(Exception):
+                                        repo._conn.rollback()  # noqa: SLF001
                                 # One-time backfill: upgraded archives may have empty
                                 # search_docs while messages already exist.
                                 try:
@@ -238,6 +240,8 @@ def run_daemon(
                                         "search_docs_backfill_error",
                                         error=type(bf_exc).__name__,
                                     )
+                                    with contextlib.suppress(Exception):
+                                        repo._conn.rollback()  # noqa: SLF001
                                 active = getattr(_run, "_embedder", None)
                                 if active is None:
                                     emb_result = {
@@ -246,9 +250,21 @@ def run_daemon(
                                         "error": "embedder_unavailable",
                                     }
                                 else:
-                                    emb_result = embed_pending(
-                                        repo, active, limit=2_048
-                                    )
+                                    if not repo.renew_embedding_op_lock(
+                                        lock_owner, lease_s=900.0
+                                    ):
+                                        emb_result = {
+                                            "ok": False,
+                                            "embedded": 0,
+                                            "error": "embedding_op_lock_lost",
+                                        }
+                                    else:
+                                        emb_result = embed_pending(
+                                            repo,
+                                            active,
+                                            limit=2_048,
+                                            lock_owner=lock_owner,
+                                        )
                                 log_event(
                                     logger,
                                     "embed_batch",
@@ -257,6 +273,9 @@ def run_daemon(
                                     ok=emb_result.get("ok"),
                                 )
                             finally:
+                                # Clear any aborted txn so lease release can commit.
+                                with contextlib.suppress(Exception):
+                                    repo._conn.rollback()  # noqa: SLF001
                                 with contextlib.suppress(Exception):
                                     repo.release_embedding_op_lock(lock_owner)
                     except Exception as emb_exc:
