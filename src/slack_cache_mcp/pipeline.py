@@ -451,36 +451,41 @@ def _ingest_profile(
                 if isinstance(rec.value, dict) and (
                     "messages" in rec.value or "bootData" in rec.value
                 ):
-                    # Full Redux state found inline/historical — extract if new
+                    # Full Redux state found inline/historical — extract; always record sightings
                     clean = sanitize(rec.value)
                     assert isinstance(clean, dict)
                     sha = _state_sha(clean)
-                    if not repo.has_state_generation(sha):
-                        ws, channels, users, files, messages, reactions, saved = redux.extract_all(
-                            clean
-                        )
-                        channels, messages = _filter_dms(
-                            channels, messages, capture_dms=settings.capture_dms
-                        )
-                        for obs in messages:
-                            obs.source = (
-                                "idb.leveldb.historical"
-                                if rec.state == "deleted"
-                                else (rec.source or "idb.leveldb")
-                            )
-                            if edge_mode:
-                                obs.source = redux.edge_source_label(obs.source)
-                            obs.source_rank = redux.SOURCE_RANK.get(obs.source, obs.source_rank)
-                            if repo.ingest_observation(
-                                obs,
-                                device_id=device_id,
-                                snapshot_id=snapshot_id,
-                                state_sha256=sha,
-                                seen_at=seen_at,
-                                hlc=hlc.now(),
-                            ):
-                                messages_ingested += 1
-                                _bump(obs.source, messages=1)
+                    known = repo.has_state_generation(sha)
+                    if known:
+                        repo.touch_state_generation(sha, seen_at)
+                        skipped_known += 1
+                    ws, channels, users, files, messages, reactions, saved = redux.extract_all(
+                        clean
+                    )
+                    channels, messages = _filter_dms(
+                        channels, messages, capture_dms=settings.capture_dms
+                    )
+                    hist_base = (
+                        "idb.leveldb.historical"
+                        if rec.state == "deleted"
+                        else (rec.source or "idb.leveldb")
+                    )
+                    for obs in messages:
+                        obs.source = hist_base
+                        if edge_mode:
+                            obs.source = redux.edge_source_label(obs.source)
+                        obs.source_rank = redux.SOURCE_RANK.get(obs.source, obs.source_rank)
+                        if repo.ingest_observation(
+                            obs,
+                            device_id=device_id,
+                            snapshot_id=snapshot_id,
+                            state_sha256=sha,
+                            seen_at=seen_at,
+                            hlc=hlc.now(),
+                        ):
+                            messages_ingested += 1
+                            _bump(obs.source, messages=1)
+                    if not known:
                         repo.insert_state_generation(
                             sha,
                             ws.workspace_key,
@@ -491,6 +496,7 @@ def _ingest_profile(
                             vault_path=None,
                         )
                         repo.upsert_workspace(ws, hlc.now(), seen_at, device_id=device_id)
+                        generations_new += 1
                 # Message-shaped single values from historical records
                 if isinstance(rec.value, dict) and redux.is_message(rec.value):
                     cid = rec.value.get("channel")
