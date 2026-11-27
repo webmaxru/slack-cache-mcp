@@ -29,7 +29,6 @@ def apply_change_row(
     *,
     hlc_clock: HLC | None = None,
     record_outbox: bool = True,
-    force_directory: bool = False,
 ) -> tuple[bool, set[tuple[str, str]]]:
     """Apply one change_log row atomically.
 
@@ -82,15 +81,15 @@ def apply_change_row(
             if ch and ts:
                 reproject.add((ch, ts))
         elif entity == "workspace":
-            _apply_workspace(repo, payload, hlc=hlc, force_directory=force_directory)
+            _apply_workspace(repo, payload, hlc=hlc)
         elif entity == "channel":
-            _apply_channel(repo, payload, hlc=hlc, force_directory=force_directory)
+            _apply_channel(repo, payload, hlc=hlc)
             ch = str(payload.get("channel_id") or "")
             if ch:
                 for ts in repo.list_known_message_ts(ch):
                     reproject.add((ch, ts))
         elif entity == "user":
-            _apply_user(repo, payload, hlc=hlc, force_directory=force_directory)
+            _apply_user(repo, payload, hlc=hlc)
         elif entity == "sighting":
             _apply_sighting(repo, payload, authenticated_device_id=device_id)
             ch = str(payload.get("channel_id") or "")
@@ -136,29 +135,6 @@ def apply_change_rows(
     failed = 0
     touched: set[tuple[str, str]] = set()
     errors: list[str] = []
-    # If any directory row carries a newer clock_epoch, bump once and force-apply
-    # every directory row in this batch (not only the first that trips the bump).
-    max_epoch = 0
-    for row in rows:
-        if str(row.get("entity") or "") not in ("workspace", "channel", "user"):
-            continue
-        payload = row.get("payload_json") or row.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-        if not isinstance(payload, dict):
-            continue
-        try:
-            max_epoch = max(max_epoch, int(payload.get("clock_epoch") or 0))
-        except (TypeError, ValueError):
-            continue
-    force_directory_batch = False
-    if max_epoch > repo.directory_clock_epoch():
-        repo.set_directory_clock_epoch(max_epoch, commit=True)
-        repo.invalidate_directory_field_clocks(commit=True)
-        force_directory_batch = True
     # Workspaces before channels (FK); messages before sightings.
     ordered = sorted(
         enumerate(rows),
@@ -171,8 +147,6 @@ def apply_change_rows(
                 row,
                 hlc_clock=hlc_clock,
                 record_outbox=True,
-                force_directory=force_directory_batch
-                and str(row.get("entity") or "") in ("workspace", "channel", "user"),
             )
             if ok:
                 applied += 1
@@ -261,26 +235,26 @@ def _directory_clock_mode(
     repo: SqliteRepository,
     payload: dict[str, Any],
     incoming_field_hlcs: dict[str, str],
-    *,
-    force_directory: bool = False,
 ) -> tuple[dict[str, str], bool, bool]:
-    """Resolve field-clock handling from ``clock_epoch`` vs local repair epoch.
+    """Resolve field-clock handling from ``clock_epoch`` / ``clock_repair``.
 
     Returns ``(clocks, force_fields, fill_nulls_only)``.
+    Force applies only to the fact that carries repair authority — never to
+    unrelated lower-epoch rows in the same batch.
     """
     try:
         incoming_epoch = int(payload.get("clock_epoch") or 0)
     except (TypeError, ValueError):
         incoming_epoch = 0
     local_epoch = repo.directory_clock_epoch()
-    if force_directory:
-        return incoming_field_hlcs, True, False
-    if incoming_epoch < local_epoch:
+    clock_repair = bool(payload.get("clock_repair"))
+    if incoming_epoch < local_epoch and not clock_repair:
         # Obsolete / pre-repair facts: never trust their clocks; only fill nulls.
         return {}, False, True
-    if incoming_epoch > local_epoch:
-        repo.set_directory_clock_epoch(incoming_epoch, commit=False)
-        repo.invalidate_directory_field_clocks(commit=False)
+    if clock_repair or incoming_epoch > local_epoch:
+        # Per-fact repair authority only — do not invalidate unrelated entities.
+        if incoming_epoch > local_epoch:
+            repo.set_directory_clock_epoch(incoming_epoch, commit=False)
         return incoming_field_hlcs, True, False
     return incoming_field_hlcs, False, False
 
@@ -290,7 +264,6 @@ def _apply_workspace(
     payload: dict[str, Any],
     *,
     hlc: str,
-    force_directory: bool = False,
 ) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
@@ -314,7 +287,7 @@ def _apply_workspace(
         else {}
     )
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs, force_directory=force_directory
+        repo, payload, incoming_field_hlcs
     )
     repo.upsert_workspace(
         ws,
@@ -334,7 +307,6 @@ def _apply_channel(
     payload: dict[str, Any],
     *,
     hlc: str,
-    force_directory: bool = False,
 ) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
@@ -362,7 +334,7 @@ def _apply_channel(
         else {}
     )
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs, force_directory=force_directory
+        repo, payload, incoming_field_hlcs
     )
     repo.upsert_channel(
         ch,
@@ -419,7 +391,6 @@ def _apply_user(
     payload: dict[str, Any],
     *,
     hlc: str,
-    force_directory: bool = False,
 ) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
@@ -456,7 +427,7 @@ def _apply_user(
         else {}
     )
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs, force_directory=force_directory
+        repo, payload, incoming_field_hlcs
     )
     repo.upsert_user(
         user,

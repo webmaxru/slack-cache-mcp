@@ -556,7 +556,7 @@ def test_export_sequence_bounds_independent_of_entity_order(tmp_path: Path) -> N
     )
     repo.set_sync_cursor("folder", "push", "0")
     # Skip migration purge side-effects for this bounds check.
-    repo.set_meta("field_hlcs_policy", "v6-epoch-repair")
+    repo.set_meta("field_hlcs_policy", "v7-epoch-repair")
     exported = export_bundle(repo, identity=identity, to_dir=folder)
     assert exported["ok"] is True
     assert exported["exported"] >= 2
@@ -625,11 +625,11 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
     assert clocks.get("team_id") == good  # preserved table clock (ignores fabricated log)
     assert clocks.get("name") == good  # restored pair
     assert repo2.directory_clock_epoch() >= 1
-    assert repo2.get_meta("field_hlcs_policy") == "v6-pending-outbox-purge"
+    assert repo2.get_meta("field_hlcs_policy") == "v7-pending-outbox-purge"
 
     rebuilt = repo2.backfill_outbox(device_id=identity.device_id, hlc=good)
     assert rebuilt["workspaces"] >= 1
-    assert repo2.get_meta("field_hlcs_policy") == "v6-epoch-repair"
+    assert repo2.get_meta("field_hlcs_policy") == "v7-epoch-repair"
     rows = repo2._conn.execute(  # noqa: SLF001
         """
         SELECT payload_json FROM change_log
@@ -642,6 +642,7 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
         payload = json.loads(r["payload_json"])
         assert payload.get("name") == "kept"
         assert payload.get("clock_epoch") == repo2.directory_clock_epoch()
+        assert payload.get("clock_repair") is True
         fh = payload.get("field_hlcs") or {}
         assert fh.get("team_id") == good
         assert fh.get("name") == good

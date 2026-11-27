@@ -463,8 +463,8 @@ class SqliteRepository:
         """
         policy = self.get_meta("field_hlcs_policy")
         if policy in (
-            "v6-epoch-repair",
-            "v6-pending-outbox-purge",
+            "v7-epoch-repair",
+            "v7-pending-outbox-purge",
         ):
             return
         specs: list[tuple[str, str, str, tuple[str, ...]]] = [
@@ -488,11 +488,11 @@ class SqliteRepository:
             ),
         ]
         # Best (value, clock) per field from outbox history — clock and value stay paired.
-        # Skip uniform row-HLC stamps (classic fabrication: every field got the row hlc).
+        # Prefer pairs that already match the current table value (applied state).
         recovered: dict[tuple[str, str, str], tuple[Any, str]] = {}
         for entity in ("workspace", "channel", "user"):
             for row in self._conn.execute(
-                "SELECT entity_key, hlc, payload_json FROM change_log WHERE entity=?",
+                "SELECT entity_key, payload_json FROM change_log WHERE entity=?",
                 (entity,),
             ).fetchall():
                 try:
@@ -503,19 +503,6 @@ class SqliteRepository:
                     continue
                 field_hlcs = payload.get("field_hlcs")
                 if not isinstance(field_hlcs, dict):
-                    continue
-                row_hlc = str(row["hlc"] or "")
-                real_clocks = [
-                    c
-                    for c in field_hlcs.values()
-                    if isinstance(c, str) and _real_field_hlc(c) is not None
-                ]
-                uniform_fabricated = (
-                    bool(row_hlc)
-                    and len(real_clocks) >= 2
-                    and all(c == row_hlc for c in real_clocks)
-                )
-                if uniform_fabricated:
                     continue
                 for field, clock in field_hlcs.items():
                     if not isinstance(field, str) or not isinstance(clock, str):
@@ -567,7 +554,7 @@ class SqliteRepository:
         current_epoch = self.directory_clock_epoch()
         if current_epoch < _DIRECTORY_CLOCK_EPOCH_REPAIR:
             self.set_directory_clock_epoch(_DIRECTORY_CLOCK_EPOCH_REPAIR, commit=False)
-        self.set_meta("field_hlcs_policy", "v6-pending-outbox-purge", commit=False)
+        self.set_meta("field_hlcs_policy", "v7-pending-outbox-purge", commit=False)
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -827,7 +814,12 @@ class SqliteRepository:
         from slack_cache_mcp.domain.models import Channel, User, Workspace
 
         policy = self.get_meta("field_hlcs_policy")
-        if policy in ("v6-pending-outbox-purge", "v5-pending-outbox-purge"):
+        emit_clock_repair = False
+        if policy in (
+            "v7-pending-outbox-purge",
+            "v6-pending-outbox-purge",
+            "v5-pending-outbox-purge",
+        ):
             # Drop fabricated local directory facts; peer markers stay for idempotency.
             self._conn.execute(
                 """
@@ -852,8 +844,9 @@ class SqliteRepository:
                 """,
                 (_utc_now(),),
             )
-            self.set_meta("field_hlcs_policy", "v6-epoch-repair", commit=False)
+            self.set_meta("field_hlcs_policy", "v7-epoch-repair", commit=False)
             self._conn.commit()
+            emit_clock_repair = True
 
         self.delete_incomplete_local_message_outbox(device_id)
         counts = {
@@ -917,6 +910,7 @@ class SqliteRepository:
                     "last_seen": r["last_seen"],
                     "field_hlcs": field_hlcs,
                     "clock_epoch": self.directory_clock_epoch(),
+                    **({"clock_repair": True} if emit_clock_repair else {}),
                 },
             ):
                 counts["workspaces"] += 1
@@ -1047,6 +1041,7 @@ class SqliteRepository:
                     "last_seen": r["last_seen"],
                     "field_hlcs": field_hlcs,
                     "clock_epoch": self.directory_clock_epoch(),
+                    **({"clock_repair": True} if emit_clock_repair else {}),
                 },
             ):
                 counts["channels"] += 1
@@ -1143,6 +1138,7 @@ class SqliteRepository:
                     "last_seen": r["last_seen"],
                     "field_hlcs": field_hlcs,
                     "clock_epoch": self.directory_clock_epoch(),
+                    **({"clock_repair": True} if emit_clock_repair else {}),
                 },
             ):
                 counts["users"] += 1
