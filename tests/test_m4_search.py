@@ -214,6 +214,38 @@ def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
     assert allowed.get("error") != "refuse_hashing_demotion"
 
 
+def test_embed_pending_from_worker_thread(archive: SqliteRepository) -> None:
+    """Daemon Timer cycles call embed_pending off the main thread."""
+    import threading
+
+    from slack_cache_mcp.search.embedder import HashingEmbedder
+
+    assert archive.acquire_embedding_op_lock("worker-thread") is True
+    result: dict = {}
+    err: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.update(
+                embed_pending(
+                    archive,
+                    HashingEmbedder(),
+                    limit=4,
+                    lock_owner="worker-thread",
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 — surface to main thread
+            err.append(exc)
+
+    t = threading.Thread(target=_run, name="test-embed-worker")
+    t.start()
+    t.join(timeout=30)
+    assert not t.is_alive()
+    archive.release_embedding_op_lock("worker-thread")
+    assert not err, f"embed_pending raised in worker thread: {err[0]!r}"
+    assert result.get("ok") is True
+
+
 def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
     """Crash-released OS file lock excludes a second repository handle."""
     import json

@@ -337,13 +337,23 @@ def embed_pending(
                 t = threading.Thread(
                     target=_beat, name="embed-op-lock-beat", daemon=True
                 )
-                prev_handler = signal.getsignal(signal.SIGINT)
-                signal.signal(signal.SIGINT, _note_sigint)
+                # signal.signal only works in the main thread; daemon Timer
+                # cycles call embed_pending from a worker thread.
+                prev_handler: Any = None
+                deferred_sigint = False
+                try:
+                    prev_handler = signal.getsignal(signal.SIGINT)
+                    signal.signal(signal.SIGINT, _note_sigint)
+                    deferred_sigint = True
+                except (ValueError, OSError):
+                    # Non-main thread: Ctrl-C targets main, not this worker.
+                    pass
                 try:
                     t.start()
                     beater = t
                 finally:
-                    signal.signal(signal.SIGINT, prev_handler)
+                    if deferred_sigint:
+                        signal.signal(signal.SIGINT, prev_handler)
             else:
                 done_beat.set()
 
