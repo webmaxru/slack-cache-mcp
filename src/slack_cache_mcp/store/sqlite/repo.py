@@ -852,7 +852,7 @@ class SqliteRepository:
                 device_id, "user", r["user_id"], required_with_assoc
             ):
                 # Association coverage: every workspace_key must appear in some payload.
-                covered_ws: set[str] = set()
+                covered_user_ws: set[str] = set()
                 for prow in self._conn.execute(
                     """
                     SELECT payload_json FROM change_log
@@ -867,11 +867,11 @@ class SqliteRepository:
                     if not isinstance(payload, dict):
                         continue
                     if isinstance(payload.get("workspace_key"), str):
-                        covered_ws.add(payload["workspace_key"])
+                        covered_user_ws.add(payload["workspace_key"])
                     for wk in payload.get("workspace_keys") or []:
                         if isinstance(wk, str):
-                            covered_ws.add(wk)
-                if set(ws_keys).issubset(covered_ws):
+                            covered_user_ws.add(wk)
+                if set(ws_keys).issubset(covered_user_ws):
                     continue
             user = User(
                 user_id=r["user_id"],
