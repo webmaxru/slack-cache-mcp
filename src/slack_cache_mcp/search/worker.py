@@ -118,11 +118,15 @@ def embed_pending(
     embedded = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
-        # Renew before inference so a long embed_documents call cannot let a
-        # legacy lease reader steal mid-batch.
-        lost = _fence(embedded=embedded)
-        if lost is not None:
-            return lost
+        # Stretch the meta lease across inference (no second SQLite thread).
+        if lock_owner is not None:
+            if not repo.renew_embedding_op_lock(lock_owner, lease_s=3600.0):
+                return {
+                    "ok": False,
+                    "embedded": embedded,
+                    "model_id": embedder.model_id,
+                    "error": "embedding_op_lock_lost",
+                }
         texts = [r["text"] for r in batch]
         vectors = embedder.embed_documents(texts)
         lost = _fence(embedded=embedded)

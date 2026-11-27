@@ -383,6 +383,11 @@ class SearchDocsBuilder:
                     if started:
                         self.repo._conn.commit()  # noqa: SLF001
                     return False
+                # Fence before any write so a lost lease cannot publish a batch.
+                if not self.repo.heartbeat_embedding_op_lock():
+                    if started:
+                        self.repo._conn.rollback()  # noqa: SLF001
+                    raise RuntimeError("embedding_op_lock_lost")
                 for b in chunk:
                     self.repo.upsert_search_doc(
                         kind="window",
@@ -395,7 +400,6 @@ class SearchDocsBuilder:
                     )
                 if started:
                     self.repo._conn.commit()  # noqa: SLF001
-                self._require_embed_lock_heartbeat()
             except Exception:
                 if started:
                     with contextlib.suppress(Exception):

@@ -2629,8 +2629,11 @@ class SqliteRepository:
         # Opaque legacy row without PID: preserve exclusion.
         return True
 
-    def _claim_legacy_meta(self, owner: str, *, holding_files: bool) -> bool:
+    def _claim_legacy_meta(
+        self, owner: str, *, holding_files: bool, lease_s: float | None = None
+    ) -> bool:
         """Claim/refresh the meta lock under IMMEDIATE; False if blocked."""
+        lease = self._EMBED_OP_LOCK_LEASE_S if lease_s is None else float(lease_s)
         started = self._begin_immediate()
         try:
             if self._legacy_meta_blocks(owner, holding_files=holding_files):
@@ -2643,7 +2646,7 @@ class SqliteRepository:
                 {
                     "owner": owner,
                     "pid": os.getpid(),
-                    "expires_at": time.time() + self._EMBED_OP_LOCK_LEASE_S,
+                    "expires_at": time.time() + max(lease, 1.0),
                     "protocol": "file+meta",
                 }
             )
@@ -2757,7 +2760,6 @@ class SqliteRepository:
         If another process wrote the meta row while we held the file lock
         (legacy lease reader), fail closed instead of silently reclaiming.
         """
-        del lease_s
         if not self.embedding_op_lock_owned(owner):
             return False
         row = self._conn.execute(
@@ -2766,9 +2768,12 @@ class SqliteRepository:
         parsed = self._parse_legacy_embed_meta(
             str(row["value"]) if row else None
         )
-        if parsed and parsed[0] != owner:
+        # Missing row = a legacy holder acquired and released under us — lost.
+        if not parsed or parsed[0] != owner:
             return False
-        return self._claim_legacy_meta(owner, holding_files=True)
+        return self._claim_legacy_meta(
+            owner, holding_files=True, lease_s=lease_s
+        )
 
     def heartbeat_embedding_op_lock(self) -> bool:
         """Renew the short meta lease if this instance holds the op lock.
