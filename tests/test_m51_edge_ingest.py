@@ -136,12 +136,137 @@ def test_edge_and_desktop_dedupe_into_same_archive(tmp_path: Path) -> None:
     assert repo.scan_for_token_leak() == []
     repo.close()
 
-    # Edge mirror must not retain credential bait.
+    # Edge mirror must not retain credential bait or raw IndexedDB (token-bearing Redux).
     edge_src_id = next(s["source_id"] for s in result["sources"] if s["kind"] == "win-edge")
     edge_mirror = settings.mirror_dir / edge_src_id
     assert not (edge_mirror / "Cookies").exists()
     assert not (edge_mirror / "Local Storage").exists()
     assert not (edge_mirror / "Local State").exists()
+    assert not (edge_mirror / "IndexedDB").exists()
+
+
+def test_edge_override_without_idb_does_not_use_desktop_allowlist(tmp_path: Path) -> None:
+    """Invalid Edge path must not fall back to desktop Local Storage copy."""
+    edge = tmp_path / "Microsoft" / "Edge" / "User Data" / "Default"
+    edge.mkdir(parents=True)
+    (edge / "Cookies").write_text("secret", encoding="utf-8")
+    ls = edge / "Local Storage" / "leveldb"
+    ls.mkdir(parents=True)
+    (ls / "CURRENT").write_text("x", encoding="utf-8")
+    (edge / "Local Storage" / "localConfig_v2.json").write_text(
+        '{"token":"xoxc-FAKE"}', encoding="utf-8"
+    )
+    settings = Settings(data_dir=tmp_path / "data", source_overrides=[edge])
+    result = run_snapshot_once(settings)
+    assert result.get("error") == "no_valid_profiles"
+    assert not (settings.mirror_dir).exists() or not any(settings.mirror_dir.iterdir())
+
+
+def test_second_source_records_sightings_on_known_generation(tmp_path: Path) -> None:
+    """Identical sanitized state from Edge after desktop still adds edge.* sightings."""
+    import shutil
+
+    edge = build_edge_browser_profile(
+        tmp_path / "Microsoft" / "Edge" / "User Data" / "Default",
+        with_reply_body=True,
+    )
+    # Desktop-shaped tree sharing the exact same IndexedDB blobs → same state sha256.
+    desktop = tmp_path / "SlackDesktop"
+    shutil.copytree(edge / "IndexedDB", desktop / "IndexedDB")
+    (desktop / "storage").mkdir(parents=True)
+    (desktop / "storage" / "root-state.json").write_text("{}", encoding="utf-8")
+    (desktop / "local-settings.json").write_text("{}", encoding="utf-8")
+
+    data = tmp_path / "data"
+    r1 = run_snapshot_once(Settings(data_dir=data, source_overrides=[desktop]))
+    assert r1["generations_new"] >= 1
+    r2 = run_snapshot_once(Settings(data_dir=data, source_overrides=[edge]))
+    assert r2["skipped_known_generations"] >= 1
+    repo = SqliteRepository(data / "archive.db", read_only=True)
+    sights = repo._conn.execute(  # noqa: SLF001
+        """
+        SELECT DISTINCT source FROM message_sightings
+        WHERE channel_id='C0SYNTHPUB1' AND ts='1763400000.000100'
+        """
+    ).fetchall()
+    sources = {r["source"] for r in sights}
+    assert any(s.startswith("edge.") for s in sources)
+    assert any(not s.startswith("edge.") for s in sources)
+    repo.close()
+
+
+def test_desktop_does_not_suspect_edge_only_replies(tmp_path: Path) -> None:
+    """Thinner desktop window must not mark Edge-filled replies as suspected."""
+    from tests.fixture_gen.build_profile import _workspace_state, write_blob
+
+    edge = build_edge_browser_profile(
+        tmp_path / "Microsoft" / "Edge" / "User Data" / "Default",
+        with_reply_body=True,
+    )
+    desktop = build_desktop_missing_reply_profile(tmp_path / "SlackDesktop")
+    data = tmp_path / "data"
+    run_snapshot_once(Settings(data_dir=data, source_overrides=[edge]))
+
+    # Two distinct desktop generations lacking the Edge-only reply (streak threshold=2).
+    for blob_n in (2, 3):
+        state = _workspace_state(
+            workspace_key="T0SYNTHAAA",
+            team_id="T0SYNTHAAA",
+            user_id="U0SELF0001",
+            team_name="Synth Team A",
+            domain="synth-a",
+            guest=False,
+        )
+        pub = state["messages"]["C0SYNTHPUB1"]
+        pub.pop("1763400001.000200", None)
+        # Vary content so each pass is a new state generation.
+        pub["1763400000.000100"]["text"] = f"synthetic root gen{blob_n} about widgets"
+        pub["1763400000.000100"]["reply_count"] = 1
+        pub["1763400000.000100"]["latest_reply"] = "1763400001.000200"
+        for slice_name in ("threads", "allThreads"):
+            bucket = state.get(slice_name)
+            if isinstance(bucket, dict) and "C0SYNTHPUB1" in bucket:
+                bucket["C0SYNTHPUB1"] = {
+                    "1763400000.000100": {
+                        "replies": [pub["1763400000.000100"]],
+                        "reply_count": 1,
+                    }
+                }
+        write_blob(
+            desktop
+            / "IndexedDB"
+            / "https_app.slack.com_0.indexeddb.blob"
+            / "1"
+            / "00"
+            / str(blob_n),
+            state,
+            v8_version=16,
+        )
+        run_snapshot_once(Settings(data_dir=data, source_overrides=[desktop]))
+
+    repo = SqliteRepository(data / "archive.db", read_only=True)
+    for ts in ("1763400001.000200", "1763400999.000100"):
+        row = repo._conn.execute(  # noqa: SLF001
+            "SELECT deleted_state FROM messages WHERE channel_id=? AND ts=?",
+            ("C0SYNTHPUB1", ts),
+        ).fetchone()
+        assert row is not None
+        assert row["deleted_state"] != "suspected"
+    repo.close()
+
+
+def test_doctor_skips_edge_session_storage(tmp_path: Path) -> None:
+    from slack_cache_mcp.desktop.doctor import run_doctor
+
+    edge = build_edge_browser_profile(
+        tmp_path / "Microsoft" / "Edge" / "User Data" / "Default"
+    )
+    settings = Settings(data_dir=tmp_path / "data", source_overrides=[edge])
+    report = run_doctor(settings)
+    assert report["edge_sources"] == 1
+    assert report["session_storage"].get("skipped") == "edge_idb_only"
+    assert report["local_storage_key_patterns"] == []
+    assert report["http_cache"].get("skipped") == "edge_idb_only"
 
 
 def test_full_synthetic_desktop_still_works(tmp_path: Path) -> None:

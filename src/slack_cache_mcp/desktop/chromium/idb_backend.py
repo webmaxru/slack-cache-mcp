@@ -39,16 +39,27 @@ class IdbBackend(Protocol):
     def read_blob(self, ref: int | str) -> bytes | None: ...
 
 
-def detect_idb_backend(profile_or_mirror: Path) -> str:
+def detect_idb_backend(
+    profile_or_mirror: Path, *, slack_origin_only: bool = False
+) -> str:
     """Return 'sqlite' | 'leveldb' | 'missing' | 'unknown' without opening live DBs unsafely.
 
     Detection opens files read-only for a 16-byte header check only.
+    When ``slack_origin_only`` (Edge doctor), only inspect the Slack app origin IDB dirs.
     """
     origin = idb_origin_dir_name()
     idb = Path(profile_or_mirror) / "IndexedDB"
     if not idb.is_dir():
         return "missing"
-    for p in idb.rglob("*"):
+    if slack_origin_only:
+        scan_roots = [idb / f"{origin}.leveldb", idb / f"{origin}.blob"]
+        file_iter: list[Path] = []
+        for root in scan_roots:
+            if root.is_dir():
+                file_iter.extend(p for p in root.rglob("*") if p.is_file())
+    else:
+        file_iter = list(idb.rglob("*"))
+    for p in file_iter:
         if not p.is_file() or p.name == "LOCK":
             continue
         try:
@@ -60,7 +71,9 @@ def detect_idb_backend(profile_or_mirror: Path) -> str:
             return "sqlite"
     if (idb / f"{origin}.leveldb").is_dir():
         return "leveldb"
-    if any(idb.glob("*.indexeddb.leveldb")) or any(idb.glob("*.indexeddb.blob")):
+    if not slack_origin_only and (
+        any(idb.glob("*.indexeddb.leveldb")) or any(idb.glob("*.indexeddb.blob"))
+    ):
         return "leveldb"
     return "unknown"
 

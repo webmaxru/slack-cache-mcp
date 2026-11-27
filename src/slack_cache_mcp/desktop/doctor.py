@@ -24,10 +24,14 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
     session_inv: dict[str, Any] = {"present": False}
     local_keys: list[str] = []
     http_inv: dict[str, Any] = {"present": False}
-    for p in profiles:
-        if not p.valid:
-            continue
-        backend = detect_idb_backend(p.path)
+    # Prefer a desktop profile for inventories; Edge is Slack-IDB-only.
+    ordered = sorted(
+        [p for p in profiles if p.valid],
+        key=lambda p: (p.is_edge_browser, not p.primary),
+    )
+    for p in ordered:
+        edge_only = p.is_edge_browser
+        backend = detect_idb_backend(p.path, slack_origin_only=edge_only)
         blob_root = p.path / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
         if blob_root.is_dir():
             for bf in blob_root.rglob("*"):
@@ -44,9 +48,14 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
                         for k in redux.unknown_slices(val):
                             if k not in unknown_slices:
                                 unknown_slices.append(k)
-        session_inv = session_scan.inventory_session_storage(p.path)
-        local_keys = localstate.inventory_local_storage_keys(p.path)
-        http_inv = inventory_http_cache(p.path)
+        if edge_only:
+            session_inv = {"present": False, "skipped": "edge_idb_only"}
+            local_keys = []
+            http_inv = {"present": False, "skipped": "edge_idb_only"}
+        else:
+            session_inv = session_scan.inventory_session_storage(p.path)
+            local_keys = localstate.inventory_local_storage_keys(p.path)
+            http_inv = inventory_http_cache(p.path)
         break
 
     vault_objects = 0

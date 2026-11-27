@@ -15,7 +15,12 @@ from slack_cache_mcp.config import Settings
 from slack_cache_mcp.desktop.chromium import httpcache
 from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend, open_idb_backend
 from slack_cache_mcp.desktop.chromium.idb_values import decode_blob_file, idb_origin_dir_name
-from slack_cache_mcp.desktop.locate import SlackProfile, discover_profiles, redact_path
+from slack_cache_mcp.desktop.locate import (
+    SlackProfile,
+    discover_profiles,
+    infer_override_kind,
+    redact_path,
+)
 from slack_cache_mcp.desktop.sanitize import sanitize
 from slack_cache_mcp.desktop.slack import (
     canvas,
@@ -137,8 +142,15 @@ def _apply_coverage_and_suspected(
     *,
     state_sha256: str,
     seen_at: str,
+    apply_suspected: bool = True,
+    protect_edge_sightings: bool = True,
 ) -> int:
-    """Update coverage ranges / channel_status and mark suspected deletions. Returns count marked."""
+    """Update coverage ranges / channel_status and mark suspected deletions. Returns count marked.
+
+    Edge streams never drive suspected deletion (gap-fillers, not deletion authority).
+    Desktop streams skip ts that already have ``edge.*`` sightings so a thinner desktop
+    window cannot hide Edge-filled reply bodies.
+    """
     marked_total = 0
     latests = clean.get("channelLatests") if isinstance(clean.get("channelLatests"), dict) else {}
     unreads = clean.get("unreadCounts") if isinstance(clean.get("unreadCounts"), dict) else {}
@@ -178,8 +190,10 @@ def _apply_coverage_and_suspected(
             unread_count=unread,
             seen_at=seen_at,
         )
-        if win.contiguous_to_latest:
+        if apply_suspected and win.contiguous_to_latest:
             missing = suspected_missing(previously_seen=known_in_window, window=win)
+            if protect_edge_sightings and missing:
+                missing -= repo.list_edge_sighted_ts(win.channel_id, missing)
             marked = repo.apply_suspected_deletions(
                 win.channel_id,
                 missing,
@@ -188,6 +202,68 @@ def _apply_coverage_and_suspected(
             )
             marked_total += len(marked)
     return marked_total
+
+
+def _scrub_edge_raw_idb(mirror: Path) -> None:
+    """After Edge ingest, delete raw IndexedDB copies (may contain tokens in Redux blobs).
+
+    Sanitized content already lives in the vault/archive. Manifest entries for IndexedDB
+    are dropped so the next cycle re-copies from the live Edge profile when needed.
+    """
+    idb = mirror / "IndexedDB"
+    if idb.exists():
+        _rmtree_credential_scratch(idb)
+    manifest_path = mirror / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return
+    for key in list(files):
+        if key == "IndexedDB" or str(key).startswith("IndexedDB/"):
+            files.pop(key, None)
+    data["files"] = files
+    manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _record_sightings_from_state(
+    *,
+    repo: SqliteRepository,
+    clean: dict[str, Any],
+    edge_mode: bool,
+    capture_dms: bool,
+    device_id: str,
+    snapshot_id: str,
+    state_sha256: str,
+    seen_at: str,
+    hlc: HLC,
+) -> tuple[int, dict[str, int]]:
+    """Extract messages and upsert sightings (used for new and known state generations)."""
+    _ws, channels, _users, _files, messages, _reactions, _saved = redux.extract_all(clean)
+    _channels, messages = _filter_dms(channels, messages, capture_dms=capture_dms)
+    if edge_mode:
+        _tag_edge_observations(messages)
+    ingested = 0
+    by_source: dict[str, int] = {}
+    for obs in messages:
+        if repo.ingest_observation(
+            obs,
+            device_id=device_id,
+            snapshot_id=snapshot_id,
+            state_sha256=state_sha256,
+            seen_at=seen_at,
+            hlc=hlc.now(),
+        ):
+            ingested += 1
+            by_source[obs.source] = by_source.get(obs.source, 0) + 1
+        else:
+            # Version already known — sighting still recorded; count provenance bumps.
+            by_source[obs.source] = by_source.get(obs.source, 0)
+    return ingested, by_source
 
 
 def _ingest_profile(
@@ -275,6 +351,22 @@ def _ingest_profile(
                 if repo.has_state_generation(sha):
                     repo.touch_state_generation(sha, seen_at)
                     skipped_known += 1
+                    # Still record multi-source sightings (desktop vs Edge provenance).
+                    n_new, by_src = _record_sightings_from_state(
+                        repo=repo,
+                        clean=clean,
+                        edge_mode=edge_mode,
+                        capture_dms=settings.capture_dms,
+                        device_id=device_id,
+                        snapshot_id=snapshot_id,
+                        state_sha256=sha,
+                        seen_at=seen_at,
+                        hlc=hlc,
+                    )
+                    messages_ingested += n_new
+                    for src_name, n in by_src.items():
+                        if n:
+                            _bump(src_name, messages=n)
                     continue
 
                 generations_new += 1
@@ -336,7 +428,12 @@ def _ingest_profile(
                         _bump(obs.source, messages=1)
 
                 suspected_marked += _apply_coverage_and_suspected(
-                    repo, clean, state_sha256=sha, seen_at=seen_at
+                    repo,
+                    clean,
+                    state_sha256=sha,
+                    seen_at=seen_at,
+                    apply_suspected=not edge_mode,
+                    protect_edge_sightings=not edge_mode,
                 )
 
         # Historical / inline IDB records (LevelDB + side-cars)
@@ -508,6 +605,9 @@ def _ingest_profile(
             known_keys.add(key)
     finally:
         _scrub_credential_scratch(mirror)
+        if edge_mode:
+            # Raw Edge IndexedDB blobs can hold tokens inside Redux; drop after sanitize/vault.
+            _scrub_edge_raw_idb(mirror)
 
     for src_name, counts in yield_counts.items():
         repo.record_source_yield(
@@ -572,11 +672,18 @@ def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[s
     profiles = discover_profiles(overrides=settings.source_overrides or None)
     valid = [p for p in profiles if p.valid]
     if not valid and settings.source_overrides:
-        valid = [
-            SlackProfile(path=Path(p), kind="override", valid=True, primary=True)
-            for p in settings.source_overrides
-            if Path(p).exists()
-        ]
+        # Force-valid only for non-Edge overrides. Edge paths without Slack IDB must not
+        # fall back to the desktop allowlist (would copy Local Storage / other origins).
+        forced: list[SlackProfile] = []
+        for raw in settings.source_overrides:
+            path = Path(raw)
+            if not path.exists():
+                continue
+            kind = infer_override_kind(path)
+            if kind == "win-edge":
+                continue
+            forced.append(SlackProfile(path=path, kind=kind, valid=True, primary=True))
+        valid = forced
     if not valid:
         return {"error": "no_valid_profiles", "profiles": [], "trigger": trigger}
 

@@ -1437,6 +1437,26 @@ class SqliteRepository:
         ).fetchone()
         return int(row["c"]) if row else 0
 
+    def list_edge_sighted_ts(self, channel_id: str, candidates: set[str]) -> set[str]:
+        """Return subset of ``candidates`` that have at least one ``edge.*`` sighting."""
+        if not candidates:
+            return set()
+        out: set[str] = set()
+        # Chunk IN lists for SQLite variable limits.
+        items = list(candidates)
+        for i in range(0, len(items), 400):
+            chunk = items[i : i + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT ts FROM message_sightings
+                WHERE channel_id=? AND source LIKE 'edge.%' AND ts IN ({placeholders})
+                """,
+                (channel_id, *chunk),
+            ).fetchall()
+            out.update(str(r["ts"]) for r in rows)
+        return out
+
     def list_known_message_ts(
         self,
         channel_id: str,

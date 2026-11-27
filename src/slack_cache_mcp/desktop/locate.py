@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from dataclasses import dataclass
@@ -60,15 +61,26 @@ def windows_edge_candidates(env: dict[str, str] | None = None) -> list[tuple[Pat
     return [(edge_default, "win-edge")]
 
 
+def _path_looks_like_edge_user_data(path: Path) -> bool:
+    """True when path (or a resolved target) is under Edge/User Data (symlink-safe)."""
+    candidates = [Path(path)]
+    with contextlib.suppress(OSError):
+        candidates.append(Path(path).resolve())
+    for cand in candidates:
+        parts_lower = [p.lower() for p in cand.parts]
+        try:
+            edge_idx = parts_lower.index("edge")
+        except ValueError:
+            continue
+        # .../Edge/User Data/...
+        if edge_idx + 1 < len(parts_lower) and parts_lower[edge_idx + 1] == "user data":
+            return True
+    return False
+
+
 def infer_override_kind(path: Path) -> str:
     """Classify a config/CLI override path (Edge Default → win-edge; else override)."""
-    parts_lower = [p.lower() for p in Path(path).parts]
-    try:
-        edge_idx = parts_lower.index("edge")
-    except ValueError:
-        return "override"
-    # .../Edge/User Data/Default (or deeper under Default)
-    if edge_idx + 2 < len(parts_lower) and parts_lower[edge_idx + 1] == "user data":
+    if _path_looks_like_edge_user_data(path):
         return "win-edge"
     return "override"
 

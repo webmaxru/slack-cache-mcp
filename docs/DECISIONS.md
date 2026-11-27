@@ -130,3 +130,10 @@ Edge-ingested observations use `edge.<slice>` source labels (e.g. `edge.redux.me
 
 ### Motivation (Maxim A/B)
 Offline probe of Edge IDB showed reply **bodies** for threads where the desktop archive had `reply_count` metadata but `replies_captured=0`. M5.1 productizes that second observation stream under the offline-only rules.
+
+### Copilot hardening (PR #7)
+- Edge overrides without Slack IDB never fall back to the desktop allowlist; kind inference resolves symlinks/junctions.
+- After Edge ingest, raw IndexedDB is deleted from the mirror (sanitized content already in vault/archive).
+- Edge never drives suspected-deletion; desktop coverage skips ts that already have `edge.*` sightings.
+- Known state generations still record multi-source sightings (desktop vs Edge provenance).
+- Doctor inventories Session/Local Storage / HTTP cache only on desktop profiles; Edge is Slack-IDB-only.
