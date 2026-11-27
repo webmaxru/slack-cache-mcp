@@ -2439,6 +2439,65 @@ class SqliteRepository:
                 return False
             raise
 
+    _EMBED_OP_LOCK_KEY = "embedding_op_lock"
+
+    def embedding_op_lock_held(self) -> bool:
+        """True when a CLI rebuild holds the cross-process embedding op lock."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
+        ).fetchone()
+        return bool(row and str(row["value"]))
+
+    def acquire_embedding_op_lock(self, owner: str) -> bool:
+        """Acquire exclusive meta lock for destructive embed rebuilds.
+
+        Survives nested SQLite commits inside ``rebuild_all`` / ``embed_pending``
+        so a concurrent daemon cannot promote the model mid-rebuild.
+        """
+        started = self._begin_immediate()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
+            ).fetchone()
+            if row and str(row["value"]) and str(row["value"]) != owner:
+                if started:
+                    self._conn.commit()
+                return False
+            self._conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (self._EMBED_OP_LOCK_KEY, owner),
+            )
+            if started:
+                self._conn.commit()
+            return True
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
+    def release_embedding_op_lock(self, owner: str) -> None:
+        """Release the embedding op lock if still owned by ``owner``."""
+        started = self._begin_immediate()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
+            ).fetchone()
+            if row and str(row["value"]) == owner:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key=?", (self._EMBED_OP_LOCK_KEY,)
+                )
+            if started:
+                self._conn.commit()
+        except Exception:
+            if started:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.rollback()
+            raise
+
     def _ensure_dirty_seq_initialized(self) -> None:
         """Seed ``window_dirty_seq`` above legacy map gens; never overwrite."""
         key = "window_dirty_seq"

@@ -214,6 +214,20 @@ def test_refuse_hashing_demotion(archive: SqliteRepository) -> None:
     assert allowed.get("error") != "refuse_hashing_demotion"
 
 
+def test_embedding_op_lock_exclusive(archive: SqliteRepository) -> None:
+    """Meta lock survives commits and blocks a second owner."""
+    assert archive.acquire_embedding_op_lock("owner-a") is True
+    archive._conn.commit()  # noqa: SLF001
+    assert archive.embedding_op_lock_held() is True
+    assert archive.acquire_embedding_op_lock("owner-b") is False
+    archive.release_embedding_op_lock("owner-b")  # no-op for other owner
+    assert archive.embedding_op_lock_held() is True
+    archive.release_embedding_op_lock("owner-a")
+    assert archive.embedding_op_lock_held() is False
+    assert archive.acquire_embedding_op_lock("owner-b") is True
+    archive.release_embedding_op_lock("owner-b")
+
+
 def test_whats_new_legacy_rowbound(archive: SqliteRepository) -> None:
     """Legacy finish pins to insertion boundary, not max first_seen rowid."""
     store = Path(archive.path).parent / "client_state.json"

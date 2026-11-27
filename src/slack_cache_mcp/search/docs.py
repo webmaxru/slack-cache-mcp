@@ -12,6 +12,8 @@ from slack_cache_mcp.store.sqlite.repo import SqliteRepository
 WINDOW_GAP_S = 15 * 60
 WINDOW_MAX_CHARS = 1600
 THREAD_MAX_CHARS = 1600
+# Keep each publish write txn well under busy_timeout (5s).
+WINDOW_PUBLISH_BATCH = 64
 
 
 def _sha(text: str) -> str:
@@ -266,14 +268,17 @@ class SearchDocsBuilder:
     def rebuild_dirty_windows(self) -> dict[str, int]:
         """Rebuild dirty channels one-by-one; ack only the generation rebuilt.
 
-        Plans windows from a read snapshot outside the write lock, then publishes
-        under a short transaction after re-validating the dirty generation —
-        avoiding multi-second DB-wide locks that trip the busy timeout.
+        Plans + upserts outside the DB-wide write lock (batched commits), then
+        finalizes stale deletes from *current* rows and acks under a short
+        IMMEDIATE transaction — avoiding multi-second busy_timeout trips and
+        stale-ID deletes from a pre-lock snapshot.
         """
         pending = self.repo.peek_dirty_window_channels()
         out: dict[str, int] = {}
         for channel_id, generation in pending:
             plan = self._plan_windows_for_channel(channel_id)
+            if not self._upsert_window_buckets(channel_id, plan, generation):
+                continue
             started = self.repo._begin_immediate()  # noqa: SLF001
             try:
                 cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
@@ -281,7 +286,7 @@ class SearchDocsBuilder:
                     if started:
                         self.repo._conn.commit()  # noqa: SLF001
                     continue
-                n = self._publish_window_plan(channel_id, plan)
+                n = self._finalize_window_plan(channel_id, plan)
                 cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
                 if cur is None or int(cur) != int(generation):
                     if started:
@@ -300,7 +305,7 @@ class SearchDocsBuilder:
     def _plan_windows_for_channel(
         self, channel_id: str
     ) -> dict[str, Any]:
-        """Read-only snapshot: workspace, existing window keys, desired buckets."""
+        """Read-only snapshot: workspace + desired buckets (no doc IDs)."""
         ch = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT workspace_key FROM messages
@@ -308,19 +313,8 @@ class SearchDocsBuilder:
             """,
             (channel_id,),
         ).fetchone()
-        existing = self.repo._conn.execute(  # noqa: SLF001
-            """
-            SELECT doc_id, start_ts, end_ts, anchor_ts FROM search_docs
-            WHERE channel_id=? AND kind='window'
-            """,
-            (channel_id,),
-        ).fetchall()
         if not ch:
-            return {
-                "workspace_key": None,
-                "existing": [dict(r) for r in existing],
-                "buckets": [],
-            }
+            return {"workspace_key": None, "buckets": []}
         msgs = self.repo._conn.execute(  # noqa: SLF001
             """
             SELECT ts, ts_num, user_id, search_text, text FROM messages
@@ -345,7 +339,6 @@ class SearchDocsBuilder:
             buckets.append(self._bucket_payload(bucket))
         return {
             "workspace_key": ch["workspace_key"],
-            "existing": [dict(r) for r in existing],
             "buckets": buckets,
         }
 
@@ -360,18 +353,14 @@ class SearchDocsBuilder:
             "text": text[: WINDOW_MAX_CHARS * 2],
         }
 
-    def _publish_window_plan(self, channel_id: str, plan: dict[str, Any]) -> int:
-        """Apply a planned window set under the caller's write transaction."""
-        existing = plan["existing"]
+    def _upsert_window_buckets(
+        self, channel_id: str, plan: dict[str, Any], generation: int
+    ) -> bool:
+        """Upsert planned buckets in small commits. False if dirty gen raced away."""
         workspace_key = plan["workspace_key"]
         if workspace_key is None:
-            self._delete_doc_ids([int(r["doc_id"]) for r in existing])
-            return 0
-        desired_keys: set[tuple[str, str, str]] = set()
-        n = 0
-        for b in plan["buckets"]:
-            key = (b["anchor_ts"], b["start_ts"], b["end_ts"])
-            desired_keys.add(key)
+            return True
+        for i, b in enumerate(plan["buckets"], start=1):
             self.repo.upsert_search_doc(
                 kind="window",
                 workspace_key=workspace_key,
@@ -381,14 +370,37 @@ class SearchDocsBuilder:
                 end_ts=b["end_ts"],
                 text=b["text"],
             )
-            n += 1
+            if i % WINDOW_PUBLISH_BATCH == 0:
+                self.repo._conn.commit()  # noqa: SLF001
+                cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
+                if cur is None or int(cur) != int(generation):
+                    return False
+        self.repo._conn.commit()  # noqa: SLF001
+        return True
+
+    def _finalize_window_plan(self, channel_id: str, plan: dict[str, Any]) -> int:
+        """Under caller's write lock: drop stale windows from *current* rows."""
+        current = self.repo._conn.execute(  # noqa: SLF001
+            """
+            SELECT doc_id, start_ts, end_ts, anchor_ts FROM search_docs
+            WHERE channel_id=? AND kind='window'
+            """,
+            (channel_id,),
+        ).fetchall()
+        workspace_key = plan["workspace_key"]
+        if workspace_key is None:
+            self._delete_doc_ids([int(r["doc_id"]) for r in current])
+            return 0
+        desired_keys = {
+            (b["anchor_ts"], b["start_ts"], b["end_ts"]) for b in plan["buckets"]
+        }
         stale_ids = [
             int(r["doc_id"])
-            for r in existing
+            for r in current
             if (r["anchor_ts"], r["start_ts"], r["end_ts"]) not in desired_keys
         ]
         self._delete_doc_ids(stale_ids)
-        return n
+        return len(plan["buckets"])
 
     def _invalidate_and_rebuild_windows_around(
         self, channel_id: str, focus_ts: str

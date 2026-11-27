@@ -267,6 +267,8 @@ def rebuild_cmd(
     do_all = all_derived or not (fts or embeddings or projection)
     explicit_hashing = os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing"
     emb = load_embedder(models_dir=settings.models_dir) if (do_all or embeddings) else None
+    lock_owner = f"cli-rebuild-{os.getpid()}"
+    lock_held = False
 
     def _refuse_demotion(persisted: str, model_id: str) -> None:
         result["ok"] = False
@@ -277,81 +279,98 @@ def rebuild_cmd(
             "persisted_model": persisted,
             "model_id": model_id,
         }
+        if lock_held:
+            with contextlib.suppress(Exception):
+                repo.release_embedding_op_lock(lock_owner)
         repo.close()
         typer.echo(json.dumps(result, indent=2, default=str))
         raise typer.Exit(code=1)
 
-    # Projection first so FTS/docs see the repaired current view.
-    if do_all or projection:
-        rows = repo._conn.execute(  # noqa: SLF001
-            "SELECT DISTINCT channel_id, ts FROM message_versions"
-        ).fetchall()
-        for r in rows:
-            repo.reproject_message(r["channel_id"], r["ts"])
-        result["projection_rebuilt"] = len(rows)
-    if do_all or fts:
-        result["fts"] = repo.rebuild_fts()
-    if do_all or embeddings:
-        assert emb is not None
-        # Serialize demotion check + destructive rebuild + embed so a concurrent
-        # daemon promotion cannot invalidate the model mid-rebuild.
-        started = repo._begin_immediate()  # noqa: SLF001
-        try:
-            prev = repo._conn.execute(  # noqa: SLF001
+    def _demotion_blocked(persisted: object | None) -> bool:
+        return bool(
+            not explicit_hashing
+            and persisted
+            and not str(persisted).startswith("hashing")
+            and emb is not None
+            and str(emb.model_id).startswith("hashing")
+        )
+
+    try:
+        # Validate model + take cross-process op lock *before* projection mutates
+        # derived docs/embeddings. Nested commits inside rebuild_all/embed_pending
+        # release SQLite locks; the meta lock keeps the daemon from promoting.
+        if do_all or embeddings:
+            assert emb is not None
+            started = repo._begin_immediate()  # noqa: SLF001
+            try:
+                prev = repo._conn.execute(  # noqa: SLF001
+                    "SELECT value FROM meta WHERE key='embedding_model'"
+                ).fetchone()
+                if _demotion_blocked(prev["value"] if prev else None):
+                    if started:
+                        repo._conn.rollback()  # noqa: SLF001
+                    _refuse_demotion(str(prev["value"]), emb.model_id)
+                if started:
+                    repo._conn.commit()  # noqa: SLF001
+            except typer.Exit:
+                raise
+            except Exception:
+                if started:
+                    with contextlib.suppress(Exception):
+                        repo._conn.rollback()  # noqa: SLF001
+                raise
+            if not repo.acquire_embedding_op_lock(lock_owner):
+                result["ok"] = False
+                result["embeddings"] = {
+                    "ok": False,
+                    "embedded": 0,
+                    "error": "embedding_op_lock_held",
+                }
+                repo.close()
+                typer.echo(json.dumps(result, indent=2, default=str))
+                raise typer.Exit(code=1)
+            lock_held = True
+
+        # Projection after preflight so a refused demotion cannot clear embeddings.
+        if do_all or projection:
+            rows = repo._conn.execute(  # noqa: SLF001
+                "SELECT DISTINCT channel_id, ts FROM message_versions"
+            ).fetchall()
+            for r in rows:
+                repo.reproject_message(r["channel_id"], r["ts"])
+            result["projection_rebuilt"] = len(rows)
+        if do_all or fts:
+            result["fts"] = repo.rebuild_fts()
+        if do_all or embeddings:
+            assert emb is not None
+            prev2 = repo._conn.execute(  # noqa: SLF001
                 "SELECT value FROM meta WHERE key='embedding_model'"
             ).fetchone()
-            if (
-                not explicit_hashing
-                and prev
-                and not str(prev["value"]).startswith("hashing")
-                and str(emb.model_id).startswith("hashing")
-            ):
-                if started:
-                    repo._conn.rollback()  # noqa: SLF001
-                _refuse_demotion(str(prev["value"]), emb.model_id)
+            if _demotion_blocked(prev2["value"] if prev2 else None):
+                _refuse_demotion(str(prev2["value"]), emb.model_id)
             builder = SearchDocsBuilder(repo)
             dirty_before = repo.peek_dirty_window_channels()
             counts = builder.rebuild_all()
             for ch, gen in dirty_before:
                 repo.ack_dirty_window_channel(ch, gen)
             result["search_docs"] = counts
-            # Re-check model after rebuild (daemon may have written meta).
-            prev2 = repo._conn.execute(  # noqa: SLF001
-                "SELECT value FROM meta WHERE key='embedding_model'"
-            ).fetchone()
-            if (
-                not explicit_hashing
-                and prev2
-                and not str(prev2["value"]).startswith("hashing")
-                and str(emb.model_id).startswith("hashing")
-            ):
-                if started:
-                    repo._conn.rollback()  # noqa: SLF001
-                _refuse_demotion(str(prev2["value"]), emb.model_id)
             emb_result = embed_pending(
                 repo, emb, allow_hashing_demotion=explicit_hashing
             )
             result["embeddings"] = emb_result
             if isinstance(emb_result, dict) and emb_result.get("ok") is False:
                 result["ok"] = False
-                if started:
-                    repo._conn.rollback()  # noqa: SLF001
-            elif started:
-                repo._conn.commit()  # noqa: SLF001
-        except typer.Exit:
-            raise
-        except Exception:
-            if started:
-                with contextlib.suppress(Exception):
-                    repo._conn.rollback()  # noqa: SLF001
-            raise
-    elif fts:
-        builder = SearchDocsBuilder(repo)
-        dirty_before = repo.peek_dirty_window_channels()
-        counts = builder.rebuild_all()
-        for ch, gen in dirty_before:
-            repo.ack_dirty_window_channel(ch, gen)
-        result["search_docs"] = counts
+        elif fts:
+            builder = SearchDocsBuilder(repo)
+            dirty_before = repo.peek_dirty_window_channels()
+            counts = builder.rebuild_all()
+            for ch, gen in dirty_before:
+                repo.ack_dirty_window_channel(ch, gen)
+            result["search_docs"] = counts
+    finally:
+        if lock_held:
+            with contextlib.suppress(Exception):
+                repo.release_embedding_op_lock(lock_owner)
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
     if result.get("ok") is False:
