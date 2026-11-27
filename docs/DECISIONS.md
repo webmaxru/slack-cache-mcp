@@ -114,5 +114,5 @@ Import rejects unknown senders and signing/age key mismatches against `sync peer
 - `sync peers add` resets **all** push cursors. Decrypt failures are always errors (remove superseded folder bundles after full re-export).
 - Import rejects forged row authors and sighting payload `device_id` mismatches.
 - Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps; epoch bounds are ignored as unknown.
-- Directory upserts always maintain `field_hlcs_json` (seeded on migrate); channel outbox carries association/alias unions; backfill is cover-aware with per-field clocks.
+- Directory upserts maintain `field_hlcs_json`. Unclocked migrated values keep provenance unknown (only overwritten when incoming dominates the row HLC). Channel outbox emits legacy `aliases` strings plus `alias_records` with `first_seen`.
 - Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.

@@ -86,11 +86,24 @@ def _merge_sparse_field(
     existing_field_hlc: str | None,
     incoming_val: Any,
     incoming_hlc: str,
+    *,
+    row_hlc: str | None = None,
 ) -> tuple[Any, str | None]:
-    """Per-field LWW: null incoming is a no-op; non-null keeps its own clock."""
+    """Per-field LWW: null incoming is a no-op; non-null keeps its own clock.
+
+    When a local value exists without a field clock (migrated/unknown provenance),
+    keep it unless the incoming HLC dominates the whole-row clock — never invent a
+    field clock by copying ``updated_hlc`` onto older retained values.
+    """
     if incoming_val is None:
         return existing_val, existing_field_hlc
-    if existing_val is None or _hlc_dominates(incoming_hlc, existing_field_hlc):
+    if existing_val is None:
+        return incoming_val, incoming_hlc
+    if existing_field_hlc is None:
+        if row_hlc is not None and _hlc_dominates(incoming_hlc, row_hlc):
+            return incoming_val, incoming_hlc
+        return existing_val, None
+    if _hlc_dominates(incoming_hlc, existing_field_hlc):
         return incoming_val, incoming_hlc
     return existing_val, existing_field_hlc
 
@@ -367,9 +380,6 @@ class SqliteRepository:
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN field_hlcs_json TEXT NOT NULL DEFAULT '{{}}'"
                 )
-        # Seed empty field clocks from updated_hlc for any non-null sparse fields so
-        # a peer observation with a lower HLC cannot replace migrated local values.
-        self._seed_directory_field_hlcs()
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -412,45 +422,6 @@ class SqliteRepository:
             (peer, direction, cursor, _utc_now()),
         )
         self._conn.commit()
-
-    def _seed_directory_field_hlcs(self) -> None:
-        specs: list[tuple[str, str, tuple[str, ...]]] = [
-            (
-                "workspaces",
-                "workspace_key",
-                ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
-            ),
-            (
-                "channels",
-                "channel_id",
-                ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
-            ),
-            (
-                "users",
-                "user_id",
-                ("team_id", "name", "real_name", "display_name", "title", "tz"),
-            ),
-        ]
-        for table, pk, fields in specs:
-            rows = self._conn.execute(f"SELECT * FROM {table}").fetchall()
-            for row in rows:
-                current = _load_field_hlcs(row["field_hlcs_json"])
-                hlc = str(row["updated_hlc"] or "")
-                if not hlc:
-                    continue
-                changed = False
-                for field in fields:
-                    if row[field] is None:
-                        continue
-                    if field not in current:
-                        current[field] = hlc
-                        changed = True
-                if not changed:
-                    continue
-                self._conn.execute(
-                    f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
-                    (_dump_field_hlcs(current), row[pk]),
-                )
 
     def reset_push_cursors(self) -> int:
         """Reset every push cursor so the next export re-sends full history."""
@@ -752,9 +723,9 @@ class SqliteRepository:
             aliases = [
                 {"name": row["name"], "first_seen": row["first_seen"]} for row in alias_rows
             ]
-            # Union coverage: every workspace/alias must appear in some outbox payload.
+            # Union coverage: every workspace/alias (with earliest first_seen) must appear.
             covered_ws: set[str] = set()
-            covered_aliases: set[str] = set()
+            covered_alias_seen: dict[str, str] = {}
             for prow in self._conn.execute(
                 """
                 SELECT payload_json FROM change_log
@@ -773,15 +744,27 @@ class SqliteRepository:
                 for wk in payload.get("workspace_keys") or []:
                     if isinstance(wk, str):
                         covered_ws.add(wk)
-                for alias in payload.get("aliases") or []:
-                    if isinstance(alias, str):
-                        covered_aliases.add(alias)
-                    elif isinstance(alias, dict) and isinstance(alias.get("name"), str):
-                        covered_aliases.add(alias["name"])
+                records = list(payload.get("alias_records") or [])
+                records.extend(payload.get("aliases") or [])
+                for alias in records:
+                    if isinstance(alias, dict) and isinstance(alias.get("name"), str):
+                        name = alias["name"]
+                        seen = str(alias.get("first_seen") or "")
+                        prev = covered_alias_seen.get(name)
+                        if prev is None or (seen and (not prev or seen < prev)):
+                            covered_alias_seen[name] = seen
+            aliases_covered = True
+            for alias in aliases:
+                name = alias["name"]
+                want = str(alias["first_seen"] or "")
+                got = covered_alias_seen.get(name)
+                if got is None or (want and (not got or got > want)):
+                    aliases_covered = False
+                    break
             if (
                 self._outbox_covers_fields(device_id, "channel", r["channel_id"], required)
                 and set(ws_keys).issubset(covered_ws)
-                and {a["name"] for a in aliases}.issubset(covered_aliases)
+                and aliases_covered
             ):
                 continue
             ch = Channel(
@@ -811,7 +794,8 @@ class SqliteRepository:
                     "channel_id": ch.channel_id,
                     "workspace_key": ch.workspace_key,
                     "workspace_keys": ws_keys,
-                    "aliases": aliases,
+                    "aliases": [a["name"] for a in aliases],
+                    "alias_records": aliases,
                     "context_team_id": ch.context_team_id,
                     "name": ch.name,
                     "kind": ch.kind,
@@ -1385,7 +1369,11 @@ class SqliteRepository:
             def _take(field: str, current: Any, incoming: Any) -> Any:
                 clock_in = (incoming_field_hlcs or {}).get(field, hlc)
                 value, clock = _merge_sparse_field(
-                    current, field_hlcs.get(field), incoming, clock_in
+                    current,
+                    field_hlcs.get(field),
+                    incoming,
+                    clock_in,
+                    row_hlc=existing["updated_hlc"],
                 )
                 if clock:
                     field_hlcs[field] = clock
@@ -1524,7 +1512,11 @@ class SqliteRepository:
                 def _take(field: str, current: Any, incoming: Any) -> Any:
                     clock_in = (incoming_field_hlcs or {}).get(field, hlc)
                     value, clock = _merge_sparse_field(
-                        current, field_hlcs.get(field), incoming, clock_in
+                        current,
+                        field_hlcs.get(field),
+                        incoming,
+                        clock_in,
+                        row_hlc=existing["updated_hlc"],
                     )
                     if clock:
                         field_hlcs[field] = clock
@@ -1626,7 +1618,8 @@ class SqliteRepository:
                             "channel_id": stored["channel_id"],
                             "workspace_key": stored["workspace_key"],
                             "workspace_keys": ws_keys,
-                            "aliases": aliases,
+                            "aliases": [a["name"] for a in aliases],
+                            "alias_records": aliases,
                             "context_team_id": stored["context_team_id"],
                             "name": stored["name"],
                             "kind": stored["kind"],
@@ -1793,7 +1786,11 @@ class SqliteRepository:
                 def _take(field: str, current: Any, incoming: Any) -> Any:
                     clock_in = (incoming_field_hlcs or {}).get(field, hlc)
                     value, clock = _merge_sparse_field(
-                        current, field_hlcs.get(field), incoming, clock_in
+                        current,
+                        field_hlcs.get(field),
+                        incoming,
+                        clock_in,
+                        row_hlc=existing["updated_hlc"],
                     )
                     if clock:
                         field_hlcs[field] = clock

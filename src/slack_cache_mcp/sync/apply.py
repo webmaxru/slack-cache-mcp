@@ -278,7 +278,12 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
                 """,
                 (ch.channel_id, wk),
             )
-    for alias in payload.get("aliases") or []:
+    alias_items: list[Any] = []
+    if isinstance(payload.get("alias_records"), list):
+        alias_items.extend(payload["alias_records"])
+    if isinstance(payload.get("aliases"), list):
+        alias_items.extend(payload["aliases"])
+    for alias in alias_items:
         alias_name: str | None = None
         alias_seen = seen_at
         if isinstance(alias, str) and alias:
