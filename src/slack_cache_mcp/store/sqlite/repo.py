@@ -32,7 +32,7 @@ from slack_cache_mcp.ingest.projection import (
     max_merge_thread_meta,
 )
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 _XOX_RE = re.compile(rb"xox[a-z]-", re.I)
@@ -300,18 +300,157 @@ class SqliteRepository:
               ON search_docs(channel_id, anchor_ts)
             """
         )
+        # M5 sync cursors (additive)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_cursors (
+              peer TEXT NOT NULL,
+              direction TEXT NOT NULL,
+              cursor TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (peer, direction)
+            ) STRICT
+            """
+        )
 
-    def upsert_device(self, device_id: str, label: str) -> None:
+    def upsert_device(
+        self, device_id: str, label: str, *, public_key: str | None = None
+    ) -> None:
         now = _utc_now()
         self._conn.execute(
             """
-            INSERT INTO devices(device_id, label, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET label=excluded.label
+            INSERT INTO devices(device_id, label, public_key, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+              label=excluded.label,
+              public_key=COALESCE(excluded.public_key, devices.public_key)
             """,
-            (device_id, label, now),
+            (device_id, label, public_key, now),
         )
         self._conn.commit()
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT device_id, label, public_key, created_at FROM devices ORDER BY device_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_sync_cursor(self, peer: str, direction: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT cursor FROM sync_cursors WHERE peer=? AND direction=?",
+            (peer, direction),
+        ).fetchone()
+        return str(row["cursor"]) if row else None
+
+    def set_sync_cursor(self, peer: str, direction: str, cursor: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(peer, direction) DO UPDATE SET
+              cursor=excluded.cursor,
+              updated_at=excluded.updated_at
+            """,
+            (peer, direction, cursor, _utc_now()),
+        )
+        self._conn.commit()
+
+    def change_log_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) AS c FROM change_log").fetchone()["c"])
+
+    def max_local_hlc(self, device_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT hlc FROM change_log WHERE device_id=? ORDER BY seq DESC LIMIT 1",
+            (device_id,),
+        ).fetchone()
+        return str(row["hlc"]) if row else None
+
+    def has_change_log(
+        self,
+        *,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        payload_sha256: str,
+    ) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM change_log
+            WHERE device_id=? AND entity=? AND entity_key=? AND payload_sha256=?
+            """,
+            (device_id, entity, entity_key, payload_sha256),
+        ).fetchone()
+        return row is not None
+
+    def insert_change_log_row(
+        self,
+        *,
+        hlc: str,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        op: str,
+        payload: dict[str, Any],
+        payload_sha256: str,
+    ) -> bool:
+        """Insert outbox row. Returns True if a new row was written."""
+        from slack_cache_mcp.desktop.sanitize import sanitize
+
+        clean = sanitize(payload)
+        if not isinstance(clean, dict):
+            raise TypeError("change_log payload must sanitize to a dict")
+        payload_json = json.dumps(clean, sort_keys=True, ensure_ascii=False)
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO change_log(
+              hlc, device_id, entity, entity_key, op, payload_json, payload_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (hlc, device_id, entity, entity_key, op, payload_json, payload_sha256),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def list_change_log_since(
+        self, *, device_id: str, since_seq: int
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT seq, hlc, device_id, entity, entity_key, op, payload_json, payload_sha256
+            FROM change_log
+            WHERE device_id=? AND seq > ?
+            ORDER BY seq ASC
+            """,
+            (device_id, since_seq),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def append_entity_change(
+        self,
+        *,
+        hlc: str,
+        device_id: str,
+        entity: str,
+        entity_key: str,
+        payload: dict[str, Any],
+        op: str = "upsert",
+    ) -> bool:
+        from slack_cache_mcp.desktop.sanitize import sanitize
+
+        clean = sanitize(payload)
+        if not isinstance(clean, dict):
+            raise TypeError("change_log payload must sanitize to a dict")
+        blob = json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        sha = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return self.insert_change_log_row(
+            hlc=hlc,
+            device_id=device_id,
+            entity=entity,
+            entity_key=entity_key,
+            op=op,
+            payload=clean,
+            payload_sha256=sha,
+        )
 
     def upsert_source(
         self,
@@ -607,7 +746,15 @@ class SqliteRepository:
         self._conn.commit()
         return marked
 
-    def upsert_workspace(self, ws: Workspace, hlc: str, seen_at: str) -> None:
+    def upsert_workspace(
+        self,
+        ws: Workspace,
+        hlc: str,
+        seen_at: str,
+        *,
+        device_id: str | None = None,
+        write_change_log: bool = True,
+    ) -> None:
         raw = json.dumps(ws.raw, ensure_ascii=False)
         self._conn.execute(
             """
@@ -640,9 +787,36 @@ class SqliteRepository:
                 hlc,
             ),
         )
+        if write_change_log and device_id:
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="workspace",
+                entity_key=ws.workspace_key,
+                payload={
+                    "workspace_key": ws.workspace_key,
+                    "team_id": ws.team_id,
+                    "enterprise_id": ws.enterprise_id,
+                    "name": ws.name,
+                    "domain": ws.domain,
+                    "self_user_id": ws.self_user_id,
+                    "self_is_guest": ws.self_is_guest,
+                    "raw": ws.raw,
+                    "first_seen": seen_at,
+                    "last_seen": seen_at,
+                },
+            )
         self._conn.commit()
 
-    def upsert_channel(self, ch: Channel, hlc: str, seen_at: str) -> None:
+    def upsert_channel(
+        self,
+        ch: Channel,
+        hlc: str,
+        seen_at: str,
+        *,
+        device_id: str | None = None,
+        write_change_log: bool = True,
+    ) -> None:
         raw = json.dumps(ch.raw, ensure_ascii=False)
         self._conn.execute(
             """
@@ -696,9 +870,40 @@ class SqliteRepository:
                 """,
                 (ch.channel_id, ch.name, seen_at),
             )
+        if write_change_log and device_id:
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="channel",
+                entity_key=ch.channel_id,
+                payload={
+                    "channel_id": ch.channel_id,
+                    "workspace_key": ch.workspace_key,
+                    "context_team_id": ch.context_team_id,
+                    "name": ch.name,
+                    "kind": ch.kind,
+                    "is_ext_shared": ch.is_ext_shared,
+                    "is_archived": ch.is_archived,
+                    "is_member": ch.is_member,
+                    "topic": ch.topic,
+                    "purpose": ch.purpose,
+                    "im_user_id": ch.im_user_id,
+                    "raw": ch.raw,
+                    "first_seen": seen_at,
+                    "last_seen": seen_at,
+                },
+            )
         self._conn.commit()
 
-    def upsert_user(self, user: User, hlc: str, seen_at: str) -> None:
+    def upsert_user(
+        self,
+        user: User,
+        hlc: str,
+        seen_at: str,
+        *,
+        device_id: str | None = None,
+        write_change_log: bool = True,
+    ) -> None:
         raw = json.dumps(user.raw, ensure_ascii=False)
         self._conn.execute(
             """
@@ -749,6 +954,72 @@ class SqliteRepository:
                 """,
                 (user.user_id, user.workspace_key),
             )
+        if write_change_log and device_id:
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="user",
+                entity_key=user.user_id,
+                payload={
+                    "user_id": user.user_id,
+                    "team_id": user.team_id,
+                    "name": user.name,
+                    "real_name": user.real_name,
+                    "display_name": user.display_name,
+                    "title": user.title,
+                    "email": None,
+                    "is_bot": user.is_bot,
+                    "is_deleted": user.is_deleted,
+                    "is_restricted": user.is_restricted,
+                    "is_ultra_restricted": user.is_ultra_restricted,
+                    "is_external": user.is_external,
+                    "tz": user.tz,
+                    "raw": user.raw,
+                    "workspace_key": user.workspace_key,
+                    "first_seen": seen_at,
+                    "last_seen": seen_at,
+                },
+            )
+        self._conn.commit()
+
+    def upsert_sighting_only(
+        self,
+        *,
+        channel_id: str,
+        ts: str,
+        content_sha256: str,
+        device_id: str,
+        source: str,
+        seen_at: str,
+        snapshot_id: str,
+        state_sha256: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO message_sightings(
+              channel_id, ts, content_sha256, device_id, source,
+              first_seen, last_seen, sightings, first_snapshot_id, last_snapshot_id,
+              last_state_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(channel_id, ts, content_sha256, device_id, source) DO UPDATE SET
+              last_seen=excluded.last_seen,
+              sightings=message_sightings.sightings + 1,
+              last_snapshot_id=excluded.last_snapshot_id,
+              last_state_sha256=excluded.last_state_sha256
+            """,
+            (
+                channel_id,
+                ts,
+                content_sha256,
+                device_id,
+                source,
+                seen_at,
+                seen_at,
+                snapshot_id,
+                snapshot_id,
+                state_sha256,
+            ),
+        )
         self._conn.commit()
 
     def ingest_observation(
@@ -760,6 +1031,7 @@ class SqliteRepository:
         state_sha256: str,
         seen_at: str,
         hlc: str,
+        write_change_log: bool = True,
     ) -> bool:
         """Upsert version+sighting. Returns True if a new message_versions row was inserted."""
         existed = self._conn.execute(
@@ -825,25 +1097,39 @@ class SqliteRepository:
                 state_sha256,
             ),
         )
-        payload = {
-            "channel_id": obs.channel_id,
-            "ts": obs.ts,
-            "content_sha256": obs.content_sha256,
-            "source": obs.source,
-        }
-        payload_json = json.dumps(payload, sort_keys=True)
-        import hashlib
-
-        payload_sha = hashlib.sha256(payload_json.encode()).hexdigest()
-        entity_key = f"{obs.channel_id}|{obs.ts}|{obs.content_sha256}"
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO change_log(
-              hlc, device_id, entity, entity_key, op, payload_json, payload_sha256
-            ) VALUES (?, ?, 'message_version', ?, 'upsert', ?, ?)
-            """,
-            (hlc, device_id, entity_key, payload_json, payload_sha),
-        )
+        if write_change_log:
+            payload = {
+                "channel_id": obs.channel_id,
+                "ts": obs.ts,
+                "workspace_key": obs.workspace_key,
+                "content_sha256": obs.content_sha256,
+                "edited_ts": obs.edited_ts,
+                "is_deletion": obs.is_deletion,
+                "is_partial": obs.is_partial,
+                "source_rank": obs.source_rank,
+                "user_id": obs.user_id,
+                "thread_ts": obs.thread_ts,
+                "subtype": obs.subtype,
+                "text": obs.text,
+                "search_text": obs.search_text,
+                "raw": obs.raw,
+                "source": obs.source,
+                "reply_count": obs.reply_count,
+                "latest_reply": obs.latest_reply,
+                "reply_users": obs.reply_users,
+                "first_seen": seen_at,
+                "last_seen": seen_at,
+                "snapshot_id": snapshot_id,
+                "state_sha256": state_sha256,
+            }
+            entity_key = f"{obs.channel_id}|{obs.ts}|{obs.content_sha256}"
+            self.append_entity_change(
+                hlc=hlc,
+                device_id=device_id,
+                entity="message_version",
+                entity_key=entity_key,
+                payload=payload,
+            )
         # thread meta
         if obs.thread_ts or (obs.reply_count and obs.reply_count > 0):
             root = obs.thread_ts or obs.ts
@@ -1413,6 +1699,31 @@ class SqliteRepository:
                 "status": dict(st) if st else None,
                 "coverage_ranges": [dict(r) for r in ranges],
             }
+        devices = []
+        for d in self.list_devices():
+            sightings = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM message_sightings WHERE device_id=?",
+                (d["device_id"],),
+            ).fetchone()["c"]
+            changes = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM change_log WHERE device_id=?",
+                (d["device_id"],),
+            ).fetchone()["c"]
+            devices.append(
+                {
+                    "device_id": d["device_id"],
+                    "label": d["label"],
+                    "has_public_key": bool(d.get("public_key")),
+                    "sightings": sightings,
+                    "change_log_rows": changes,
+                }
+            )
+        from slack_cache_mcp.sync.state_hash import compute_state_hash
+
+        try:
+            state_hash = compute_state_hash(self)
+        except Exception:
+            state_hash = None
         return {
             "messages": count,
             "workspaces": len(self.list_workspaces()),
@@ -1426,6 +1737,9 @@ class SqliteRepository:
             "channel": channel,
             # Provide structured per-channel info separately (stable type: dict|None)
             "channel_status": channel_block,
+            "devices": devices,
+            "state_hash": state_hash,
+            "schema_version": SCHEMA_VERSION,
         }
 
     def search_fts(

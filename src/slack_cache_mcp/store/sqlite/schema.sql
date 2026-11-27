@@ -335,6 +335,14 @@ CREATE TABLE IF NOT EXISTS change_log (
   UNIQUE (device_id, entity, entity_key, payload_sha256)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS sync_cursors (
+  peer TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  cursor TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (peer, direction)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL

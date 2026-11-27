@@ -1,0 +1,236 @@
+"""Apply sanitized change_log rows from peer bundles (idempotent G-Set union)."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from slack_cache_mcp.desktop.sanitize import sanitize
+from slack_cache_mcp.domain.models import Channel, MessageObservation, User, Workspace
+from slack_cache_mcp.ingest.hlc import HLC
+from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+from slack_cache_mcp.sync.outbox import payload_sha256
+
+
+def _as_dict(payload: Any) -> dict[str, Any]:
+    obj = json.loads(payload) if isinstance(payload, str) else payload
+    if not isinstance(obj, dict):
+        raise TypeError("payload must be a dict")
+    clean = sanitize(obj)
+    if not isinstance(clean, dict):
+        raise TypeError("sanitized payload must be a dict")
+    return clean
+
+
+def apply_change_row(
+    repo: SqliteRepository,
+    row: dict[str, Any],
+    *,
+    hlc_clock: HLC | None = None,
+    record_outbox: bool = True,
+) -> bool:
+    """Apply one change_log row. Returns True if a new outbox row was inserted.
+
+    Idempotent on ``(device_id, entity, entity_key, payload_sha256)``.
+    """
+    device_id = str(row["device_id"])
+    entity = str(row["entity"])
+    entity_key = str(row["entity_key"])
+    op = str(row.get("op") or "upsert")
+    hlc = str(row["hlc"])
+    payload = _as_dict(row.get("payload_json") or row.get("payload") or {})
+    payload_sha = str(row.get("payload_sha256") or payload_sha256(payload))
+
+    if hlc_clock is not None:
+        hlc_clock.observe(hlc)
+
+    if record_outbox:
+        inserted = repo.insert_change_log_row(
+            hlc=hlc,
+            device_id=device_id,
+            entity=entity,
+            entity_key=entity_key,
+            op=op,
+            payload=payload,
+            payload_sha256=payload_sha,
+        )
+        if not inserted:
+            return False
+    else:
+        # Still short-circuit if already known.
+        if repo.has_change_log(
+            device_id=device_id,
+            entity=entity,
+            entity_key=entity_key,
+            payload_sha256=payload_sha,
+        ):
+            return False
+
+    if entity == "message_version":
+        _apply_message_version(repo, payload, device_id=device_id, hlc=hlc)
+    elif entity == "workspace":
+        _apply_workspace(repo, payload, hlc=hlc)
+    elif entity == "channel":
+        _apply_channel(repo, payload, hlc=hlc)
+    elif entity == "user":
+        _apply_user(repo, payload, hlc=hlc)
+    elif entity == "sighting":
+        _apply_sighting(repo, payload)
+    else:
+        # Unknown entity types are recorded in the outbox but ignored for apply.
+        pass
+    return True
+
+
+def apply_change_rows(
+    repo: SqliteRepository,
+    rows: list[dict[str, Any]],
+    *,
+    hlc_clock: HLC | None = None,
+) -> dict[str, int]:
+    applied = 0
+    skipped = 0
+    touched: set[tuple[str, str]] = set()
+    for row in rows:
+        before = repo.change_log_count()
+        ok = apply_change_row(repo, row, hlc_clock=hlc_clock, record_outbox=True)
+        if ok:
+            applied += 1
+            if str(row.get("entity")) == "message_version":
+                payload = _as_dict(row.get("payload_json") or row.get("payload") or {})
+                ch = str(payload.get("channel_id") or "")
+                ts = str(payload.get("ts") or "")
+                if ch and ts:
+                    touched.add((ch, ts))
+        else:
+            skipped += 1
+        # Defensive: count should never shrink
+        assert repo.change_log_count() >= before
+    for channel_id, ts in sorted(touched):
+        repo.reproject_message(channel_id, ts)
+    return {"applied": applied, "skipped": skipped, "reprojected": len(touched)}
+
+
+def _apply_message_version(
+    repo: SqliteRepository,
+    payload: dict[str, Any],
+    *,
+    device_id: str,
+    hlc: str,
+) -> None:
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
+    if not isinstance(clean_raw, dict):
+        clean_raw = {}
+    obs = MessageObservation(
+        channel_id=str(payload["channel_id"]),
+        ts=str(payload["ts"]),
+        workspace_key=str(payload.get("workspace_key") or "unknown"),
+        user_id=payload.get("user_id"),
+        thread_ts=payload.get("thread_ts"),
+        subtype=payload.get("subtype"),
+        text=str(payload.get("text") or ""),
+        search_text=str(payload.get("search_text") or payload.get("text") or ""),
+        content_sha256=str(payload["content_sha256"]),
+        edited_ts=payload.get("edited_ts"),
+        is_deletion=bool(payload.get("is_deletion")),
+        is_partial=bool(payload.get("is_partial")),
+        source=str(payload.get("source") or "sync"),
+        source_rank=int(payload.get("source_rank") or 0),
+        raw=clean_raw,
+        reply_count=payload.get("reply_count"),
+        latest_reply=payload.get("latest_reply"),
+        reply_users=list(payload.get("reply_users") or []),
+    )
+    seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    # Use ingest path but suppress nested outbox write (already recorded).
+    repo.ingest_observation(
+        obs,
+        device_id=device_id,
+        snapshot_id=str(payload.get("snapshot_id") or "sync"),
+        state_sha256=str(payload.get("state_sha256") or "sync"),
+        seen_at=seen_at,
+        hlc=hlc,
+        write_change_log=False,
+    )
+
+
+def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
+    if not isinstance(clean_raw, dict):
+        clean_raw = {}
+    ws = Workspace(
+        workspace_key=str(payload["workspace_key"]),
+        team_id=payload.get("team_id"),
+        enterprise_id=payload.get("enterprise_id"),
+        name=payload.get("name"),
+        domain=payload.get("domain"),
+        self_user_id=payload.get("self_user_id"),
+        self_is_guest=bool(payload.get("self_is_guest")),
+        raw=clean_raw,
+    )
+    seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    repo.upsert_workspace(ws, hlc, seen_at, write_change_log=False)
+
+
+def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
+    if not isinstance(clean_raw, dict):
+        clean_raw = {}
+    ch = Channel(
+        channel_id=str(payload["channel_id"]),
+        workspace_key=str(payload["workspace_key"]),
+        context_team_id=payload.get("context_team_id"),
+        name=payload.get("name"),
+        kind=str(payload.get("kind") or "channel"),
+        is_ext_shared=bool(payload.get("is_ext_shared")),
+        is_archived=bool(payload.get("is_archived")),
+        is_member=bool(payload.get("is_member")),
+        topic=payload.get("topic"),
+        purpose=payload.get("purpose"),
+        im_user_id=payload.get("im_user_id"),
+        raw=clean_raw,
+    )
+    seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    repo.upsert_channel(ch, hlc, seen_at, write_change_log=False)
+
+
+def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
+    if not isinstance(clean_raw, dict):
+        clean_raw = {}
+    user = User(
+        user_id=str(payload["user_id"]),
+        team_id=payload.get("team_id"),
+        name=payload.get("name"),
+        real_name=payload.get("real_name"),
+        display_name=payload.get("display_name"),
+        title=payload.get("title"),
+        email=payload.get("email"),
+        is_bot=bool(payload.get("is_bot")),
+        is_deleted=bool(payload.get("is_deleted")),
+        is_restricted=bool(payload.get("is_restricted")),
+        is_ultra_restricted=bool(payload.get("is_ultra_restricted")),
+        is_external=bool(payload.get("is_external")),
+        tz=payload.get("tz"),
+        raw=clean_raw,
+        workspace_key=payload.get("workspace_key"),
+    )
+    seen_at = str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z")
+    repo.upsert_user(user, hlc, seen_at, write_change_log=False)
+
+
+def _apply_sighting(repo: SqliteRepository, payload: dict[str, Any]) -> None:
+    repo.upsert_sighting_only(
+        channel_id=str(payload["channel_id"]),
+        ts=str(payload["ts"]),
+        content_sha256=str(payload["content_sha256"]),
+        device_id=str(payload["device_id"]),
+        source=str(payload.get("source") or "sync"),
+        seen_at=str(payload.get("last_seen") or payload.get("first_seen") or "1970-01-01T00:00:00Z"),
+        snapshot_id=str(payload.get("snapshot_id") or "sync"),
+        state_sha256=str(payload.get("state_sha256") or "sync"),
+    )

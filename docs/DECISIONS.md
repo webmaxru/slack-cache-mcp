@@ -88,3 +88,20 @@ CI uses `HashingEmbedder` with planted synonym groups so paraphrase queries prov
 
 ### Schema
 `SCHEMA_VERSION=4` adds `search_docs` (+ runtime `docs_vec`).
+
+## 2026-11-27 — M5 multi-device sync (local)
+
+### Age encryption via pyrage
+Bundle files use the age v1 X25519 recipient format through `pyrage` (Rust bindings). Signing is separate Ed25519 via `cryptography`. Envelope = zstd(JSONL change_log) + Ed25519 signature fields, then age-encrypted to all registered device age recipients (including self). Filename: `bundle-<device>-<fromseq>-<toseq>.jsonl.zst.age`.
+
+### Device key storage
+Ed25519 + age identity secrets prefer OS keyring (`slack-cache-mcp` / `device-{ed25519|age}-<id>`). File fallback `device.secrets` under the data dir (0600) for tests/recovery, mirroring vault key handling. Public halves live in `device.json` and `devices.public_key` (JSON `{"ed25519","age"}`).
+
+### Peer bootstrap
+Age encrypt requires recipients at export time. Peers exchange public identity via `slackcache sync show-device` + `sync peers add --from`. Import also refreshes the sender's public keys from the signed header after successful decrypt.
+
+### Outbox / apply
+`change_log` carries full sanitized payloads for `message_version`, `workspace`, `channel`, and `user`. Apply is idempotent on `(device_id, entity, entity_key, payload_sha256)` and re-sanitizes. `sync_cursors` tracks folder push/pull watermarks. `SCHEMA_VERSION=5`.
+
+### Convergence hash
+`state_hash` covers ordered projections of `messages`, `message_versions`, `channels`, `users`, and `workspaces` (not device-local drafts/paths). Property tests shuffle 2–4 devices and re-import duplicates.
