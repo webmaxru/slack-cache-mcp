@@ -56,6 +56,8 @@ _UNKNOWN_FIELD_HLC = "*"
 # clocks ignored, and a higher epoch force-applies values (receiver-side repair).
 _DIRECTORY_CLOCK_EPOCH_META = "directory_clock_epoch"
 _DIRECTORY_CLOCK_EPOCH_REPAIR = 1
+# Internal field-map key: last winning clock_repair HLC (not a Slack field).
+_REPAIR_HLC_KEY = "_repair_hlc"
 
 
 def _hlc_dominates(incoming: str, existing: str | None) -> bool:
@@ -451,20 +453,19 @@ class SqliteRepository:
             self._conn.commit()
 
     def _pin_unknown_directory_field_hlcs(self) -> None:
-        """Repair directory provenance via value+clock recovery, then epoch bump.
+        """Repair directory provenance via value recovery, then epoch bump.
 
-        1. Preserve real table field clocks (never replace with log clocks).
-        2. When the table clock is unknown, restore the dominating non-fabricated
-           ``(value, clock)`` pair from ``change_log`` (value and clock stay paired;
-           uniform row-HLC stamps are skipped).
-        3. Bump ``directory_clock_epoch`` and mark ``v6-pending-outbox-purge`` so
-           the next export rebuilds local directory outbox with the new epoch.
-           Peer markers stay. Receivers honour the epoch (batch force-apply).
+        1. Restore each field's value from the dominating ``(value, clock)`` pair
+           in ``change_log`` (value and clock stay paired for selection only).
+        2. Pin every non-null field clock to ``*`` — historical clocks are not
+           trusted as provenance (they may be fabricated).
+        3. Bump ``directory_clock_epoch`` and mark ``v8-pending-outbox-purge`` so
+           the next export rebuilds local directory outbox with ``clock_repair``.
         """
         policy = self.get_meta("field_hlcs_policy")
         if policy in (
-            "v7-epoch-repair",
-            "v7-pending-outbox-purge",
+            "v8-epoch-repair",
+            "v8-pending-outbox-purge",
         ):
             return
         specs: list[tuple[str, str, str, tuple[str, ...]]] = [
@@ -520,25 +521,18 @@ class SqliteRepository:
 
         for table, entity, pk, fields in specs:
             for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
-                current_clocks = _load_field_hlcs(row["field_hlcs_json"])
                 repaired: dict[str, str] = {}
                 updates: dict[str, Any] = {}
                 for field in fields:
                     table_val = row[field]
-                    table_clock = _real_field_hlc(current_clocks.get(field))
                     pair = recovered.get((entity, str(row[pk]), field))
-                    if table_clock is not None and table_val is not None:
-                        # Preserve trustworthy table provenance; never replace with log.
-                        repaired[field] = table_clock
-                        continue
                     if pair is not None:
-                        value, clock = pair
-                        # Only adopt a log pair when the table lacks a real clock.
+                        value, _clock = pair
                         if table_val != value:
                             updates[field] = value
-                        repaired[field] = clock
-                        continue
+                            table_val = value
                     if table_val is not None:
+                        # Never re-export historical clocks as trusted provenance.
                         repaired[field] = _UNKNOWN_FIELD_HLC
                 if updates:
                     assignments = ", ".join(f"{col}=?" for col in updates)
@@ -554,7 +548,7 @@ class SqliteRepository:
         current_epoch = self.directory_clock_epoch()
         if current_epoch < _DIRECTORY_CLOCK_EPOCH_REPAIR:
             self.set_directory_clock_epoch(_DIRECTORY_CLOCK_EPOCH_REPAIR, commit=False)
-        self.set_meta("field_hlcs_policy", "v7-pending-outbox-purge", commit=False)
+        self.set_meta("field_hlcs_policy", "v8-pending-outbox-purge", commit=False)
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -815,6 +809,7 @@ class SqliteRepository:
 
         policy = self.get_meta("field_hlcs_policy")
         emit_clock_repair = policy in (
+            "v8-pending-outbox-purge",
             "v7-pending-outbox-purge",
             "v6-pending-outbox-purge",
             "v5-pending-outbox-purge",
@@ -890,7 +885,7 @@ class SqliteRepository:
             field_hlcs = {
                 k: v
                 for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
-                if v and v != _UNKNOWN_FIELD_HLC
+                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
             }
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
@@ -1014,7 +1009,7 @@ class SqliteRepository:
             field_hlcs = {
                 k: v
                 for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
-                if v and v != _UNKNOWN_FIELD_HLC
+                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
             }
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
@@ -1110,7 +1105,7 @@ class SqliteRepository:
             field_hlcs = {
                 k: v
                 for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
-                if v and v != _UNKNOWN_FIELD_HLC
+                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
             }
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
@@ -1211,7 +1206,7 @@ class SqliteRepository:
             ):
                 counts["sightings"] += 1
         if emit_clock_repair:
-            self.set_meta("field_hlcs_policy", "v7-epoch-repair", commit=True)
+            self.set_meta("field_hlcs_policy", "v8-epoch-repair", commit=True)
         return counts
 
     def list_change_log_since(
@@ -1584,6 +1579,8 @@ class SqliteRepository:
                     field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
                 else:
                     field_hlcs[key] = hlc
+            if incoming_field_hlcs and incoming_field_hlcs.get(_REPAIR_HLC_KEY):
+                field_hlcs[_REPAIR_HLC_KEY] = incoming_field_hlcs[_REPAIR_HLC_KEY]
             self._conn.execute(
                 """
                 INSERT INTO workspaces(
@@ -1654,6 +1651,10 @@ class SqliteRepository:
             self_user_id = _take(
                 "self_user_id", existing["self_user_id"], ws.self_user_id
             )
+            if force_fields and incoming_field_hlcs:
+                repair_hlc = incoming_field_hlcs.get(_REPAIR_HLC_KEY)
+                if repair_hlc:
+                    field_hlcs[_REPAIR_HLC_KEY] = repair_hlc
             row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
             self_is_guest = (
                 (1 if ws.self_is_guest else 0) if row_wins else existing["self_is_guest"]
@@ -1706,14 +1707,14 @@ class SqliteRepository:
                         "raw": json.loads(stored["raw_json"] or "{}"),
                         "first_seen": stored["first_seen"],
                         "last_seen": stored["last_seen"],
-                        "field_hlcs": {
-                            k: v
-                            for k, v in _load_field_hlcs(stored["field_hlcs_json"]).items()
-                            if v and v != _UNKNOWN_FIELD_HLC
+                            "field_hlcs": {
+                                k: v
+                                for k, v in _load_field_hlcs(stored["field_hlcs_json"]).items()
+                                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
+                            },
+                            "clock_epoch": self.directory_clock_epoch(),
                         },
-                        "clock_epoch": self.directory_clock_epoch(),
-                    },
-                )
+                    )
         if commit:
             self._conn.commit()
 
@@ -1759,6 +1760,8 @@ class SqliteRepository:
                         field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
                     else:
                         field_hlcs[key] = hlc
+                if incoming_field_hlcs and incoming_field_hlcs.get(_REPAIR_HLC_KEY):
+                    field_hlcs[_REPAIR_HLC_KEY] = incoming_field_hlcs[_REPAIR_HLC_KEY]
                 self._conn.execute(
                     """
                     INSERT INTO channels(
@@ -1836,6 +1839,10 @@ class SqliteRepository:
                 context_team_id = _take(
                     "context_team_id", existing["context_team_id"], ch.context_team_id
                 )
+                if force_fields and incoming_field_hlcs:
+                    repair_hlc = incoming_field_hlcs.get(_REPAIR_HLC_KEY)
+                    if repair_hlc:
+                        field_hlcs[_REPAIR_HLC_KEY] = repair_hlc
                 row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
                 kind = ch.kind if row_wins else existing["kind"]
                 is_ext_shared = (
@@ -1937,7 +1944,7 @@ class SqliteRepository:
                                 for k, v in _load_field_hlcs(
                                     stored["field_hlcs_json"]
                                 ).items()
-                                if v and v != _UNKNOWN_FIELD_HLC
+                                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
                             },
                             "clock_epoch": self.directory_clock_epoch(),
                         },
@@ -2064,6 +2071,8 @@ class SqliteRepository:
                         field_hlcs[key] = incoming_field_hlcs.get(key, _UNKNOWN_FIELD_HLC)
                     else:
                         field_hlcs[key] = hlc
+                if incoming_field_hlcs and incoming_field_hlcs.get(_REPAIR_HLC_KEY):
+                    field_hlcs[_REPAIR_HLC_KEY] = incoming_field_hlcs[_REPAIR_HLC_KEY]
                 self._conn.execute(
                     """
                     INSERT INTO users(
@@ -2139,6 +2148,10 @@ class SqliteRepository:
                 title = _take("title", existing["title"], user.title)
                 tz = _take("tz", existing["tz"], user.tz)
                 team_id = _take("team_id", existing["team_id"], user.team_id)
+                if force_fields and incoming_field_hlcs:
+                    repair_hlc = incoming_field_hlcs.get(_REPAIR_HLC_KEY)
+                    if repair_hlc:
+                        field_hlcs[_REPAIR_HLC_KEY] = repair_hlc
                 row_wins = _hlc_dominates(hlc, existing["updated_hlc"])
                 flags = {
                     "is_bot": (1 if user.is_bot else 0) if row_wins else existing["is_bot"],
@@ -2239,7 +2252,7 @@ class SqliteRepository:
                                 for k, v in _load_field_hlcs(
                                     stored["field_hlcs_json"]
                                 ).items()
-                                if v and v != _UNKNOWN_FIELD_HLC
+                                if v and v != _UNKNOWN_FIELD_HLC and not k.startswith("_")
                             },
                             "clock_epoch": self.directory_clock_epoch(),
                         },

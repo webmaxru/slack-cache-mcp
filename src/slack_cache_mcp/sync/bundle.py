@@ -75,6 +75,47 @@ def restore_hlc(repo: SqliteRepository, device_id: str) -> HLC:
     return clock
 
 
+@contextlib.contextmanager
+def _export_dir_lock(to_dir: Path) -> Any:
+    """Serialize export/cleanup/cursor updates for one exchange folder."""
+    import sys
+
+    lock_path = to_dir / ".slackcache-export.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if not lock_path.exists():
+        with contextlib.suppress(OSError):
+            lock_path.write_text("0", encoding="utf-8")
+    fh = lock_path.open("a+b")
+    try:
+        while True:
+            try:
+                fh.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.05)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fh.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
 def export_bundle(
     repo: SqliteRepository,
     *,
@@ -86,6 +127,17 @@ def export_bundle(
     to_dir = Path(to_dir)
     to_dir.mkdir(parents=True, exist_ok=True)
 
+    with _export_dir_lock(to_dir):
+        return _export_bundle_locked(repo, identity=identity, to_dir=to_dir, peer=peer)
+
+
+def _export_bundle_locked(
+    repo: SqliteRepository,
+    *,
+    identity: DeviceIdentity,
+    to_dir: Path,
+    peer: str,
+) -> dict[str, Any]:
     # Ensure upgraded archives have complete outbox facts before export.
     hlc = restore_hlc(repo, identity.device_id)
     backfill = repo.backfill_outbox(device_id=identity.device_id, hlc=hlc.now())

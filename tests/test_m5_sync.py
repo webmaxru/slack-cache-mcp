@@ -556,7 +556,7 @@ def test_export_sequence_bounds_independent_of_entity_order(tmp_path: Path) -> N
     )
     repo.set_sync_cursor("folder", "push", "0")
     # Skip migration purge side-effects for this bounds check.
-    repo.set_meta("field_hlcs_policy", "v7-epoch-repair")
+    repo.set_meta("field_hlcs_policy", "v8-epoch-repair")
     exported = export_bundle(repo, identity=identity, to_dir=folder)
     assert exported["ok"] is True
     assert exported["exported"] >= 2
@@ -567,8 +567,8 @@ def test_export_sequence_bounds_independent_of_entity_order(tmp_path: Path) -> N
     repo.close()
 
 
-def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path: Path) -> None:
-    """v6 keeps real table clocks; restores (value, clock) only when table clock is unknown."""
+def test_field_hlcs_migration_restores_values_and_stars_clocks(tmp_path: Path) -> None:
+    """v8 restores dominating values from log pairs, stars all clocks, emits clock_repair."""
     from slack_cache_mcp.store.sqlite.repo import _UNKNOWN_FIELD_HLC, _load_field_hlcs
 
     db = tmp_path / "a.db"
@@ -576,7 +576,6 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
     identity = ensure_local_device(repo, tmp_path / "a")
     good = "1700000000000-20-new"
     fabricated = "1700000000000-30-old"
-    # team_id has a trustworthy table clock; name is unknown and wrong until restore.
     repo._conn.execute(  # noqa: SLF001
         """
         INSERT INTO workspaces(
@@ -591,8 +590,8 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
             "U1",
             "2026-11-27T12:00:00Z",
             "2026-11-27T12:00:00Z",
-            good,
-            json.dumps({"name": _UNKNOWN_FIELD_HLC, "team_id": good}),
+            fabricated,
+            json.dumps({"name": fabricated, "team_id": fabricated}),
         ),
     )
     repo.append_entity_change(
@@ -607,7 +606,7 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
             "self_user_id": "U1",
             "self_is_guest": False,
             "raw": {},
-            "field_hlcs": {"name": good, "team_id": fabricated},
+            "field_hlcs": {"name": good, "team_id": good},
         },
     )
     repo.set_meta("field_hlcs_policy", "v4-star-all-fields")
@@ -619,17 +618,17 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
         "SELECT field_hlcs_json, name, team_id FROM workspaces WHERE workspace_key='W1'"
     ).fetchone()
     assert row is not None
-    assert row["name"] == "kept"  # restored from log pair (table had *)
+    assert row["name"] == "kept"
     assert row["team_id"] == "T1"
     clocks = _load_field_hlcs(row["field_hlcs_json"])
-    assert clocks.get("team_id") == good  # preserved table clock (ignores fabricated log)
-    assert clocks.get("name") == good  # restored pair
+    assert clocks.get("team_id") == _UNKNOWN_FIELD_HLC
+    assert clocks.get("name") == _UNKNOWN_FIELD_HLC
     assert repo2.directory_clock_epoch() >= 1
-    assert repo2.get_meta("field_hlcs_policy") == "v7-pending-outbox-purge"
+    assert repo2.get_meta("field_hlcs_policy") == "v8-pending-outbox-purge"
 
     rebuilt = repo2.backfill_outbox(device_id=identity.device_id, hlc=good)
     assert rebuilt["workspaces"] >= 1
-    assert repo2.get_meta("field_hlcs_policy") == "v7-epoch-repair"
+    assert repo2.get_meta("field_hlcs_policy") == "v8-epoch-repair"
     rows = repo2._conn.execute(  # noqa: SLF001
         """
         SELECT payload_json FROM change_log
@@ -644,8 +643,7 @@ def test_field_hlcs_migration_preserves_table_clocks_and_restores_gaps(tmp_path:
         assert payload.get("clock_epoch") == repo2.directory_clock_epoch()
         assert payload.get("clock_repair") is True
         fh = payload.get("field_hlcs") or {}
-        assert fh.get("team_id") == good
-        assert fh.get("name") == good
         assert fabricated not in fh.values()
+        assert good not in fh.values()
         assert _UNKNOWN_FIELD_HLC not in fh.values()
     repo2.close()

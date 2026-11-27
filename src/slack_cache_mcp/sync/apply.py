@@ -9,7 +9,12 @@ from typing import Any
 from slack_cache_mcp.desktop.sanitize import sanitize
 from slack_cache_mcp.domain.models import Channel, MessageObservation, User, Workspace
 from slack_cache_mcp.ingest.hlc import HLC
-from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+from slack_cache_mcp.store.sqlite.repo import (
+    _REPAIR_HLC_KEY,
+    SqliteRepository,
+    _hlc_dominates,
+    _load_field_hlcs,
+)
 from slack_cache_mcp.sync.outbox import payload_sha256
 
 
@@ -235,12 +240,16 @@ def _directory_clock_mode(
     repo: SqliteRepository,
     payload: dict[str, Any],
     incoming_field_hlcs: dict[str, str],
+    *,
+    row_hlc: str,
+    existing_field_hlcs: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], bool, bool]:
     """Resolve field-clock handling from ``clock_epoch`` / ``clock_repair``.
 
     Returns ``(clocks, force_fields, fill_nulls_only)``.
-    Force applies only to the fact that carries repair authority — never to
-    unrelated lower-epoch rows in the same batch.
+    Peer rows never bump the global epoch (avoids unrelated-entity coupling).
+    ``clock_repair`` facts force-apply and LWW against each other by row HLC
+    stored under ``_repair_hlc``.
     """
     try:
         incoming_epoch = int(payload.get("clock_epoch") or 0)
@@ -251,13 +260,18 @@ def _directory_clock_mode(
     if incoming_epoch < local_epoch and not clock_repair:
         # Obsolete / pre-repair facts: never trust their clocks; only fill nulls.
         return {}, False, True
-    if incoming_epoch > local_epoch:
-        repo.set_directory_clock_epoch(incoming_epoch, commit=False)
-        # Newer epoch still force-applies this fact only.
-        return incoming_field_hlcs, True, False
-    if clock_repair:
-        # Same-epoch repairs compete via normal field LWW (deterministic order).
-        return incoming_field_hlcs, False, False
+    if clock_repair or incoming_epoch > local_epoch:
+        prev_repair = (existing_field_hlcs or {}).get(_REPAIR_HLC_KEY)
+        if prev_repair and _hlc_dominates(prev_repair, row_hlc):
+            # A newer repair already won this entity — do not regress.
+            return {}, False, True
+        clocks = {
+            k: v
+            for k, v in incoming_field_hlcs.items()
+            if not k.startswith("_")
+        }
+        clocks[_REPAIR_HLC_KEY] = row_hlc
+        return clocks, True, False
     return incoming_field_hlcs, False, False
 
 
@@ -288,8 +302,16 @@ def _apply_workspace(
         if isinstance(field_hlcs, dict)
         else {}
     )
+    existing = repo._conn.execute(  # noqa: SLF001
+        "SELECT field_hlcs_json FROM workspaces WHERE workspace_key=?",
+        (ws.workspace_key,),
+    ).fetchone()
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs
+        repo,
+        payload,
+        incoming_field_hlcs,
+        row_hlc=hlc,
+        existing_field_hlcs=_load_field_hlcs(existing["field_hlcs_json"] if existing else None),
     )
     repo.upsert_workspace(
         ws,
@@ -335,8 +357,16 @@ def _apply_channel(
         if isinstance(field_hlcs, dict)
         else {}
     )
+    existing = repo._conn.execute(  # noqa: SLF001
+        "SELECT field_hlcs_json FROM channels WHERE channel_id=?",
+        (ch.channel_id,),
+    ).fetchone()
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs
+        repo,
+        payload,
+        incoming_field_hlcs,
+        row_hlc=hlc,
+        existing_field_hlcs=_load_field_hlcs(existing["field_hlcs_json"] if existing else None),
     )
     repo.upsert_channel(
         ch,
@@ -428,8 +458,16 @@ def _apply_user(
         if isinstance(field_hlcs, dict)
         else {}
     )
+    existing = repo._conn.execute(  # noqa: SLF001
+        "SELECT field_hlcs_json FROM users WHERE user_id=?",
+        (user.user_id,),
+    ).fetchone()
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs
+        repo,
+        payload,
+        incoming_field_hlcs,
+        row_hlc=hlc,
+        existing_field_hlcs=_load_field_hlcs(existing["field_hlcs_json"] if existing else None),
     )
     repo.upsert_user(
         user,
