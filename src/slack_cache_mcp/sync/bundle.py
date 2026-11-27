@@ -150,11 +150,13 @@ def export_bundle(
     ciphertext = age_encrypt(envelope, recipients)
     name = f"bundle-{identity.device_id}-{from_seq}-{to_seq}.jsonl.zst.age"
     path = to_dir / name
-    # Drop obsolete local bundles so pre-repair exports cannot re-poison peers.
-    for stale in to_dir.glob(f"bundle-{identity.device_id}-*.jsonl.zst.age"):
-        if stale.name != name:
-            with contextlib.suppress(OSError):
-                stale.unlink()
+    # Only after a full re-export (cursor was 0) may we drop older local bundles;
+    # incremental exports must retain prior history for offline peers.
+    if since_seq <= 0:
+        for stale in to_dir.glob(f"bundle-{identity.device_id}-*.jsonl.zst.age"):
+            if stale.name != name:
+                with contextlib.suppress(OSError):
+                    stale.unlink()
     path.write_bytes(ciphertext)
     repo.set_sync_cursor(peer, "push", str(to_seq))
     return {
@@ -238,18 +240,16 @@ def import_bundles(
     for _path, _header, rows, _sender_id in verified:
         all_rows.extend(rows)
     if all_rows:
-        try:
-            stats = apply_change_rows(repo, all_rows, hlc_clock=hlc_clock)
-            total_applied += int(stats["applied"])
-            total_skipped += int(stats["skipped"])
-            for _path, header, _rows, sender_id in verified:
-                imported_files += 1
-                to_seq = header.get("to_seq")
-                if to_seq is not None:
-                    repo.set_sync_cursor(f"{peer}:{sender_id}", "pull", str(to_seq))
-        except Exception as exc:
-            # Dependency/apply failure after verify: attribute to the batch.
-            errors.append({"path": str(from_dir), "error": str(exc)})
+        stats = apply_change_rows(repo, all_rows, hlc_clock=hlc_clock)
+        total_applied += int(stats["applied"])
+        total_skipped += int(stats["skipped"])
+        for err in stats.get("errors") or []:
+            errors.append({"path": str(from_dir), "error": str(err)})
+        for _path, header, _rows, sender_id in verified:
+            imported_files += 1
+            to_seq = header.get("to_seq")
+            if to_seq is not None:
+                repo.set_sync_cursor(f"{peer}:{sender_id}", "pull", str(to_seq))
 
     # Persist merged HLC so subsequent local ingest dominates imported clocks.
     tick = hlc_clock.now()

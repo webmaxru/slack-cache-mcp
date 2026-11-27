@@ -29,6 +29,7 @@ def apply_change_row(
     *,
     hlc_clock: HLC | None = None,
     record_outbox: bool = True,
+    force_directory: bool = False,
 ) -> tuple[bool, set[tuple[str, str]]]:
     """Apply one change_log row atomically.
 
@@ -81,15 +82,15 @@ def apply_change_row(
             if ch and ts:
                 reproject.add((ch, ts))
         elif entity == "workspace":
-            _apply_workspace(repo, payload, hlc=hlc)
+            _apply_workspace(repo, payload, hlc=hlc, force_directory=force_directory)
         elif entity == "channel":
-            _apply_channel(repo, payload, hlc=hlc)
+            _apply_channel(repo, payload, hlc=hlc, force_directory=force_directory)
             ch = str(payload.get("channel_id") or "")
             if ch:
                 for ts in repo.list_known_message_ts(ch):
                     reproject.add((ch, ts))
         elif entity == "user":
-            _apply_user(repo, payload, hlc=hlc)
+            _apply_user(repo, payload, hlc=hlc, force_directory=force_directory)
         elif entity == "sighting":
             _apply_sighting(repo, payload, authenticated_device_id=device_id)
             ch = str(payload.get("channel_id") or "")
@@ -129,23 +130,65 @@ def apply_change_rows(
     rows: list[dict[str, Any]],
     *,
     hlc_clock: HLC | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     applied = 0
     skipped = 0
+    failed = 0
     touched: set[tuple[str, str]] = set()
+    errors: list[str] = []
+    # If any directory row carries a newer clock_epoch, bump once and force-apply
+    # every directory row in this batch (not only the first that trips the bump).
+    max_epoch = 0
+    for row in rows:
+        if str(row.get("entity") or "") not in ("workspace", "channel", "user"):
+            continue
+        payload = row.get("payload_json") or row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            max_epoch = max(max_epoch, int(payload.get("clock_epoch") or 0))
+        except (TypeError, ValueError):
+            continue
+    force_directory_batch = False
+    if max_epoch > repo.directory_clock_epoch():
+        repo.set_directory_clock_epoch(max_epoch, commit=True)
+        repo.invalidate_directory_field_clocks(commit=True)
+        force_directory_batch = True
     # Workspaces before channels (FK); messages before sightings.
     ordered = sorted(
         enumerate(rows),
         key=lambda item: (_ENTITY_ORDER.get(str(item[1].get("entity") or ""), 99), item[0]),
     )
     for _idx, row in ordered:
-        ok, keys = apply_change_row(repo, row, hlc_clock=hlc_clock, record_outbox=True)
-        if ok:
-            applied += 1
-            touched.update(keys)
-        else:
-            skipped += 1
-    return {"applied": applied, "skipped": skipped, "reprojected": len(touched)}
+        try:
+            ok, keys = apply_change_row(
+                repo,
+                row,
+                hlc_clock=hlc_clock,
+                record_outbox=True,
+                force_directory=force_directory_batch
+                and str(row.get("entity") or "") in ("workspace", "channel", "user"),
+            )
+            if ok:
+                applied += 1
+                touched.update(keys)
+            else:
+                skipped += 1
+        except Exception as exc:  # noqa: BLE001 — isolate row failures across the batch
+            failed += 1
+            errors.append(f"{row.get('entity')}:{row.get('entity_key')}: {exc}")
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "failed": failed,
+        "reprojected": len(touched),
+        "errors": errors,
+    }
 
 
 def _apply_message_version(
@@ -215,7 +258,11 @@ def _apply_message_version(
 
 
 def _directory_clock_mode(
-    repo: SqliteRepository, payload: dict[str, Any], incoming_field_hlcs: dict[str, str]
+    repo: SqliteRepository,
+    payload: dict[str, Any],
+    incoming_field_hlcs: dict[str, str],
+    *,
+    force_directory: bool = False,
 ) -> tuple[dict[str, str], bool, bool]:
     """Resolve field-clock handling from ``clock_epoch`` vs local repair epoch.
 
@@ -226,6 +273,8 @@ def _directory_clock_mode(
     except (TypeError, ValueError):
         incoming_epoch = 0
     local_epoch = repo.directory_clock_epoch()
+    if force_directory:
+        return incoming_field_hlcs, True, False
     if incoming_epoch < local_epoch:
         # Obsolete / pre-repair facts: never trust their clocks; only fill nulls.
         return {}, False, True
@@ -236,7 +285,13 @@ def _directory_clock_mode(
     return incoming_field_hlcs, False, False
 
 
-def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
+def _apply_workspace(
+    repo: SqliteRepository,
+    payload: dict[str, Any],
+    *,
+    hlc: str,
+    force_directory: bool = False,
+) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
     if not isinstance(clean_raw, dict):
@@ -259,7 +314,7 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
         else {}
     )
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs
+        repo, payload, incoming_field_hlcs, force_directory=force_directory
     )
     repo.upsert_workspace(
         ws,
@@ -274,7 +329,13 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
     )
 
 
-def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
+def _apply_channel(
+    repo: SqliteRepository,
+    payload: dict[str, Any],
+    *,
+    hlc: str,
+    force_directory: bool = False,
+) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
     if not isinstance(clean_raw, dict):
@@ -301,7 +362,7 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         else {}
     )
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs
+        repo, payload, incoming_field_hlcs, force_directory=force_directory
     )
     repo.upsert_channel(
         ch,
@@ -353,7 +414,13 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
         )
 
 
-def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) -> None:
+def _apply_user(
+    repo: SqliteRepository,
+    payload: dict[str, Any],
+    *,
+    hlc: str,
+    force_directory: bool = False,
+) -> None:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     clean_raw = sanitize(raw) if isinstance(raw, dict) else {}
     if not isinstance(clean_raw, dict):
@@ -389,7 +456,7 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
         else {}
     )
     clocks, force_fields, fill_nulls_only = _directory_clock_mode(
-        repo, payload, incoming_field_hlcs
+        repo, payload, incoming_field_hlcs, force_directory=force_directory
     )
     repo.upsert_user(
         user,

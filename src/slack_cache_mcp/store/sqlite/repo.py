@@ -453,14 +453,13 @@ class SqliteRepository:
     def _pin_unknown_directory_field_hlcs(self) -> None:
         """Repair directory provenance via value+clock recovery, then epoch bump.
 
-        1. Restore each field's value from the ``(value, clock)`` pair that holds
-           the dominating real clock in ``change_log`` (never attach a clock to a
-           mismatched current value).
-        2. Bump ``directory_clock_epoch`` and pin all field clocks to ``*`` so
-           fabricated historical clocks cannot be re-exported as trusted.
-        3. Mark ``v6-pending-outbox-purge`` so the next ``backfill_outbox`` drops
-           local directory outbox rows and rebuilds them with the new epoch.
-           Peer ``change_log`` markers are kept. Receivers honour the epoch.
+        1. Preserve real table field clocks (never replace with log clocks).
+        2. When the table clock is unknown, restore the dominating non-fabricated
+           ``(value, clock)`` pair from ``change_log`` (value and clock stay paired;
+           uniform row-HLC stamps are skipped).
+        3. Bump ``directory_clock_epoch`` and mark ``v6-pending-outbox-purge`` so
+           the next export rebuilds local directory outbox with the new epoch.
+           Peer markers stay. Receivers honour the epoch (batch force-apply).
         """
         policy = self.get_meta("field_hlcs_policy")
         if policy in (
@@ -489,10 +488,11 @@ class SqliteRepository:
             ),
         ]
         # Best (value, clock) per field from outbox history — clock and value stay paired.
+        # Skip uniform row-HLC stamps (classic fabrication: every field got the row hlc).
         recovered: dict[tuple[str, str, str], tuple[Any, str]] = {}
         for entity in ("workspace", "channel", "user"):
             for row in self._conn.execute(
-                "SELECT entity_key, payload_json FROM change_log WHERE entity=?",
+                "SELECT entity_key, hlc, payload_json FROM change_log WHERE entity=?",
                 (entity,),
             ).fetchall():
                 try:
@@ -503,6 +503,19 @@ class SqliteRepository:
                     continue
                 field_hlcs = payload.get("field_hlcs")
                 if not isinstance(field_hlcs, dict):
+                    continue
+                row_hlc = str(row["hlc"] or "")
+                real_clocks = [
+                    c
+                    for c in field_hlcs.values()
+                    if isinstance(c, str) and _real_field_hlc(c) is not None
+                ]
+                uniform_fabricated = (
+                    bool(row_hlc)
+                    and len(real_clocks) >= 2
+                    and all(c == row_hlc for c in real_clocks)
+                )
+                if uniform_fabricated:
                     continue
                 for field, clock in field_hlcs.items():
                     if not isinstance(field, str) or not isinstance(clock, str):
@@ -520,22 +533,37 @@ class SqliteRepository:
 
         for table, entity, pk, fields in specs:
             for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
+                current_clocks = _load_field_hlcs(row["field_hlcs_json"])
+                repaired: dict[str, str] = {}
                 updates: dict[str, Any] = {}
                 for field in fields:
+                    table_val = row[field]
+                    table_clock = _real_field_hlc(current_clocks.get(field))
                     pair = recovered.get((entity, str(row[pk]), field))
-                    if pair is None:
+                    if table_clock is not None and table_val is not None:
+                        # Preserve trustworthy table provenance; never replace with log.
+                        repaired[field] = table_clock
                         continue
-                    value, _clock = pair
-                    if row[field] != value:
-                        updates[field] = value
+                    if pair is not None:
+                        value, clock = pair
+                        # Only adopt a log pair when the table lacks a real clock.
+                        if table_val != value:
+                            updates[field] = value
+                        repaired[field] = clock
+                        continue
+                    if table_val is not None:
+                        repaired[field] = _UNKNOWN_FIELD_HLC
                 if updates:
                     assignments = ", ".join(f"{col}=?" for col in updates)
                     self._conn.execute(
-                        f"UPDATE {table} SET {assignments} WHERE {pk}=?",
-                        (*updates.values(), row[pk]),
+                        f"UPDATE {table} SET {assignments}, field_hlcs_json=? WHERE {pk}=?",
+                        (*updates.values(), _dump_field_hlcs(repaired), row[pk]),
                     )
-        # Invalidate all clocks (fabricated or not); epoch carries repair authority.
-        self.invalidate_directory_field_clocks(commit=False)
+                else:
+                    self._conn.execute(
+                        f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                        (_dump_field_hlcs(repaired), row[pk]),
+                    )
         current_epoch = self.directory_clock_epoch()
         if current_epoch < _DIRECTORY_CLOCK_EPOCH_REPAIR:
             self.set_directory_clock_epoch(_DIRECTORY_CLOCK_EPOCH_REPAIR, commit=False)
