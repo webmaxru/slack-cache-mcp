@@ -33,11 +33,12 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
     for p in ordered:
         edge_only = p.is_edge_browser
         backend = detect_idb_backend(p.path, slack_origin_only=edge_only)
-        blob_root = p.path / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
-        # Reject symlink/junction Slack blob roots; never follow escapes under the tree.
-        if blob_root.is_dir() and _resolved_under(blob_root, blob_root.parent):
+        idb_dir = p.path / "IndexedDB"
+        blob_root = idb_dir / f"{idb_origin_dir_name()}.blob"
+        # Reject linked IndexedDB / Slack blob roots; never follow escapes under the tree.
+        if blob_root.is_dir() and _resolved_under(blob_root, idb_dir, profile=p.path):
             for bf in blob_root.rglob("*"):
-                if not bf.is_file() or not _resolved_under(bf, blob_root):
+                if not bf.is_file() or not _resolved_under(bf, blob_root, profile=p.path):
                     continue
                 info, val = decode_blob_file(bf)
                 key = f"blink={info.blink_version},v8={info.v8_version}"

@@ -119,27 +119,45 @@ FORBIDDEN_BROWSER_NAME_PARTS = frozenset(
 )
 
 
-def _is_linkish(path: Path) -> bool:
-    """True for symlinks and Windows junctions/reparse points that redirect resolve()."""
+def _is_linkish(path: Path, *, up_to: Path | None = None) -> bool:
+    """True for symlinks/junctions on ``path`` or (when ``up_to``) any ancestor.
+
+    A linked ``IndexedDB`` parent makes ``child.resolve() == parent.resolve()/name``
+    still hold for Slack ``.blob``/``.leveldb`` children — walking ancestors catches that.
+    """
     try:
-        if path.is_symlink():
-            return True
-        if not path.exists():
-            return False
-        # Junction: resolve() leaves the lexical parent/name location.
-        return path.resolve() != path.parent.resolve() / path.name
+        cur = path
+        while True:
+            if cur.is_symlink():
+                return True
+            if cur.exists() and cur.resolve() != cur.parent.resolve() / cur.name:
+                return True
+            if up_to is None:
+                return False
+            if cur == up_to:
+                return False
+            try:
+                if cur.resolve() == up_to.resolve():
+                    return False
+            except OSError:
+                return True
+            parent = cur.parent
+            if parent == cur:
+                return False
+            cur = parent
     except OSError:
         return True
 
 
-def _resolved_under(path: Path, root: Path) -> bool:
+def _resolved_under(path: Path, root: Path, *, profile: Path | None = None) -> bool:
     """True when ``path`` is a real entry under a non-link ``root`` (no symlink escape).
 
-    Rejects when either ``path`` or ``root`` is a symlink/junction. Resolving a
-    linked allow-root would otherwise make out-of-tree targets look "under" it.
+    Rejects when ``path``, ``root``, or (when ``profile`` is set) a linked ancestor
+    up to the profile redirects resolve() outside the lexical tree.
     """
     try:
-        if _is_linkish(path) or _is_linkish(root):
+        stop = profile if profile is not None else root
+        if _is_linkish(path, up_to=stop) or _is_linkish(root, up_to=stop):
             return False
         resolved = path.resolve()
         root_resolved = root.resolve()
@@ -237,10 +255,16 @@ def snapshot_profile(
     origin = idb_origin_dir_name()
     if allowlist == ALLOWLIST_EDGE_IDB:
         # M5.1: IndexedDB for app.slack.com only — never Local Storage / Cookies / …
-        allow_trees = [
-            source / "IndexedDB" / f"{origin}.blob",
-            source / "IndexedDB" / f"{origin}.leveldb",
-        ]
+        idb_dir = source / "IndexedDB"
+        if _is_linkish(idb_dir, up_to=source):
+            # Linked IndexedDB parent would make Slack .blob/.leveldb look local.
+            stats.errors.append("IndexedDB: symlink/junction parent skipped")
+            allow_trees = []
+        else:
+            allow_trees = [
+                idb_dir / f"{origin}.blob",
+                idb_dir / f"{origin}.leveldb",
+            ]
         allow_files: list[Path] = []
         # Opt-in flags are ignored for browser sources (no HTTP cache / notif from Edge).
         include_http_cache = False
@@ -286,9 +310,10 @@ def snapshot_profile(
             return
         rel_s = rel.as_posix()
         if allowlist == ALLOWLIST_EDGE_IDB:
-            # Never follow symlinks out of the Slack-origin IDB trees.
-            if src_file.is_symlink() or (
-                allow_root is not None and not _resolved_under(src_file, allow_root)
+            # Never follow symlinks/junctions out of the Slack-origin IDB trees.
+            if _is_linkish(src_file, up_to=source) or (
+                allow_root is not None
+                and not _resolved_under(src_file, allow_root, profile=source)
             ):
                 stats.errors.append(f"{rel_s}: symlink or escaped allow root")
                 return
@@ -336,8 +361,8 @@ def snapshot_profile(
 
     cache_bytes = 0
     for tree in allow_trees:
-        if allowlist == ALLOWLIST_EDGE_IDB and _is_linkish(tree):
-            # Symlinked/junction Slack .blob/.leveldb roots escape the Edge boundary.
+        if allowlist == ALLOWLIST_EDGE_IDB and _is_linkish(tree, up_to=source):
+            # Symlinked/junction Slack .blob/.leveldb roots (or linked ancestors) escape.
             try:
                 rel_tree = tree.relative_to(source).as_posix()
             except ValueError:
@@ -348,7 +373,11 @@ def snapshot_profile(
             stats.missing.append(tree.name)
             continue
         for p in tree.rglob("*"):
-            linkish = _is_linkish(p) if allowlist == ALLOWLIST_EDGE_IDB else p.is_symlink()
+            linkish = (
+                _is_linkish(p, up_to=source)
+                if allowlist == ALLOWLIST_EDGE_IDB
+                else p.is_symlink()
+            )
             if linkish:
                 if allowlist == ALLOWLIST_EDGE_IDB:
                     stats.errors.append(f"{p.relative_to(source).as_posix()}: symlink skipped")
