@@ -220,7 +220,7 @@ def _apply_workspace(repo: SqliteRepository, payload: dict[str, Any], *, hlc: st
     incoming_field_hlcs = (
         {str(k): str(v) for k, v in field_hlcs.items() if isinstance(k, str) and isinstance(v, str)}
         if isinstance(field_hlcs, dict)
-        else None
+        else {}
     )
     repo.upsert_workspace(
         ws,
@@ -257,7 +257,7 @@ def _apply_channel(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str)
     incoming_field_hlcs = (
         {str(k): str(v) for k, v in field_hlcs.items() if isinstance(k, str) and isinstance(v, str)}
         if isinstance(field_hlcs, dict)
-        else None
+        else {}
     )
     repo.upsert_channel(
         ch,
@@ -340,7 +340,7 @@ def _apply_user(repo: SqliteRepository, payload: dict[str, Any], *, hlc: str) ->
     incoming_field_hlcs = (
         {str(k): str(v) for k, v in field_hlcs.items() if isinstance(k, str) and isinstance(v, str)}
         if isinstance(field_hlcs, dict)
-        else None
+        else {}
     )
     repo.upsert_user(
         user,

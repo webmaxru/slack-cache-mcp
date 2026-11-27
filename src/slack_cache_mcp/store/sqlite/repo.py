@@ -49,10 +49,17 @@ def _ts_num(ts: str) -> float:
         return 0.0
 
 
+# Sentinel field clock for migrated values with unknown provenance. Stable across
+# later unrelated row-HLC bumps; remote observations never overwrite it.
+_UNKNOWN_FIELD_HLC = "*"
+
+
 def _hlc_dominates(incoming: str, existing: str | None) -> bool:
     """True when ``incoming`` should win field-level LWW (tie → device_id lex)."""
     if not existing:
         return True
+    if existing == _UNKNOWN_FIELD_HLC or incoming == _UNKNOWN_FIELD_HLC:
+        return False
     from slack_cache_mcp.ingest.hlc import parse_hlc
 
     try:
@@ -85,27 +92,30 @@ def _merge_sparse_field(
     existing_val: Any,
     existing_field_hlc: str | None,
     incoming_val: Any,
-    incoming_hlc: str,
+    incoming_hlc: str | None,
     *,
-    row_hlc: str | None = None,
+    replace_unknown: bool = False,
 ) -> tuple[Any, str | None]:
     """Per-field LWW: null incoming is a no-op; non-null keeps its own clock.
 
-    When a local value exists without a field clock (migrated/unknown provenance),
-    keep it unless the incoming HLC dominates the whole-row clock — never invent a
-    field clock by copying ``updated_hlc`` onto older retained values.
+    ``incoming_hlc is None`` = unknown incoming (sparse-fill nulls only).
+    ``*`` = stable unknown local provenance; remotes cannot overwrite; local
+    writes pass ``replace_unknown=True`` to set a real clock.
     """
     if incoming_val is None:
         return existing_val, existing_field_hlc
     if existing_val is None:
-        return incoming_val, incoming_hlc
-    if existing_field_hlc is None:
-        if row_hlc is not None and _hlc_dominates(incoming_hlc, row_hlc):
+        return incoming_val, incoming_hlc if incoming_hlc is not None else _UNKNOWN_FIELD_HLC
+    pinned = existing_field_hlc if existing_field_hlc is not None else _UNKNOWN_FIELD_HLC
+    if pinned == _UNKNOWN_FIELD_HLC:
+        if replace_unknown and incoming_hlc and incoming_hlc != _UNKNOWN_FIELD_HLC:
             return incoming_val, incoming_hlc
-        return existing_val, None
-    if _hlc_dominates(incoming_hlc, existing_field_hlc):
+        return existing_val, _UNKNOWN_FIELD_HLC
+    if incoming_hlc is None:
+        return existing_val, pinned
+    if _hlc_dominates(incoming_hlc, pinned):
         return incoming_val, incoming_hlc
-    return existing_val, existing_field_hlc
+    return existing_val, pinned
 
 
 def _filter_clause(filters: dict[str, Any], *, alias: str = "m") -> tuple[str, list[Any]]:
@@ -380,6 +390,42 @@ class SqliteRepository:
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN field_hlcs_json TEXT NOT NULL DEFAULT '{{}}'"
                 )
+        self._pin_unknown_directory_field_hlcs()
+
+    def _pin_unknown_directory_field_hlcs(self) -> None:
+        """Pin ``*`` on non-null directory fields that still lack a clock."""
+        specs: list[tuple[str, str, tuple[str, ...]]] = [
+            (
+                "workspaces",
+                "workspace_key",
+                ("team_id", "enterprise_id", "name", "domain", "self_user_id"),
+            ),
+            (
+                "channels",
+                "channel_id",
+                ("workspace_key", "context_team_id", "name", "topic", "purpose", "im_user_id"),
+            ),
+            (
+                "users",
+                "user_id",
+                ("team_id", "name", "real_name", "display_name", "title", "tz"),
+            ),
+        ]
+        for table, pk, fields in specs:
+            for row in self._conn.execute(f"SELECT * FROM {table}").fetchall():
+                current = _load_field_hlcs(row["field_hlcs_json"])
+                changed = False
+                for field in fields:
+                    if row[field] is None:
+                        continue
+                    if field not in current:
+                        current[field] = _UNKNOWN_FIELD_HLC
+                        changed = True
+                if changed:
+                    self._conn.execute(
+                        f"UPDATE {table} SET field_hlcs_json=? WHERE {pk}=?",
+                        (_dump_field_hlcs(current), row[pk]),
+                    )
 
     def upsert_device(
         self, device_id: str, label: str, *, public_key: str | None = None
@@ -676,10 +722,12 @@ class SqliteRepository:
                 self_is_guest=bool(r["self_is_guest"]),
                 raw=json.loads(r["raw_json"] or "{}"),
             )
-            field_hlcs = _load_field_hlcs(r["field_hlcs_json"])
-            for key, val in required.items():
-                if val is not None and key not in field_hlcs:
-                    field_hlcs[key] = _row_hlc(r, hlc)
+            # Export only known clocks — never invent row HLC for unclocked fields.
+            field_hlcs = {
+                k: v
+                for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
+                if v and v != _UNKNOWN_FIELD_HLC
+            }
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -744,16 +792,33 @@ class SqliteRepository:
                 for wk in payload.get("workspace_keys") or []:
                     if isinstance(wk, str):
                         covered_ws.add(wk)
-                records = list(payload.get("alias_records") or [])
-                records.extend(payload.get("aliases") or [])
-                for alias in records:
-                    if isinstance(alias, dict) and isinstance(alias.get("name"), str):
-                        name = alias["name"]
-                        seen = str(alias.get("first_seen") or "")
-                        prev = covered_alias_seen.get(name)
-                        if prev is None or (seen and (not prev or seen < prev)):
-                            covered_alias_seen[name] = seen
-            aliases_covered = True
+            records = list(payload.get("alias_records") or [])
+            for alias in records:
+                if isinstance(alias, dict) and isinstance(alias.get("name"), str):
+                    name = alias["name"]
+                    seen = str(alias.get("first_seen") or "")
+                    prev = covered_alias_seen.get(name)
+                    if prev is None or (seen and (not prev or seen < prev)):
+                        covered_alias_seen[name] = seen
+            # Dual-format coverage: require string aliases list AND earliest first_seen.
+            has_string_aliases = False
+            for prow2 in self._conn.execute(
+                """
+                SELECT payload_json FROM change_log
+                WHERE device_id=? AND entity='channel' AND entity_key=?
+                """,
+                (device_id, r["channel_id"]),
+            ).fetchall():
+                try:
+                    p2 = json.loads(prow2["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(p2, dict) and any(
+                    isinstance(a, str) for a in (p2.get("aliases") or [])
+                ):
+                    has_string_aliases = True
+                    break
+            aliases_covered = has_string_aliases or not aliases
             for alias in aliases:
                 name = alias["name"]
                 want = str(alias["first_seen"] or "")
@@ -781,10 +846,11 @@ class SqliteRepository:
                 im_user_id=r["im_user_id"],
                 raw=json.loads(r["raw_json"] or "{}"),
             )
-            field_hlcs = _load_field_hlcs(r["field_hlcs_json"])
-            for key, val in required.items():
-                if val is not None and key not in field_hlcs:
-                    field_hlcs[key] = _row_hlc(r, hlc)
+            field_hlcs = {
+                k: v
+                for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
+                if v and v != _UNKNOWN_FIELD_HLC
+            }
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -874,10 +940,11 @@ class SqliteRepository:
                 raw=json.loads(r["raw_json"] or "{}"),
                 workspace_key=ws_keys[0] if ws_keys else None,
             )
-            field_hlcs = _load_field_hlcs(r["field_hlcs_json"])
-            for key, val in required.items():
-                if val is not None and key not in field_hlcs:
-                    field_hlcs[key] = _row_hlc(r, hlc)
+            field_hlcs = {
+                k: v
+                for k, v in _load_field_hlcs(r["field_hlcs_json"]).items()
+                if v and v != _UNKNOWN_FIELD_HLC
+            }
             if self.append_entity_change(
                 hlc=_row_hlc(r, hlc),
                 device_id=device_id,
@@ -1367,13 +1434,18 @@ class SqliteRepository:
             field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
             def _take(field: str, current: Any, incoming: Any) -> Any:
-                clock_in = (incoming_field_hlcs or {}).get(field, hlc)
+                if incoming_field_hlcs is not None:
+                    clock_in: str | None = incoming_field_hlcs.get(field)
+                    replace_unknown = False
+                else:
+                    clock_in = hlc
+                    replace_unknown = True
                 value, clock = _merge_sparse_field(
                     current,
                     field_hlcs.get(field),
                     incoming,
                     clock_in,
-                    row_hlc=existing["updated_hlc"],
+                    replace_unknown=replace_unknown,
                 )
                 if clock:
                     field_hlcs[field] = clock
@@ -1442,7 +1514,11 @@ class SqliteRepository:
                         "raw": json.loads(stored["raw_json"] or "{}"),
                         "first_seen": stored["first_seen"],
                         "last_seen": stored["last_seen"],
-                        "field_hlcs": _load_field_hlcs(stored["field_hlcs_json"]),
+                        "field_hlcs": {
+                            k: v
+                            for k, v in _load_field_hlcs(stored["field_hlcs_json"]).items()
+                            if v and v != _UNKNOWN_FIELD_HLC
+                        },
                     },
                 )
         if commit:
@@ -1510,13 +1586,18 @@ class SqliteRepository:
                 field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
                 def _take(field: str, current: Any, incoming: Any) -> Any:
-                    clock_in = (incoming_field_hlcs or {}).get(field, hlc)
+                    if incoming_field_hlcs is not None:
+                        clock_in: str | None = incoming_field_hlcs.get(field)
+                        replace_unknown = False
+                    else:
+                        clock_in = hlc
+                        replace_unknown = True
                     value, clock = _merge_sparse_field(
                         current,
                         field_hlcs.get(field),
                         incoming,
                         clock_in,
-                        row_hlc=existing["updated_hlc"],
+                        replace_unknown=replace_unknown,
                     )
                     if clock:
                         field_hlcs[field] = clock
@@ -1632,7 +1713,13 @@ class SqliteRepository:
                             "raw": json.loads(stored["raw_json"] or "{}"),
                             "first_seen": stored["first_seen"],
                             "last_seen": stored["last_seen"],
-                            "field_hlcs": _load_field_hlcs(stored["field_hlcs_json"]),
+                            "field_hlcs": {
+                                k: v
+                                for k, v in _load_field_hlcs(
+                                    stored["field_hlcs_json"]
+                                ).items()
+                                if v and v != _UNKNOWN_FIELD_HLC
+                            },
                         },
                     )
             if commit:
@@ -1784,13 +1871,18 @@ class SqliteRepository:
                 field_hlcs = _load_field_hlcs(existing["field_hlcs_json"])
 
                 def _take(field: str, current: Any, incoming: Any) -> Any:
-                    clock_in = (incoming_field_hlcs or {}).get(field, hlc)
+                    if incoming_field_hlcs is not None:
+                        clock_in: str | None = incoming_field_hlcs.get(field)
+                        replace_unknown = False
+                    else:
+                        clock_in = hlc
+                        replace_unknown = True
                     value, clock = _merge_sparse_field(
                         current,
                         field_hlcs.get(field),
                         incoming,
                         clock_in,
-                        row_hlc=existing["updated_hlc"],
+                        replace_unknown=replace_unknown,
                     )
                     if clock:
                         field_hlcs[field] = clock
@@ -1901,7 +1993,13 @@ class SqliteRepository:
                             "workspace_keys": ws_stored,
                             "first_seen": stored["first_seen"],
                             "last_seen": stored["last_seen"],
-                            "field_hlcs": _load_field_hlcs(stored["field_hlcs_json"]),
+                            "field_hlcs": {
+                                k: v
+                                for k, v in _load_field_hlcs(
+                                    stored["field_hlcs_json"]
+                                ).items()
+                                if v and v != _UNKNOWN_FIELD_HLC
+                            },
                         },
                     )
             if commit:
