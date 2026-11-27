@@ -12,6 +12,7 @@ dependencies = [
     "keyring>=25.7.0",
     "mcp==2.3.0",
     "numpy>=2.0",
+    "pyrage>=1.4.0",
     "sqlite-vec>=0.1.6",
     "typer>=0.16.0",
     "tzdata>=2026.6",
@@ -107,6 +108,8 @@ module = [
     "sqlite_vec",
     "fastembed",
     "fastembed.*",
+    "pyrage",
+    "pyrage.*",
 ]
 ignore_missing_imports = true
 follow_imports = "skip"

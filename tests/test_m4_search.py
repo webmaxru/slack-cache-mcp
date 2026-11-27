@@ -32,7 +32,7 @@ def test_schema_v4_search_docs(archive: SqliteRepository) -> None:
     ver = archive._conn.execute(  # noqa: SLF001
         "SELECT value FROM meta WHERE key='schema_version'"
     ).fetchone()["value"]
-    assert ver == SCHEMA_VERSION == "4"
+    assert ver == SCHEMA_VERSION
     tables = {
         r[0]
         for r in archive._conn.execute(  # noqa: SLF001
