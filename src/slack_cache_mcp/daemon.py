@@ -47,14 +47,20 @@ class _DebouncedTrigger:
                 self._timer = None
 
 
-def _watch_roots(profile: Path) -> list[Path]:
+def _watch_roots(profile: Path, *, edge_browser: bool = False) -> list[Path]:
     origin = idb_origin_dir_name()
     roots = [
         profile / "IndexedDB" / f"{origin}.blob",
         profile / "IndexedDB" / f"{origin}.leveldb",
-        profile / "Local Storage" / "leveldb",
-        profile / "storage",
     ]
+    if not edge_browser:
+        # Desktop-only: never watch Edge Local Storage / root-state (credential-adjacent).
+        roots.extend(
+            [
+                profile / "Local Storage" / "leveldb",
+                profile / "storage",
+            ]
+        )
     return [r for r in roots if r.exists()]
 
 
@@ -329,7 +335,7 @@ def run_daemon(
         observer = Observer()
         watched = 0
         for p in valid:
-            for root in _watch_roots(p.path):
+            for root in _watch_roots(p.path, edge_browser=p.is_edge_browser):
                 observer.schedule(Handler(), str(root), recursive=True)
                 watched += 1
         if watched:

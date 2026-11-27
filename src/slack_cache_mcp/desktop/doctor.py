@@ -65,6 +65,7 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             source_yield = []
 
+    edge_profiles = [p for p in profiles if p.is_edge_browser]
     return {
         "profiles": [
             {
@@ -72,9 +73,11 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
                 "path": redact_path(p.path),
                 "valid": p.valid,
                 "primary": p.primary,
+                "edge_idb_only": p.is_edge_browser,
             }
             for p in profiles
         ],
+        "edge_sources": len(edge_profiles),
         "indexeddb_backend": backend,
         "blob_version_histogram": blob_versions,
         "decode_ok": decode_ok,

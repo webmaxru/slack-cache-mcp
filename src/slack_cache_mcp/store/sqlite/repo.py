@@ -3233,6 +3233,22 @@ class SqliteRepository:
             state_hash = compute_state_hash(self)
         except Exception:
             state_hash = None
+        sources = [
+            {
+                "source_id": r["source_id"],
+                "kind": r["kind"],
+                "path_hint": r["path_hint"],
+                "first_seen": r["first_seen"],
+                "last_seen": r["last_seen"],
+            }
+            for r in self._conn.execute(
+                """
+                SELECT source_id, kind, path_hint, first_seen, last_seen
+                FROM sources
+                ORDER BY kind, path_hint
+                """
+            ).fetchall()
+        ]
         return {
             "messages": count,
             "workspaces": len(self.list_workspaces()),
@@ -3247,6 +3263,7 @@ class SqliteRepository:
             # Provide structured per-channel info separately (stable type: dict|None)
             "channel_status": channel_block,
             "devices": devices,
+            "sources": sources,
             "state_hash": state_hash,
             "schema_version": SCHEMA_VERSION,
         }

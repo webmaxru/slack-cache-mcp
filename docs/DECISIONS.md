@@ -116,3 +116,17 @@ Import rejects unknown senders and signing/age key mismatches against `sync peer
 - Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps; epoch bounds are ignored as unknown.
 - Directory upserts maintain `field_hlcs_json`. Unclocked values use sentinel `*`. Repair migration (policy `v7-*`) preserves real table clocks, restores dominating `(value, clock)` pairs only for unknown table clocks, bumps `directory_clock_epoch`, and rebuilds local directory outbox with `clock_epoch` + one-shot `clock_repair`. Receivers force-apply only facts that carry repair authority (higher epoch or `clock_repair`); lower-epoch clocks are null-fill only. Full re-exports write the new bundle before deleting older local files; incremental exports retain history. Bundle `from_seq`/`to_seq` use min/max sequence; import verifies all files then applies rows in global entity order with per-row failure isolation. Channel outbox emits legacy `aliases` plus `alias_records`; backfill repairs object-only rows.
 - Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.
+
+## 2026-11-27 — M5.1 Edge browser IndexedDB ingest
+
+### Second offline source (Edge only)
+Microsoft Edge Chromium `%LOCALAPPDATA%\Microsoft\Edge\User Data\Default` is auto-discovered when Slack’s `https_app.slack.com` IndexedDB is present (`kind=win-edge`). It feeds the **same** `archive.db` as desktop via existing `(channel_id, ts)` + `content_sha256` versioning and multi-source sightings. Distinct `source_id` (hash of device + path) and `sources.kind` distinguish Edge from desktop. **Chrome is out of scope for M5.1.**
+
+### IndexedDB-only allowlist for browser sources
+Edge is a full Chromium user-data tree (credential-rich). Snapshot mode `edge-idb` copies **only** `IndexedDB/https_app.slack.com_0.indexeddb.{blob,leveldb}` (skip `LOCK`). Never open or copy Cookies, Local State, Network, Login Data, passwords, or Edge Local/Session Storage. Desktop profiles keep the existing desktop allowlist.
+
+### Sighting provenance
+Edge-ingested observations use `edge.<slice>` source labels (e.g. `edge.redux.messages`) with the same `SOURCE_RANK` as the desktop slice, so one device can record both desktop and Edge sightings without collapsing them, while content still dedupes into one `message_versions` row.
+
+### Motivation (Maxim A/B)
+Offline probe of Edge IDB showed reply **bodies** for threads where the desktop archive had `reply_count` metadata but `replies_captured=0`. M5.1 productizes that second observation stream under the offline-only rules.

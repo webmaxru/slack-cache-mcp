@@ -30,9 +30,11 @@ def test_daemon_max_cycles(tmp_path: Path) -> None:
     data = tmp_path / "data"
     settings = load_settings(data_dir=data, source=profile)
     stop = threading.Event()
+    # ensure_single=False: developer machines often already run slackcache daemon
+    # (Windows named mutex Local\slackcache-daemon); this test covers cycle cadence.
     result = run_daemon(
         settings,
-        ensure_single=True,
+        ensure_single=False,
         max_cycles=1,
         poll_interval_s=0.05,
         full_pass_interval_s=60.0,

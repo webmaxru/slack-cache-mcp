@@ -1,4 +1,4 @@
-"""Discover Slack desktop profile directories (Windows Store/direct, macOS, Linux)."""
+"""Discover Slack desktop + Edge browser profile directories (Windows Store/direct/Edge, macOS, Linux)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from pathlib import Path
 from slack_cache_mcp.config import local_appdata, roaming_appdata
 from slack_cache_mcp.desktop.chromium.idb_values import idb_origin_dir_name
 
+# Browser Chromium sources use IndexedDB-only snapshot allowlists (never credentials).
+BROWSER_EDGE_KINDS = frozenset({"win-edge"})
+
 
 @dataclass(frozen=True)
 class SlackProfile:
@@ -18,6 +21,10 @@ class SlackProfile:
     valid: bool
     primary: bool = False
     idb_mtime_ns: int = 0
+
+    @property
+    def is_edge_browser(self) -> bool:
+        return self.kind in BROWSER_EDGE_KINDS
 
 
 def _is_valid_profile(path: Path) -> bool:
@@ -41,6 +48,31 @@ def _idb_mtime(path: Path) -> int:
     return newest
 
 
+def windows_edge_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
+    """Microsoft Edge Default profile when Slack https_app IndexedDB is present (M5.1).
+
+    Chrome User Data is intentionally out of scope for M5.1.
+    """
+    e = env if env is not None else dict(os.environ)
+    local = Path(e["LOCALAPPDATA"]) if e.get("LOCALAPPDATA") else local_appdata()
+    # Edge Chromium user-data Default — Slack web app.slack.com IDB lives here.
+    edge_default = local / "Microsoft" / "Edge" / "User Data" / "Default"
+    return [(edge_default, "win-edge")]
+
+
+def infer_override_kind(path: Path) -> str:
+    """Classify a config/CLI override path (Edge Default → win-edge; else override)."""
+    parts_lower = [p.lower() for p in Path(path).parts]
+    try:
+        edge_idx = parts_lower.index("edge")
+    except ValueError:
+        return "override"
+    # .../Edge/User Data/Default (or deeper under Default)
+    if edge_idx + 2 < len(parts_lower) and parts_lower[edge_idx + 1] == "user data":
+        return "win-edge"
+    return "override"
+
+
 def windows_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
     e = env if env is not None else dict(os.environ)
     out: list[tuple[Path, str]] = []
@@ -48,12 +80,7 @@ def windows_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, st
     roaming = Path(e["APPDATA"]) if e.get("APPDATA") else roaming_appdata()
 
     store_fixed = (
-        local
-        / "Packages"
-        / "91750D7E.Slack_8she8kybcnzg4"
-        / "LocalCache"
-        / "Roaming"
-        / "Slack"
+        local / "Packages" / "91750D7E.Slack_8she8kybcnzg4" / "LocalCache" / "Roaming" / "Slack"
     )
     out.append((store_fixed, "win-store"))
 
@@ -65,6 +92,7 @@ def windows_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, st
                 out.append((cand, "win-store"))
 
     out.append((roaming / "Slack", "win-direct"))
+    out.extend(windows_edge_candidates(env=e))
     return out
 
 
@@ -86,7 +114,9 @@ def macos_candidates(home: Path | None = None) -> list[tuple[Path, str]]:
     ]
 
 
-def linux_candidates(home: Path | None = None, env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
+def linux_candidates(
+    home: Path | None = None, env: dict[str, str] | None = None
+) -> list[tuple[Path, str]]:
     h = home or Path.home()
     e = env if env is not None else dict(os.environ)
     out: list[tuple[Path, str]] = []
@@ -110,7 +140,8 @@ def discover_profiles(
     candidates: list[tuple[Path, str]] = []
     if overrides:
         for p in overrides:
-            candidates.append((Path(p), "override"))
+            path = Path(p)
+            candidates.append((path, infer_override_kind(path)))
     elif plat == "win32":
         candidates.extend(windows_candidates(env=env))
     elif plat == "darwin":
@@ -129,7 +160,11 @@ def discover_profiles(
             continue
         seen.add(resolved)
         valid = _is_valid_profile(path)
-        if not valid and kind != "override":
+        if kind in BROWSER_EDGE_KINDS:
+            # Edge Default always exists if Edge is installed; only list when Slack IDB is present.
+            if not valid:
+                continue
+        elif not valid and kind != "override":
             # Still record overrides even if incomplete; skip missing non-override
             if not path.exists():
                 continue
@@ -139,7 +174,7 @@ def discover_profiles(
             SlackProfile(
                 path=path,
                 kind=kind,
-                valid=_is_valid_profile(path),
+                valid=valid,
                 idb_mtime_ns=_idb_mtime(path) if path.exists() else 0,
             )
         )

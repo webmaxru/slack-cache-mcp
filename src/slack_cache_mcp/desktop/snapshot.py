@@ -97,6 +97,27 @@ def _should_copy(src: Path, manifest_entry: dict[str, Any] | None) -> bool:
     )
 
 
+# Snapshot allowlist modes:
+# - desktop: Slack desktop profile (IndexedDB + Local/Session Storage + root-state, …)
+# - edge-idb: Edge Chromium Default — Slack https_app IndexedDB only (never credentials)
+ALLOWLIST_DESKTOP = "desktop"
+ALLOWLIST_EDGE_IDB = "edge-idb"
+
+# Paths that must never be copied from a browser Chromium user-data tree.
+FORBIDDEN_BROWSER_NAME_PARTS = frozenset(
+    {
+        "Cookies",
+        "Cookies-journal",
+        "Local State",
+        "Login Data",
+        "Login Data For Account",
+        "Network",
+        "Trust Tokens",
+        "Trust Tokens-journal",
+    }
+)
+
+
 def snapshot_profile(
     source: Path,
     mirror: Path,
@@ -106,12 +127,15 @@ def snapshot_profile(
     include_http_cache: bool = False,
     include_notifications: bool = False,
     http_cache_max_bytes: int = 50_000_000,
+    allowlist: str = ALLOWLIST_DESKTOP,
 ) -> SnapshotStats:
     """Copy allowlisted paths from source -> mirror. Never deletes source files."""
     source = Path(source).resolve()
     mirror = Path(mirror).resolve()
     if source == mirror or source in mirror.parents or mirror in source.parents:
         raise ValueError("Source and mirror directories must not overlap")
+    if allowlist not in {ALLOWLIST_DESKTOP, ALLOWLIST_EDGE_IDB}:
+        raise ValueError(f"unknown snapshot allowlist mode: {allowlist}")
     mirror.mkdir(parents=True, exist_ok=True)
     stats = SnapshotStats()
     manifest_path = mirror / "manifest.json"
@@ -119,30 +143,41 @@ def snapshot_profile(
     files_meta: dict[str, Any] = dict(manifest.get("files") or {})
 
     origin = idb_origin_dir_name()
-    allow_trees = [
-        source / "IndexedDB",
-        # Local Storage may contain tokens; pipeline scrub removes the copy end-of-cycle
-        # after allowlist parsing (PLAN §5.2).
-        source / "Local Storage",
-        source / "Session Storage",
-    ]
-    if include_http_cache:
-        allow_trees.append(source / "Cache")
-    allow_files = [
-        source / "storage" / "root-state.json",
-        source / "local-settings.json",
-        # M1 fixture side-car for localConfig (not present on real Slack)
-        source / "Local Storage" / "localConfig_v2.json",
-        # Always-on M3 synthetic side-cars (session scan; drafts gated at ingest)
-        source / "Session Storage" / "session_entries.json",
-        source / "Local Storage" / "local_entries.json",
-    ]
-    # Opt-in side-cars only — avoid copying/missing-noise when flags are off.
-    if include_http_cache:
-        allow_files.append(source / "Cache" / "cache_entries.json")
-    if include_notifications:
-        allow_files.append(source / "Notifications" / "notifications_win.json")
-        allow_files.append(source / "notifications_win.json")
+    if allowlist == ALLOWLIST_EDGE_IDB:
+        # M5.1: IndexedDB for app.slack.com only — never Local Storage / Cookies / …
+        allow_trees = [
+            source / "IndexedDB" / f"{origin}.blob",
+            source / "IndexedDB" / f"{origin}.leveldb",
+        ]
+        allow_files: list[Path] = []
+        # Opt-in flags are ignored for browser sources (no HTTP cache / notif from Edge).
+        include_http_cache = False
+        include_notifications = False
+    else:
+        allow_trees = [
+            source / "IndexedDB",
+            # Local Storage may contain tokens; pipeline scrub removes the copy end-of-cycle
+            # after allowlist parsing (PLAN §5.2).
+            source / "Local Storage",
+            source / "Session Storage",
+        ]
+        if include_http_cache:
+            allow_trees.append(source / "Cache")
+        allow_files = [
+            source / "storage" / "root-state.json",
+            source / "local-settings.json",
+            # M1 fixture side-car for localConfig (not present on real Slack)
+            source / "Local Storage" / "localConfig_v2.json",
+            # Always-on M3 synthetic side-cars (session scan; drafts gated at ingest)
+            source / "Session Storage" / "session_entries.json",
+            source / "Local Storage" / "local_entries.json",
+        ]
+        # Opt-in side-cars only — avoid copying/missing-noise when flags are off.
+        if include_http_cache:
+            allow_files.append(source / "Cache" / "cache_entries.json")
+        if include_notifications:
+            allow_files.append(source / "Notifications" / "notifications_win.json")
+            allow_files.append(source / "notifications_win.json")
 
     def handle_file(src_file: Path, rel: Path, *, is_blob: bool) -> None:
         nonlocal stats
@@ -150,6 +185,15 @@ def snapshot_profile(
             stats.skipped_lock += 1
             return
         rel_s = rel.as_posix()
+        if allowlist == ALLOWLIST_EDGE_IDB:
+            # Defence in depth: refuse any credential-shaped relative path.
+            parts = set(rel.parts)
+            if parts & FORBIDDEN_BROWSER_NAME_PARTS:
+                stats.errors.append(f"{rel_s}: forbidden browser path")
+                return
+            if "Local Storage" in rel.parts or "Session Storage" in rel.parts:
+                stats.errors.append(f"{rel_s}: forbidden browser storage")
+                return
         prev = files_meta.get(rel_s)
         if not _should_copy(src_file, prev):
             stats.skipped_unchanged += 1
@@ -219,6 +263,7 @@ def snapshot_profile(
         {
             "source": str(source),
             "origin": origin,
+            "allowlist": allowlist,
             "files": files_meta,
             "updated_at": time.time(),
         },
@@ -234,9 +279,7 @@ def assert_source_not_written(source: Path, open_calls: list[tuple[Any, ...]]) -
             continue
         path = str(args[0])
         mode = args[1] if len(args) > 1 else "r"
-        if path.startswith(src) or Path(path).resolve().as_posix().startswith(
-            Path(src).as_posix()
-        ):
+        if path.startswith(src) or Path(path).resolve().as_posix().startswith(Path(src).as_posix()):
             if isinstance(mode, str) and any(c in mode for c in "wax+"):
                 # read modes with '+' are read/write
                 if mode == "rb" or mode == "r" or mode.startswith("r") and "+" not in mode:
