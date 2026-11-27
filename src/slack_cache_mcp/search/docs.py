@@ -264,19 +264,37 @@ class SearchDocsBuilder:
             self.repo.mark_windows_dirty(channel_id)
 
     def rebuild_dirty_windows(self) -> dict[str, int]:
-        """Rebuild dirty channels one-by-one; ack only the generation rebuilt."""
+        """Rebuild dirty channels one-by-one; ack only the generation rebuilt.
+
+        Acquires a write lock before reading messages so a concurrent edit cannot
+        leave a committed window with stale text while the generation mismatch
+        only re-queues the channel.
+        """
         pending = self.repo.peek_dirty_window_channels()
         out: dict[str, int] = {}
         for channel_id, generation in pending:
+            started = self.repo._begin_immediate()  # noqa: SLF001
             try:
-                out[channel_id] = self._rebuild_windows_for_channel(channel_id)
+                cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
+                if cur is None or int(cur) != int(generation):
+                    if started:
+                        self.repo._conn.commit()  # noqa: SLF001
+                    continue
+                n = self._rebuild_windows_for_channel(channel_id)
+                cur = self.repo._dirty_window_map().get(channel_id)  # noqa: SLF001
+                if cur is None or int(cur) != int(generation):
+                    # Concurrent mark while rebuilding — discard stale windows.
+                    if started:
+                        self.repo._conn.rollback()  # noqa: SLF001
+                    continue
                 self.repo.ack_dirty_window_channel(channel_id, generation)
-                # Always persist rebuild+ack together. ack may skip commit when
-                # nested in a caller txn; daemon close would then roll both back
-                # (e.g. after skipping embed due to ONNX demotion guard).
+                # Always persist rebuild+ack (ack may skip commit when nested).
                 self.repo._conn.commit()  # noqa: SLF001
+                out[channel_id] = n
             except Exception:
-                # Leave channel (and remaining) dirty for the next pass.
+                if started:
+                    with contextlib.suppress(Exception):
+                        self.repo._conn.rollback()  # noqa: SLF001
                 raise
         return out
 

@@ -264,6 +264,32 @@ def rebuild_cmd(
     repo = SqliteRepository(settings.archive_db, read_only=False)
     result: dict[str, object] = {"ok": True}
     do_all = all_derived or not (fts or embeddings or projection)
+    explicit_hashing = os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing"
+    emb = None
+    # Validate embedder before destructive docs/embedding rebuild so a temporary
+    # ONNX load failure cannot wipe the index and then refuse re-embedding.
+    if do_all or embeddings:
+        emb = load_embedder(models_dir=settings.models_dir)
+        prev = repo._conn.execute(  # noqa: SLF001
+            "SELECT value FROM meta WHERE key='embedding_model'"
+        ).fetchone()
+        if (
+            not explicit_hashing
+            and prev
+            and not str(prev["value"]).startswith("hashing")
+            and str(emb.model_id).startswith("hashing")
+        ):
+            result["ok"] = False
+            result["embeddings"] = {
+                "ok": False,
+                "embedded": 0,
+                "error": "refuse_hashing_demotion",
+                "persisted_model": str(prev["value"]),
+                "model_id": emb.model_id,
+            }
+            repo.close()
+            typer.echo(json.dumps(result, indent=2, default=str))
+            raise typer.Exit(code=1)
     # Projection first so FTS/docs see the repaired current view.
     if do_all or projection:
         rows = repo._conn.execute(  # noqa: SLF001
@@ -285,12 +311,7 @@ def rebuild_cmd(
             repo.ack_dirty_window_channel(ch, gen)
         result["search_docs"] = counts
     if do_all or embeddings:
-        emb = load_embedder(models_dir=settings.models_dir)
-        # Allow hashing demotion only when hashing was explicitly selected
-        # (SLACKCACHE_EMBEDDER=hashing) — not when ONNX merely failed to load.
-        explicit_hashing = (
-            os.environ.get("SLACKCACHE_EMBEDDER", "").lower() == "hashing"
-        )
+        assert emb is not None
         emb_result = embed_pending(
             repo, emb, allow_hashing_demotion=explicit_hashing
         )
@@ -299,6 +320,8 @@ def rebuild_cmd(
             result["ok"] = False
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
+    if result.get("ok") is False:
+        raise typer.Exit(code=1)
 
 
 models_app = typer.Typer(help="Local embedding model management", no_args_is_help=True)
