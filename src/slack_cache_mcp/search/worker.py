@@ -118,6 +118,9 @@ def embed_pending(
     embedded = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
+        lost = _fence(embedded=embedded)
+        if lost is not None:
+            return lost
         texts = [r["text"] for r in batch]
         vectors = embedder.embed_documents(texts)
         now = _utc_now()

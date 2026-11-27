@@ -125,6 +125,10 @@ def _filter_clause(filters: dict[str, Any], *, alias: str = "m") -> tuple[str, l
 class SqliteRepository:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        # Canonicalize so symlink aliases share lock identity within this build.
+        with contextlib.suppress(OSError):
+            if self.path.exists():
+                self.path = self.path.resolve()
         self.read_only = read_only
         if read_only:
             if not self.path.exists():
@@ -2482,20 +2486,25 @@ class SqliteRepository:
     def _embed_lock_paths(self) -> list[Path]:
         """Sidecar paths deduplicated by file identity (not string equality).
 
-        Includes an inode-keyed lock (alias-invariant), the resolved sidecar,
-        and the unresolved sidecar used by mid-PR builds — then drops paths
-        that ``os.path.samefile`` shows are the same inode.
+        Includes an inode-keyed lock, path-string sidecars, and any existing
+        ``*embedding_op*.lock`` already in the DB directory (so an older build
+        holding a symlink alias sidecar blocks us instead of overlapping).
         """
         resolved_db = self.path.resolve()
+        parent = resolved_db.parent
         candidates: list[Path] = []
         with contextlib.suppress(OSError):
             st = resolved_db.stat()
             candidates.append(
-                resolved_db.parent
-                / f".embedding_op.{st.st_dev}-{st.st_ino}.lock"
+                parent / f".embedding_op.{st.st_dev}-{st.st_ino}.lock"
             )
         candidates.append(Path(str(resolved_db) + ".embedding_op.lock"))
         candidates.append(Path(str(self.path) + ".embedding_op.lock"))
+        with contextlib.suppress(OSError):
+            for p in parent.glob("*embedding_op*.lock"):
+                candidates.append(p)
+            for p in parent.glob(".embedding_op*.lock"):
+                candidates.append(p)
         unique: list[Path] = []
         for p in candidates:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -2587,7 +2596,7 @@ class SqliteRepository:
             return raw, int(m.group(1)), None
         return raw, None, None
 
-    _EMBED_OP_LOCK_LEASE_S = 180.0
+    _EMBED_OP_LOCK_LEASE_S = 120.0
 
     def _legacy_meta_blocks(self, owner: str, *, holding_files: bool) -> bool:
         """True if another live holder still owns the meta lock row.
@@ -2712,6 +2721,7 @@ class SqliteRepository:
         if self._embed_lock_fhs:
             return self._embed_lock_owner == owner
         fhs: list[TextIO] = []
+        claimed_meta = False
         try:
             for path in self._embed_lock_paths():
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -2720,6 +2730,7 @@ class SqliteRepository:
                 self._lock_embed_file(fh)
             if not self._claim_legacy_meta(owner, holding_files=True):
                 raise OSError("embedding_op_meta_blocked")
+            claimed_meta = True
             self._embed_lock_fhs = fhs
             self._embed_lock_owner = owner
             return True
@@ -2729,8 +2740,9 @@ class SqliteRepository:
                     self._unlock_embed_file(fh)
                 with contextlib.suppress(Exception):
                     fh.close()
-            with contextlib.suppress(Exception):
-                self._clear_legacy_meta(owner)
+            if claimed_meta:
+                with contextlib.suppress(Exception):
+                    self._clear_legacy_meta(owner)
             return False
 
     def renew_embedding_op_lock(
@@ -2741,6 +2753,17 @@ class SqliteRepository:
         if not self.embedding_op_lock_owned(owner):
             return False
         return self._claim_legacy_meta(owner, holding_files=True)
+
+    def heartbeat_embedding_op_lock(self) -> bool:
+        """Renew the short meta lease if this instance holds the op lock.
+
+        Called from long rebuild/embed loops so 918c1ec-era lease readers
+        cannot steal mid-operation.
+        """
+        owner = self._embed_lock_owner
+        if not owner or not self._embed_lock_fhs:
+            return True
+        return self.renew_embedding_op_lock(owner)
 
     def release_embedding_op_lock(self, owner: str) -> None:
         """Release the OS file locks and dual-protocol meta row if owned."""

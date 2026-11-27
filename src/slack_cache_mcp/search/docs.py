@@ -53,6 +53,7 @@ class SearchDocsBuilder:
         self.repo = repo
 
     def rebuild_all(self) -> dict[str, int]:
+        self.repo.heartbeat_embedding_op_lock()
         counts = {
             "message": self.rebuild_message_docs(),
             "thread": self.rebuild_thread_docs(),
@@ -60,6 +61,7 @@ class SearchDocsBuilder:
             "canvas": self.rebuild_canvas_docs(),
             "file": self.rebuild_file_docs(),
         }
+        self.repo.heartbeat_embedding_op_lock()
         return counts
 
     def upsert_message_doc(self, channel_id: str, ts: str) -> tuple[int | None, bool]:
@@ -77,10 +79,12 @@ class SearchDocsBuilder:
             "SELECT * FROM messages WHERE deleted_state='none'"
         ).fetchall()
         n = 0
-        for r in rows:
+        for i, r in enumerate(rows, start=1):
             doc_id, _changed = self._upsert_from_message_row(dict(r))
             if doc_id is not None:
                 n += 1
+            if i % 64 == 0:
+                self.repo.heartbeat_embedding_op_lock()
         self.repo._conn.commit()  # noqa: SLF001
         return n
 
@@ -387,6 +391,7 @@ class SearchDocsBuilder:
                     )
                 if started:
                     self.repo._conn.commit()  # noqa: SLF001
+                self.repo.heartbeat_embedding_op_lock()
             except Exception:
                 if started:
                     with contextlib.suppress(Exception):
