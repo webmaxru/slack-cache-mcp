@@ -52,8 +52,12 @@ class SearchDocsBuilder:
     def __init__(self, repo: SqliteRepository) -> None:
         self.repo = repo
 
+    def _require_embed_lock_heartbeat(self) -> None:
+        if not self.repo.heartbeat_embedding_op_lock():
+            raise RuntimeError("embedding_op_lock_lost")
+
     def rebuild_all(self) -> dict[str, int]:
-        self.repo.heartbeat_embedding_op_lock()
+        self._require_embed_lock_heartbeat()
         counts = {
             "message": self.rebuild_message_docs(),
             "thread": self.rebuild_thread_docs(),
@@ -61,7 +65,7 @@ class SearchDocsBuilder:
             "canvas": self.rebuild_canvas_docs(),
             "file": self.rebuild_file_docs(),
         }
-        self.repo.heartbeat_embedding_op_lock()
+        self._require_embed_lock_heartbeat()
         return counts
 
     def upsert_message_doc(self, channel_id: str, ts: str) -> tuple[int | None, bool]:
@@ -84,7 +88,7 @@ class SearchDocsBuilder:
             if doc_id is not None:
                 n += 1
             if i % 64 == 0:
-                self.repo.heartbeat_embedding_op_lock()
+                self._require_embed_lock_heartbeat()
         self.repo._conn.commit()  # noqa: SLF001
         return n
 
@@ -391,7 +395,7 @@ class SearchDocsBuilder:
                     )
                 if started:
                     self.repo._conn.commit()  # noqa: SLF001
-                self.repo.heartbeat_embedding_op_lock()
+                self._require_embed_lock_heartbeat()
             except Exception:
                 if started:
                     with contextlib.suppress(Exception):

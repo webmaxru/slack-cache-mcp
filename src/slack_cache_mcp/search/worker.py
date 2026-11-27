@@ -118,11 +118,16 @@ def embed_pending(
     embedded = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
+        # Renew before inference so a long embed_documents call cannot let a
+        # legacy lease reader steal mid-batch.
         lost = _fence(embedded=embedded)
         if lost is not None:
             return lost
         texts = [r["text"] for r in batch]
         vectors = embedder.embed_documents(texts)
+        lost = _fence(embedded=embedded)
+        if lost is not None:
+            return lost
         now = _utc_now()
         for j, r in enumerate(batch):
             lost = _fence(embedded=embedded)

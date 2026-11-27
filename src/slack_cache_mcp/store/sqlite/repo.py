@@ -133,7 +133,11 @@ class SqliteRepository:
         if read_only:
             if not self.path.exists():
                 raise FileNotFoundError(self.path)
-            uri = f"file:{self.path.as_posix()}?mode=ro"
+            from urllib.parse import quote
+
+            # Quote so resolved targets containing `?`/`#` stay in the path.
+            encoded = quote(self.path.as_posix(), safe="/:")
+            uri = f"file:{encoded}?mode=ro"
             self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2500,11 +2504,11 @@ class SqliteRepository:
             )
         candidates.append(Path(str(resolved_db) + ".embedding_op.lock"))
         candidates.append(Path(str(self.path) + ".embedding_op.lock"))
+        # Only this archive's basename sidecars — never other DBs in the dir.
+        stem = resolved_db.name
         with contextlib.suppress(OSError):
-            for p in parent.glob("*embedding_op*.lock"):
-                candidates.append(p)
-            for p in parent.glob(".embedding_op*.lock"):
-                candidates.append(p)
+            direct = parent / f"{stem}.embedding_op.lock"
+            candidates.append(direct)
         unique: list[Path] = []
         for p in candidates:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -2748,9 +2752,21 @@ class SqliteRepository:
     def renew_embedding_op_lock(
         self, owner: str, *, lease_s: float | None = None
     ) -> bool:
-        """Fence + refresh short meta lease while the OS lock is held."""
+        """Fence + refresh short meta lease while the OS lock is held.
+
+        If another process wrote the meta row while we held the file lock
+        (legacy lease reader), fail closed instead of silently reclaiming.
+        """
         del lease_s
         if not self.embedding_op_lock_owned(owner):
+            return False
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (self._EMBED_OP_LOCK_META_KEY,)
+        ).fetchone()
+        parsed = self._parse_legacy_embed_meta(
+            str(row["value"]) if row else None
+        )
+        if parsed and parsed[0] != owner:
             return False
         return self._claim_legacy_meta(owner, holding_files=True)
 
