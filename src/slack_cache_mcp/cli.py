@@ -28,21 +28,13 @@ def _boot() -> None:
 
 
 def _load_json_file(path: Path) -> object:
-    """Load JSON from disk, tolerating UTF-8 BOM and PowerShell UTF-16 redirects.
+    """Load JSON from disk, tolerating UTF-8/UTF-16/UTF-32 BOMs.
 
-    Windows PowerShell ``>`` / ``Out-File`` default to UTF-16 LE with BOM
-    (``FF FE``), which breaks naive ``encoding='utf-8'`` reads. Prefer UTF-8
-    (with optional BOM via ``utf-8-sig``), then fall back to UTF-16.
+    Windows PowerShell 5.1 ``>`` / ``Out-File`` write UTF-16 LE with BOM
+    (``FF FE``), which breaks naive ``encoding='utf-8'`` reads. Passing bytes
+    to ``json.loads`` uses its BOM-based encoding detection (UTF-8/16/32).
     """
-    raw = Path(path).read_bytes()
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        text = raw.decode("utf-16")
-    else:
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("utf-16")
-    return json.loads(text)
+    return json.loads(Path(path).read_bytes())
 
 
 @app.command("locate")

@@ -412,10 +412,22 @@ def test_load_json_file_accepts_utf16_le_bom(tmp_path: Path) -> None:
     assert _load_json_file(utf8_bom) == payload
 
 
-def test_peers_add_cli_accepts_utf16_peer_json(tmp_path: Path) -> None:
+def test_peers_add_cli_accepts_utf16_peer_json(
+    tmp_path: Path, monkeypatch
+) -> None:
     from typer.testing import CliRunner
 
     from slack_cache_mcp.cli import app
+
+    # Avoid writing sync private keys into the real OS keyring during CLI init.
+    monkeypatch.setattr(
+        "slack_cache_mcp.sync.device._store_keyring_secret",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "slack_cache_mcp.sync.device._load_keyring_secret",
+        lambda *_a, **_k: None,
+    )
 
     a_data = tmp_path / "a"
     b_data = tmp_path / "b"
