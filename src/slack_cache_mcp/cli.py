@@ -27,6 +27,24 @@ def _boot() -> None:
     netguard.install()
 
 
+def _load_json_file(path: Path) -> object:
+    """Load JSON from disk, tolerating UTF-8 BOM and PowerShell UTF-16 redirects.
+
+    Windows PowerShell ``>`` / ``Out-File`` default to UTF-16 LE with BOM
+    (``FF FE``), which breaks naive ``encoding='utf-8'`` reads. Prefer UTF-8
+    (with optional BOM via ``utf-8-sig``), then fall back to UTF-16.
+    """
+    raw = Path(path).read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16")
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-16")
+    return json.loads(text)
+
+
 @app.command("locate")
 def locate_cmd(
     json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
@@ -482,7 +500,10 @@ def sync_peers_cmd(
     if peer_json is None:
         typer.echo("--from <peer.json> required for add", err=True)
         raise typer.Exit(2)
-    data = json.loads(Path(peer_json).read_text(encoding="utf-8"))
+    data = _load_json_file(peer_json)
+    if not isinstance(data, dict):
+        typer.echo("--from peer JSON must be an object", err=True)
+        raise typer.Exit(2)
     peer = peer_from_dict(data)
     register_peer(repo, peer)
     repo.close()

@@ -390,3 +390,45 @@ def test_unpinned_attribute_is_not_online_only(tmp_path: Path, monkeypatch) -> N
         _recall,
     )
     assert is_cloud_placeholder(f) is True
+
+
+def test_load_json_file_accepts_utf16_le_bom(tmp_path: Path) -> None:
+    """PowerShell ``>`` writes UTF-16 LE BOM; peers add must still parse it."""
+    from slack_cache_mcp.cli import _load_json_file
+
+    payload = {
+        "device_id": "01TESTDEVICE00000000000001",
+        "label": "peer",
+        "ed25519_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "age_recipient": "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6ul0",
+    }
+    path = tmp_path / "peer-utf16.json"
+    path.write_bytes(json.dumps(payload, indent=2).encode("utf-16"))  # includes BOM
+    assert path.read_bytes()[:2] == b"\xff\xfe"
+    assert _load_json_file(path) == payload
+
+    utf8_bom = tmp_path / "peer-utf8-bom.json"
+    utf8_bom.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
+    assert _load_json_file(utf8_bom) == payload
+
+
+def test_peers_add_cli_accepts_utf16_peer_json(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from slack_cache_mcp.cli import app
+
+    a_data = tmp_path / "a"
+    b_data = tmp_path / "b"
+    runner = CliRunner()
+    assert runner.invoke(app, ["sync", "init", "--data-dir", str(a_data)]).exit_code == 0
+    assert runner.invoke(app, ["sync", "init", "--data-dir", str(b_data)]).exit_code == 0
+    peer_b = tmp_path / "b-utf16.json"
+    show = runner.invoke(app, ["sync", "show-device", "--data-dir", str(b_data)])
+    assert show.exit_code == 0
+    peer_b.write_bytes(show.output.encode("utf-16"))
+    result = runner.invoke(
+        app,
+        ["sync", "peers", "add", "--from", str(peer_b), "--data-dir", str(a_data)],
+    )
+    assert result.exit_code == 0, result.output
+    assert '"ok": true' in result.output
