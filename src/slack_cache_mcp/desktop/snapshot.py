@@ -166,12 +166,26 @@ def _resolved_under(path: Path, root: Path, *, profile: Path | None = None) -> b
         return False
 
 
-def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> None:
-    """Remove mirror files/dirs outside the Slack-origin IDB trees; prune manifest entries."""
+def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> list[str]:
+    """Remove mirror files/dirs outside the Slack-origin IDB trees; prune manifest entries.
+
+    Returns human-readable errors when out-of-allowlist deletion fails (never silent).
+    """
+    errors: list[str] = []
+
+    def _remove(path: Path, *, rel: str) -> None:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as exc:
+            errors.append(f"purge {rel}: {type(exc).__name__}")
+
     allowed_resolved: list[Path] = []
     for root in allowed_roots:
         with contextlib.suppress(OSError):
-            if root.exists():
+            if root.exists() and not _is_linkish(root):
                 allowed_resolved.append(root.resolve())
     idb = mirror / "IndexedDB"
     if idb.is_dir():
@@ -181,12 +195,9 @@ def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> None:
                 cres = child.resolve()
                 keep = any(cres == a or a in cres.parents or cres in a.parents for a in allowed_resolved)
             if not keep:
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    with contextlib.suppress(OSError):
-                        child.unlink()
-    # Drop any non-IndexedDB top-level leftovers from a prior desktop-allowlist mistake.
+                _remove(child, rel=f"IndexedDB/{child.name}")
+    # Drop non-IndexedDB top-level leftovers from a prior desktop-allowlist mistake
+    # (dirs and root-level sidecars such as local-settings.json / notifications_win.json).
     for name in (
         "Local Storage",
         "Session Storage",
@@ -197,23 +208,20 @@ def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> None:
         "Network",
         "storage",
         "Notifications",
+        "local-settings.json",
+        "notifications_win.json",
     ):
-        p = mirror / name
-        if p.is_dir() and not p.is_symlink():
-            shutil.rmtree(p, ignore_errors=True)
-        elif p.exists():
-            with contextlib.suppress(OSError):
-                p.unlink()
+        _remove(mirror / name, rel=name)
     manifest_path = mirror / "manifest.json"
     if not manifest_path.is_file():
-        return
+        return errors
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return
+        return errors
     files = data.get("files") if isinstance(data, dict) else None
     if not isinstance(files, dict):
-        return
+        return errors
     origin = idb_origin_dir_name()
     keep_prefixes = (
         f"IndexedDB/{origin}.blob/",
@@ -226,6 +234,7 @@ def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> None:
     data["files"] = files
     data["allowlist"] = ALLOWLIST_EDGE_IDB
     _save_manifest(manifest_path, data)
+    return errors
 
 
 def snapshot_profile(
@@ -270,9 +279,14 @@ def snapshot_profile(
         include_http_cache = False
         include_notifications = False
         # Drop leftovers if this mirror was previously ingested under the desktop allowlist.
-        _purge_edge_mirror_extras(
-            mirror,
-            [mirror / "IndexedDB" / f"{origin}.blob", mirror / "IndexedDB" / f"{origin}.leveldb"],
+        stats.errors.extend(
+            _purge_edge_mirror_extras(
+                mirror,
+                [
+                    mirror / "IndexedDB" / f"{origin}.blob",
+                    mirror / "IndexedDB" / f"{origin}.leveldb",
+                ],
+            )
         )
         # Reload manifest after purge.
         manifest = _load_manifest(manifest_path)

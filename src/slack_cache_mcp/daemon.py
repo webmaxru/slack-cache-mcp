@@ -12,6 +12,7 @@ from typing import Any
 from slack_cache_mcp.config import Settings
 from slack_cache_mcp.desktop.chromium.idb_values import idb_origin_dir_name
 from slack_cache_mcp.desktop.locate import discover_profiles
+from slack_cache_mcp.desktop.snapshot import _is_linkish
 from slack_cache_mcp.logutil import log_event, setup_daemon_logging
 from slack_cache_mcp.pipeline import run_snapshot_cycle
 from slack_cache_mcp.single_instance import AlreadyRunningError, acquire, release
@@ -53,14 +54,23 @@ def _watch_roots(profile: Path, *, edge_browser: bool = False) -> list[Path]:
         profile / "IndexedDB" / f"{origin}.blob",
         profile / "IndexedDB" / f"{origin}.leveldb",
     ]
-    if not edge_browser:
-        # Desktop-only: never watch Edge Local Storage / root-state (credential-adjacent).
-        roots.extend(
-            [
-                profile / "Local Storage" / "leveldb",
-                profile / "storage",
-            ]
-        )
+    if edge_browser:
+        # Same containment as Edge snapshot: linked IndexedDB/ancestors are out of bounds.
+        idb = profile / "IndexedDB"
+        if _is_linkish(idb, up_to=profile):
+            return []
+        return [
+            r
+            for r in roots
+            if r.exists() and not _is_linkish(r, up_to=profile)
+        ]
+    # Desktop-only extras: never watch these for Edge (credential-adjacent).
+    roots.extend(
+        [
+            profile / "Local Storage" / "leveldb",
+            profile / "storage",
+        ]
+    )
     return [r for r in roots if r.exists() and not r.is_symlink()]
 
 

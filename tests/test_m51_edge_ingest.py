@@ -388,6 +388,8 @@ def test_edge_purge_removes_prior_desktop_allowlist_leftovers(tmp_path: Path) ->
     (mirror / "Local Storage" / "leveldb").mkdir(parents=True)
     (mirror / "Local Storage" / "leveldb" / "CURRENT").write_text("bait", encoding="utf-8")
     (mirror / "Session Storage").mkdir(parents=True)
+    (mirror / "local-settings.json").write_text("{}", encoding="utf-8")
+    (mirror / "notifications_win.json").write_text("[]", encoding="utf-8")
     other = mirror / "IndexedDB" / "https_other.example_0.indexeddb.leveldb"
     other.mkdir(parents=True)
     (other / "CURRENT").write_text("other", encoding="utf-8")
@@ -395,7 +397,25 @@ def test_edge_purge_removes_prior_desktop_allowlist_leftovers(tmp_path: Path) ->
     assert stats.copied > 0
     assert not (mirror / "Local Storage").exists()
     assert not (mirror / "Session Storage").exists()
+    assert not (mirror / "local-settings.json").exists()
+    assert not (mirror / "notifications_win.json").exists()
     assert not other.exists()
+
+
+def test_daemon_skips_edge_watch_when_indexeddb_linked(tmp_path: Path) -> None:
+    from slack_cache_mcp.daemon import _watch_roots
+
+    edge = tmp_path / "Edge" / "User Data" / "Default"
+    edge.mkdir(parents=True)
+    real_idb = tmp_path / "evil_idb"
+    blob = real_idb / "https_app.slack.com_0.indexeddb.blob"
+    blob.mkdir(parents=True)
+    (blob / "CURRENT").write_text("x", encoding="utf-8")
+    try:
+        _link_dir(edge / "IndexedDB", real_idb)
+    except Exception:  # noqa: BLE001
+        pytest.skip("symlinks/junctions unavailable")
+    assert _watch_roots(edge, edge_browser=True) == []
 
 
 def test_list_edge_sighted_ts_excludes_historical(tmp_path: Path) -> None:
