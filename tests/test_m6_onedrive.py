@@ -331,6 +331,44 @@ def test_import_skips_already_processed_ciphertext(tmp_path: Path) -> None:
     b_repo.close()
 
 
+def test_peer_add_bumps_generation_and_blocks_stale_advance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Peer-add mid-export (cursor already 0) must not advance the push cursor."""
+    exchange = tmp_path / "ex"
+    exchange.mkdir()
+    a_data = tmp_path / "a"
+    b_data = tmp_path / "b"
+    a_repo = SqliteRepository(a_data / "archive.db")
+    b_repo = SqliteRepository(b_data / "archive.db")
+    a_id = ensure_local_device(a_repo, a_data)
+    b_id = ensure_local_device(b_repo, b_data)
+    _seed_one_message(a_repo, device_id=a_id.device_id)
+
+    gen_before = a_repo.get_sync_peer_generation()
+    assert gen_before == 0
+
+    real_encrypt = None
+    from slack_cache_mcp.sync import bundle as bundle_mod
+
+    real_encrypt = bundle_mod.age_encrypt
+
+    def _encrypt_and_add_peer(envelope: bytes, recipients: list[str]) -> bytes:
+        # Concurrent peers add while export is encrypting.
+        register_peer(a_repo, b_id.public_info())
+        assert a_repo.get_sync_peer_generation() == gen_before + 1
+        return real_encrypt(envelope, recipients)
+
+    monkeypatch.setattr(bundle_mod, "age_encrypt", _encrypt_and_add_peer)
+    result = export_bundle(a_repo, identity=a_id, to_dir=exchange, peer="folder")
+    assert result["ok"]
+    assert result.get("peers_changed") is True
+    assert result.get("cursor_advanced") is False
+    assert a_repo.get_sync_cursor("folder", "push") == "0"
+    a_repo.close()
+    b_repo.close()
+
+
 def test_unpinned_attribute_is_not_online_only(tmp_path: Path, monkeypatch) -> None:
     f = tmp_path / "local.age"
     f.write_bytes(b"abc")

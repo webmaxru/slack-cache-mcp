@@ -147,6 +147,7 @@ def _export_bundle_locked(
     cursor_raw = repo.get_sync_cursor(peer, "push")
     since_seq = int(cursor_raw) if cursor_raw is not None else 0
     expected_cursor = str(since_seq)
+    peer_generation = repo.get_sync_peer_generation()
     rows = repo.list_change_log_since(device_id=identity.device_id, since_seq=since_seq)
     # Stable dependency order inside the bundle (workspace → channel → …).
     _order = {
@@ -196,6 +197,9 @@ def _export_bundle_locked(
     recipients = list_age_recipients(repo)
     if identity.age_recipient not in recipients:
         recipients.append(identity.age_recipient)
+    recipient_fp = hashlib.sha256(
+        "\n".join(sorted(recipients)).encode("utf-8")
+    ).hexdigest()
 
     envelope = build_signed_envelope(
         identity=identity,
@@ -219,11 +223,28 @@ def _export_bundle_locked(
     tmp_path = to_dir / f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     tmp_path.write_bytes(ciphertext)
     tmp_path.rename(path)
-    # CAS: if peers add reset the cursor mid-export, leave the reset intact so the
-    # next export re-sends full history to the new recipient set.
-    cursor_advanced = repo.cas_sync_cursor(
-        peer, "push", expected=expected_cursor, new=str(to_seq)
+
+    # Peer-add during export: generation and/or recipient set may change even when
+    # the push cursor was already ``0`` (CAS alone cannot see that).
+    recipients_now = list_age_recipients(repo)
+    if identity.age_recipient not in recipients_now:
+        recipients_now.append(identity.age_recipient)
+    recipient_fp_now = hashlib.sha256(
+        "\n".join(sorted(recipients_now)).encode("utf-8")
+    ).hexdigest()
+    generation_now = repo.get_sync_peer_generation()
+    peers_changed = (
+        generation_now != peer_generation or recipient_fp_now != recipient_fp
     )
+    cursor_advanced = False
+    if peers_changed:
+        # Keep / restore a zero push cursor so the next export is a full re-send
+        # encrypted to the updated recipient set.
+        repo.set_sync_cursor(peer, "push", "0")
+    else:
+        cursor_advanced = repo.cas_sync_cursor(
+            peer, "push", expected=expected_cursor, new=str(to_seq)
+        )
     return {
         "ok": True,
         "exported": len(rows),
@@ -235,6 +256,7 @@ def _export_bundle_locked(
         "backfill": backfill,
         "content_sha256": hashlib.sha256(ciphertext).hexdigest(),
         "cursor_advanced": cursor_advanced,
+        "peers_changed": peers_changed,
     }
 
 

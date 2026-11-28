@@ -680,6 +680,13 @@ class SqliteRepository:
             for r in rows
         ]
 
+    def get_sync_peer_generation(self) -> int:
+        raw = self.get_meta("sync_peer_generation")
+        try:
+            return int(raw) if raw is not None else 0
+        except ValueError:
+            return 0
+
     def reset_push_cursors(self) -> int:
         """Reset every push cursor so the next export re-sends full history."""
         cur = self._conn.execute(
@@ -698,6 +705,16 @@ class SqliteRepository:
               cursor='0', updated_at=excluded.updated_at
             """,
             (_utc_now(),),
+        )
+        # Generation bump detects peer-add during an in-flight export even when
+        # the cursor was already ``0`` / missing (CAS alone is insufficient).
+        gen = self.get_sync_peer_generation() + 1
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("sync_peer_generation", str(gen)),
         )
         self._conn.commit()
         return int(cur.rowcount or 0)
