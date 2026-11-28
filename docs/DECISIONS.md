@@ -117,6 +117,20 @@ Import rejects unknown senders and signing/age key mismatches against `sync peer
 - Directory upserts maintain `field_hlcs_json`. Unclocked values use sentinel `*`. Repair migration (policy `v7-*`) preserves real table clocks, restores dominating `(value, clock)` pairs only for unknown table clocks, bumps `directory_clock_epoch`, and rebuilds local directory outbox with `clock_epoch` + one-shot `clock_repair`. Receivers force-apply only facts that carry repair authority (higher epoch or `clock_repair`); lower-epoch clocks are null-fill only. Full re-exports write the new bundle before deleting older local files; incremental exports retain history. Bundle `from_seq`/`to_seq` use min/max sequence; import verifies all files then applies rows in global entity order with per-row failure isolation. Channel outbox emits legacy `aliases` plus `alias_records`; backfill repairs object-only rows.
 - Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.
 
+## 2026-11-28 — M6.0 OneDrive exchange (folder living)
+
+### Hub choice
+Maxim chose **OneDrive-first** for living multi-laptop sync before object storage (R2). Reuse M5 age bundles; no Microsoft Graph API; filesystem path only.
+
+### Default path
+`%USERPROFILE%\OneDrive - Microsoft\Projects\slackcache` (expand `USERPROFILE`; create on `sync push` / `export` when omitted). Override: env `SLACKCACHE_EXCHANGE_DIR` (tests, USB, Personal OneDrive roots).
+
+### CLI
+`sync export` / `import` accept optional `--to` / `--from` (default = exchange path). Aliases `sync push` / `pull`. `sync status` shows folder existence, bundle counts, optional Win32 hydration flags, pin hint, and local `sync_cursors` — never message text.
+
+### Hard rules
+Write-once `bundle-*.jsonl.zst.age` only in OneDrive. No `archive.db`, vault, `device.secrets`, or shared cursor/manifest files. Cursors stay in local SQLite. Pin exchange folder **Always keep on this device** for offline import. Peer JSON exchanged once out of band (`show-device` → `peers add`), not auto-trusted from the cloud folder.
+
 ## 2026-11-27 — M5.1 Edge browser IndexedDB ingest
 
 ### Second offline source (Edge only)

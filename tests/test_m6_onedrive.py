@@ -1,0 +1,248 @@
+"""M6.0 OneDrive exchange helpers — temp dirs only (no real OneDrive required)."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from slack_cache_mcp.domain.models import Channel, MessageObservation, Workspace
+from slack_cache_mcp.ingest.hlc import HLC
+from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+from slack_cache_mcp.sync.bundle import (
+    ensure_local_device,
+    export_bundle,
+    import_bundles,
+    register_peer,
+)
+from slack_cache_mcp.sync.onedrive import (
+    EXCHANGE_DIR_ENV,
+    default_exchange_dir,
+    ensure_exchange_dir,
+    exchange_status,
+    is_cloud_placeholder,
+    list_bundle_paths,
+)
+from slack_cache_mcp.sync.state_hash import compute_state_hash
+
+
+def test_default_exchange_dir_under_userprofile(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv(EXCHANGE_DIR_ENV, raising=False)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    got = default_exchange_dir()
+    assert got == tmp_path / "OneDrive - Microsoft" / "Projects" / "slackcache"
+
+
+def test_exchange_dir_env_override(tmp_path: Path, monkeypatch) -> None:
+    custom = tmp_path / "usb-stick" / "bundles"
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, str(custom))
+    assert default_exchange_dir() == custom
+
+
+def test_ensure_exchange_dir_creates_readme(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, str(tmp_path / "exchange"))
+    path = ensure_exchange_dir(create=True)
+    assert path.is_dir()
+    readme = path / "README.txt"
+    assert readme.is_file()
+    text = readme.read_text(encoding="utf-8")
+    assert "archive.db" in text
+    assert "Always keep on this device" in text
+    # Idempotent: do not clobber an edited README.
+    readme.write_text("custom", encoding="utf-8")
+    ensure_exchange_dir(create=True)
+    assert readme.read_text(encoding="utf-8") == "custom"
+
+
+def test_exchange_status_counts_bundles(tmp_path: Path, monkeypatch) -> None:
+    exchange = tmp_path / "ex"
+    exchange.mkdir()
+    (exchange / "bundle-A-1-2.jsonl.zst.age").write_bytes(b"cipher")
+    (exchange / "noise.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, str(exchange))
+    status = exchange_status()
+    assert status["exists"] is True
+    assert status["bundle_count"] == 1
+    assert status["rules"]["no_archive_db"] is True
+    assert status["rules"]["no_shared_cursors"] is True
+    assert list_bundle_paths(exchange)[0].name.startswith("bundle-")
+
+
+def test_is_cloud_placeholder_regular_file(tmp_path: Path) -> None:
+    f = tmp_path / "local.age"
+    f.write_bytes(b"abc")
+    flag = is_cloud_placeholder(f)
+    # On Windows a normal file is hydrated (False); elsewhere unknown (None).
+    assert flag in (False, None)
+
+
+def _seed_one_message(repo: SqliteRepository, *, device_id: str) -> None:
+    hlc = HLC(device_id=device_id)
+    seen = "2026-11-28T12:00:00Z"
+    repo.upsert_workspace(
+        Workspace(
+            workspace_key="W1",
+            team_id="T1",
+            enterprise_id=None,
+            name="ws",
+            domain="example",
+            self_user_id="U1",
+            self_is_guest=False,
+            raw={"name": "ws"},
+        ),
+        hlc.now(),
+        seen,
+        device_id=device_id,
+    )
+    repo.upsert_channel(
+        Channel(
+            channel_id="C1",
+            workspace_key="W1",
+            context_team_id="T1",
+            name="general",
+            kind="channel",
+            is_ext_shared=False,
+            is_archived=False,
+            is_member=True,
+            topic=None,
+            purpose=None,
+            im_user_id=None,
+            raw={"name": "general"},
+        ),
+        hlc.now(),
+        seen,
+        device_id=device_id,
+    )
+    obs = MessageObservation(
+        channel_id="C1",
+        ts="1700000000.000100",
+        workspace_key="W1",
+        user_id="U1",
+        thread_ts=None,
+        subtype=None,
+        text="hello from A",
+        search_text="hello from A",
+        content_sha256="sha-a1",
+        edited_ts=None,
+        is_deletion=False,
+        is_partial=False,
+        source="redux.messages",
+        source_rank=100,
+        raw={"ts": "1700000000.000100", "text": "hello from A", "user": "U1"},
+    )
+    repo.ingest_observation(
+        obs,
+        device_id=device_id,
+        snapshot_id="snap",
+        state_sha256="state",
+        seen_at=seen,
+        hlc=hlc.now(),
+    )
+
+
+def test_two_device_folder_living_via_exchange(tmp_path: Path, monkeypatch) -> None:
+    """Device A push → shared temp exchange → device B pull converges (CI-safe)."""
+    exchange = tmp_path / "OneDrive - Microsoft" / "Projects" / "slackcache"
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, str(exchange))
+    ensure_exchange_dir(create=True)
+
+    a_data = tmp_path / "a"
+    b_data = tmp_path / "b"
+    a_repo = SqliteRepository(a_data / "archive.db")
+    b_repo = SqliteRepository(b_data / "archive.db")
+    a_id = ensure_local_device(a_repo, a_data)
+    b_id = ensure_local_device(b_repo, b_data)
+    register_peer(a_repo, b_id.public_info())
+    register_peer(b_repo, a_id.public_info())
+
+    _seed_one_message(a_repo, device_id=a_id.device_id)
+
+    pushed = export_bundle(a_repo, identity=a_id, to_dir=default_exchange_dir())
+    assert pushed["ok"] is True
+    assert pushed["exported"] >= 1
+    assert exchange_status()["bundle_count"] >= 1
+
+    pulled = import_bundles(b_repo, identity=b_id, from_dir=default_exchange_dir())
+    assert pulled["ok"] is True
+    assert pulled["files_imported"] >= 1
+    assert compute_state_hash(a_repo) == compute_state_hash(b_repo)
+
+    cursors = b_repo.list_sync_cursors()
+    assert any(c["direction"] == "pull" for c in cursors)
+
+    a_repo.close()
+    b_repo.close()
+
+
+def test_cli_push_pull_aliases_use_env_exchange(tmp_path: Path, monkeypatch) -> None:
+    """Smoke the Typer aliases against a temp exchange (no real OneDrive)."""
+    from typer.testing import CliRunner
+
+    from slack_cache_mcp.cli import app
+
+    exchange = tmp_path / "ex"
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, str(exchange))
+    a_data = tmp_path / "cli-a"
+    b_data = tmp_path / "cli-b"
+
+    runner = CliRunner()
+    assert runner.invoke(app, ["sync", "init", "--data-dir", str(a_data)]).exit_code == 0
+    assert runner.invoke(app, ["sync", "init", "--data-dir", str(b_data)]).exit_code == 0
+
+    peer_a = tmp_path / "a.json"
+    peer_b = tmp_path / "b.json"
+    peer_a.write_text(
+        runner.invoke(app, ["sync", "show-device", "--data-dir", str(a_data)]).output,
+        encoding="utf-8",
+    )
+    peer_b.write_text(
+        runner.invoke(app, ["sync", "show-device", "--data-dir", str(b_data)]).output,
+        encoding="utf-8",
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["sync", "peers", "add", "--from", str(peer_b), "--data-dir", str(a_data)],
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["sync", "peers", "add", "--from", str(peer_a), "--data-dir", str(b_data)],
+        ).exit_code
+        == 0
+    )
+
+    repo = SqliteRepository(a_data / "archive.db")
+    identity = ensure_local_device(repo, a_data)
+    _seed_one_message(repo, device_id=identity.device_id)
+    repo.close()
+
+    push = runner.invoke(app, ["sync", "push", "--data-dir", str(a_data)])
+    assert push.exit_code == 0, push.output
+    push_json = json.loads(push.output)
+    assert push_json["exchange_dir"] == str(exchange)
+    assert any(exchange.glob("bundle-*.jsonl.zst.age"))
+
+    status = runner.invoke(app, ["sync", "status", "--data-dir", str(a_data)])
+    assert status.exit_code == 0, status.output
+    status_json = json.loads(status.output)
+    assert status_json["exchange"]["bundle_count"] >= 1
+    assert status_json["exchange"]["rules"]["no_archive_db"] is True
+
+    pull = runner.invoke(app, ["sync", "pull", "--data-dir", str(b_data)])
+    assert pull.exit_code == 0, pull.output
+    pull_json = json.loads(pull.output)
+    assert pull_json["files_imported"] >= 1
+
+
+def test_status_missing_exchange_without_create(tmp_path: Path, monkeypatch) -> None:
+    missing = tmp_path / "nope" / "slackcache"
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, str(missing))
+    st = exchange_status(create=False)
+    assert st["exists"] is False
+    assert st["bundle_count"] == 0
+    assert not missing.exists()
+    assert default_exchange_dir() == missing
+    assert EXCHANGE_DIR_ENV in os.environ

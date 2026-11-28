@@ -592,6 +592,25 @@ class SqliteRepository:
         )
         self._conn.commit()
 
+    def list_sync_cursors(self) -> list[dict[str, str]]:
+        """Return push/pull watermarks (counts/ids only — no message text)."""
+        rows = self._conn.execute(
+            """
+            SELECT peer, direction, cursor, updated_at
+            FROM sync_cursors
+            ORDER BY peer, direction
+            """
+        ).fetchall()
+        return [
+            {
+                "peer": str(r["peer"]),
+                "direction": str(r["direction"]),
+                "cursor": str(r["cursor"]),
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
     def reset_push_cursors(self) -> int:
         """Reset every push cursor so the next export re-sends full history."""
         cur = self._conn.execute(
