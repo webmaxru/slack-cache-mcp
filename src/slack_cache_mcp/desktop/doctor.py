@@ -11,6 +11,7 @@ from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend
 from slack_cache_mcp.desktop.chromium.idb_values import decode_blob_file, idb_origin_dir_name
 from slack_cache_mcp.desktop.locate import discover_profiles, redact_path
 from slack_cache_mcp.desktop.slack import localstate, redux, session_scan
+from slack_cache_mcp.desktop.snapshot import _resolved_under
 
 
 def run_doctor(settings: Settings) -> dict[str, Any]:
@@ -24,14 +25,20 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
     session_inv: dict[str, Any] = {"present": False}
     local_keys: list[str] = []
     http_inv: dict[str, Any] = {"present": False}
-    for p in profiles:
-        if not p.valid:
-            continue
-        backend = detect_idb_backend(p.path)
-        blob_root = p.path / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
-        if blob_root.is_dir():
+    # Prefer a desktop profile for inventories; Edge is Slack-IDB-only.
+    ordered = sorted(
+        [p for p in profiles if p.valid],
+        key=lambda p: (p.is_edge_browser, not p.primary),
+    )
+    for p in ordered:
+        edge_only = p.is_edge_browser
+        backend = detect_idb_backend(p.path, slack_origin_only=edge_only)
+        idb_dir = p.path / "IndexedDB"
+        blob_root = idb_dir / f"{idb_origin_dir_name()}.blob"
+        # Reject linked IndexedDB / Slack blob roots; never follow escapes under the tree.
+        if blob_root.is_dir() and _resolved_under(blob_root, idb_dir, profile=p.path):
             for bf in blob_root.rglob("*"):
-                if not bf.is_file():
+                if not bf.is_file() or not _resolved_under(bf, blob_root, profile=p.path):
                     continue
                 info, val = decode_blob_file(bf)
                 key = f"blink={info.blink_version},v8={info.v8_version}"
@@ -44,9 +51,14 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
                         for k in redux.unknown_slices(val):
                             if k not in unknown_slices:
                                 unknown_slices.append(k)
-        session_inv = session_scan.inventory_session_storage(p.path)
-        local_keys = localstate.inventory_local_storage_keys(p.path)
-        http_inv = inventory_http_cache(p.path)
+        if edge_only:
+            session_inv = {"present": False, "skipped": "edge_idb_only"}
+            local_keys = []
+            http_inv = {"present": False, "skipped": "edge_idb_only"}
+        else:
+            session_inv = session_scan.inventory_session_storage(p.path)
+            local_keys = localstate.inventory_local_storage_keys(p.path)
+            http_inv = inventory_http_cache(p.path)
         break
 
     vault_objects = 0
@@ -65,6 +77,7 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             source_yield = []
 
+    edge_profiles = [p for p in profiles if p.is_edge_browser]
     return {
         "profiles": [
             {
@@ -72,9 +85,11 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
                 "path": redact_path(p.path),
                 "valid": p.valid,
                 "primary": p.primary,
+                "edge_idb_only": p.is_edge_browser,
             }
             for p in profiles
         ],
+        "edge_sources": len(edge_profiles),
         "indexeddb_backend": backend,
         "blob_version_histogram": blob_versions,
         "decode_ok": decode_ok,

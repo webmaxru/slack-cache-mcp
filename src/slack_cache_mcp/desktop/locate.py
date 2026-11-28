@@ -1,7 +1,8 @@
-"""Discover Slack desktop profile directories (Windows Store/direct, macOS, Linux)."""
+"""Discover Slack desktop + Edge browser profile directories (Windows Store/direct/Edge, macOS, Linux)."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from dataclasses import dataclass
@@ -9,6 +10,19 @@ from pathlib import Path
 
 from slack_cache_mcp.config import local_appdata, roaming_appdata
 from slack_cache_mcp.desktop.chromium.idb_values import idb_origin_dir_name
+
+# Browser Chromium sources use IndexedDB-only snapshot allowlists (never credentials).
+BROWSER_EDGE_KINDS = frozenset({"win-edge"})
+
+# Microsoft Edge channel install directory names under %LOCALAPPDATA%\Microsoft\.
+_EDGE_CHANNEL_DIRS = frozenset(
+    {
+        "edge",
+        "edge beta",
+        "edge dev",
+        "edge sxs",  # Canary
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -19,10 +33,17 @@ class SlackProfile:
     primary: bool = False
     idb_mtime_ns: int = 0
 
+    @property
+    def is_edge_browser(self) -> bool:
+        return self.kind in BROWSER_EDGE_KINDS
+
 
 def _is_valid_profile(path: Path) -> bool:
     origin = idb_origin_dir_name()
     idb_current = path / "IndexedDB" / f"{origin}.leveldb" / "CURRENT"
+    # Reject symlink CURRENT (must be a real file under the Slack origin tree).
+    if idb_current.is_symlink():
+        return False
     root_state = path / "storage" / "root-state.json"
     return idb_current.is_file() or root_state.is_file()
 
@@ -33,12 +54,60 @@ def _idb_mtime(path: Path) -> int:
     newest = 0
     if idb.is_dir():
         for p in idb.rglob("*"):
+            if p.is_symlink():
+                continue
             if p.is_file():
                 try:
                     newest = max(newest, p.stat().st_mtime_ns)
                 except OSError:
                     continue
     return newest
+
+
+def windows_edge_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
+    """Microsoft Edge channel Default profiles (Stable/Beta/Dev/Canary).
+
+    Chrome User Data is intentionally out of scope for M5.1.
+    """
+    e = env if env is not None else dict(os.environ)
+    local = Path(e["LOCALAPPDATA"]) if e.get("LOCALAPPDATA") else local_appdata()
+    microsoft = local / "Microsoft"
+    out: list[tuple[Path, str]] = []
+    # Known channel folder names (literal casing as installed on Windows).
+    for channel in ("Edge", "Edge Beta", "Edge Dev", "Edge SxS"):
+        out.append((microsoft / channel / "User Data" / "Default", "win-edge"))
+    return out
+
+
+def _is_edge_channel_dir(name: str) -> bool:
+    n = name.lower()
+    return n in _EDGE_CHANNEL_DIRS or n.startswith("edge ")
+
+
+def _path_looks_like_edge_user_data(path: Path) -> bool:
+    """True when path (or a resolved target) is under an Edge*/User Data tree."""
+    candidates = [Path(path)]
+    with contextlib.suppress(OSError):
+        candidates.append(Path(path).resolve())
+    for cand in candidates:
+        parts = list(cand.parts)
+        parts_lower = [p.lower() for p in parts]
+        for i, part in enumerate(parts_lower):
+            # .../<Edge channel>/User Data/...
+            if _is_edge_channel_dir(part) and i + 1 < len(parts_lower):
+                if parts_lower[i + 1] == "user data":
+                    return True
+            # .../User Data/... preceded by an Edge channel dir
+            if part == "user data" and i > 0 and _is_edge_channel_dir(parts_lower[i - 1]):
+                return True
+    return False
+
+
+def infer_override_kind(path: Path) -> str:
+    """Classify a config/CLI override path (any Edge channel → win-edge; else override)."""
+    if _path_looks_like_edge_user_data(path):
+        return "win-edge"
+    return "override"
 
 
 def windows_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
@@ -48,12 +117,7 @@ def windows_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, st
     roaming = Path(e["APPDATA"]) if e.get("APPDATA") else roaming_appdata()
 
     store_fixed = (
-        local
-        / "Packages"
-        / "91750D7E.Slack_8she8kybcnzg4"
-        / "LocalCache"
-        / "Roaming"
-        / "Slack"
+        local / "Packages" / "91750D7E.Slack_8she8kybcnzg4" / "LocalCache" / "Roaming" / "Slack"
     )
     out.append((store_fixed, "win-store"))
 
@@ -65,6 +129,7 @@ def windows_candidates(env: dict[str, str] | None = None) -> list[tuple[Path, st
                 out.append((cand, "win-store"))
 
     out.append((roaming / "Slack", "win-direct"))
+    out.extend(windows_edge_candidates(env=e))
     return out
 
 
@@ -86,7 +151,9 @@ def macos_candidates(home: Path | None = None) -> list[tuple[Path, str]]:
     ]
 
 
-def linux_candidates(home: Path | None = None, env: dict[str, str] | None = None) -> list[tuple[Path, str]]:
+def linux_candidates(
+    home: Path | None = None, env: dict[str, str] | None = None
+) -> list[tuple[Path, str]]:
     h = home or Path.home()
     e = env if env is not None else dict(os.environ)
     out: list[tuple[Path, str]] = []
@@ -110,7 +177,8 @@ def discover_profiles(
     candidates: list[tuple[Path, str]] = []
     if overrides:
         for p in overrides:
-            candidates.append((Path(p), "override"))
+            path = Path(p)
+            candidates.append((path, infer_override_kind(path)))
     elif plat == "win32":
         candidates.extend(windows_candidates(env=env))
     elif plat == "darwin":
@@ -129,7 +197,11 @@ def discover_profiles(
             continue
         seen.add(resolved)
         valid = _is_valid_profile(path)
-        if not valid and kind != "override":
+        if kind in BROWSER_EDGE_KINDS:
+            # Edge Default always exists if Edge is installed; only list when Slack IDB is present.
+            if not valid:
+                continue
+        elif not valid and kind != "override":
             # Still record overrides even if incomplete; skip missing non-override
             if not path.exists():
                 continue
@@ -139,7 +211,7 @@ def discover_profiles(
             SlackProfile(
                 path=path,
                 kind=kind,
-                valid=_is_valid_profile(path),
+                valid=valid,
                 idb_mtime_ns=_idb_mtime(path) if path.exists() else 0,
             )
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import shutil
@@ -97,6 +98,145 @@ def _should_copy(src: Path, manifest_entry: dict[str, Any] | None) -> bool:
     )
 
 
+# Snapshot allowlist modes:
+# - desktop: Slack desktop profile (IndexedDB + Local/Session Storage + root-state, …)
+# - edge-idb: Edge Chromium Default — Slack https_app IndexedDB only (never credentials)
+ALLOWLIST_DESKTOP = "desktop"
+ALLOWLIST_EDGE_IDB = "edge-idb"
+
+# Paths that must never be copied from a browser Chromium user-data tree.
+FORBIDDEN_BROWSER_NAME_PARTS = frozenset(
+    {
+        "Cookies",
+        "Cookies-journal",
+        "Local State",
+        "Login Data",
+        "Login Data For Account",
+        "Network",
+        "Trust Tokens",
+        "Trust Tokens-journal",
+    }
+)
+
+
+def _is_linkish(path: Path, *, up_to: Path | None = None) -> bool:
+    """True for symlinks/junctions on ``path`` or (when ``up_to``) any ancestor.
+
+    A linked ``IndexedDB`` parent makes ``child.resolve() == parent.resolve()/name``
+    still hold for Slack ``.blob``/``.leveldb`` children — walking ancestors catches that.
+    """
+    try:
+        cur = path
+        while True:
+            if cur.is_symlink():
+                return True
+            if cur.exists() and cur.resolve() != cur.parent.resolve() / cur.name:
+                return True
+            if up_to is None:
+                return False
+            if cur == up_to:
+                return False
+            try:
+                if cur.resolve() == up_to.resolve():
+                    return False
+            except OSError:
+                return True
+            parent = cur.parent
+            if parent == cur:
+                return False
+            cur = parent
+    except OSError:
+        return True
+
+
+def _resolved_under(path: Path, root: Path, *, profile: Path | None = None) -> bool:
+    """True when ``path`` is a real entry under a non-link ``root`` (no symlink escape).
+
+    Rejects when ``path``, ``root``, or (when ``profile`` is set) a linked ancestor
+    up to the profile redirects resolve() outside the lexical tree.
+    """
+    try:
+        stop = profile if profile is not None else root
+        if _is_linkish(path, up_to=stop) or _is_linkish(root, up_to=stop):
+            return False
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+        return root_resolved in resolved.parents or resolved == root_resolved
+    except OSError:
+        return False
+
+
+def _purge_edge_mirror_extras(mirror: Path, allowed_roots: list[Path]) -> list[str]:
+    """Remove mirror files/dirs outside the Slack-origin IDB trees; prune manifest entries.
+
+    Returns human-readable errors when out-of-allowlist deletion fails (never silent).
+    """
+    errors: list[str] = []
+
+    def _remove(path: Path, *, rel: str) -> None:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as exc:
+            errors.append(f"purge {rel}: {type(exc).__name__}")
+
+    allowed_resolved: list[Path] = []
+    for root in allowed_roots:
+        with contextlib.suppress(OSError):
+            if root.exists() and not _is_linkish(root):
+                allowed_resolved.append(root.resolve())
+    idb = mirror / "IndexedDB"
+    if idb.is_dir():
+        for child in list(idb.iterdir()):
+            keep = False
+            with contextlib.suppress(OSError):
+                cres = child.resolve()
+                keep = any(cres == a or a in cres.parents or cres in a.parents for a in allowed_resolved)
+            if not keep:
+                _remove(child, rel=f"IndexedDB/{child.name}")
+    # Drop non-IndexedDB top-level leftovers from a prior desktop-allowlist mistake
+    # (dirs and root-level sidecars such as local-settings.json / notifications_win.json).
+    for name in (
+        "Local Storage",
+        "Session Storage",
+        "Cache",
+        "Cookies",
+        "Local State",
+        "Login Data",
+        "Network",
+        "storage",
+        "Notifications",
+        "local-settings.json",
+        "notifications_win.json",
+    ):
+        _remove(mirror / name, rel=name)
+    manifest_path = mirror / "manifest.json"
+    if not manifest_path.is_file():
+        return errors
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return errors
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return errors
+    origin = idb_origin_dir_name()
+    keep_prefixes = (
+        f"IndexedDB/{origin}.blob/",
+        f"IndexedDB/{origin}.leveldb/",
+    )
+    for key in list(files):
+        ks = str(key).replace("\\", "/")
+        if not any(ks.startswith(pref) or ks == pref.rstrip("/") for pref in keep_prefixes):
+            files.pop(key, None)
+    data["files"] = files
+    data["allowlist"] = ALLOWLIST_EDGE_IDB
+    _save_manifest(manifest_path, data)
+    return errors
+
+
 def snapshot_profile(
     source: Path,
     mirror: Path,
@@ -106,12 +246,15 @@ def snapshot_profile(
     include_http_cache: bool = False,
     include_notifications: bool = False,
     http_cache_max_bytes: int = 50_000_000,
+    allowlist: str = ALLOWLIST_DESKTOP,
 ) -> SnapshotStats:
     """Copy allowlisted paths from source -> mirror. Never deletes source files."""
     source = Path(source).resolve()
     mirror = Path(mirror).resolve()
     if source == mirror or source in mirror.parents or mirror in source.parents:
         raise ValueError("Source and mirror directories must not overlap")
+    if allowlist not in {ALLOWLIST_DESKTOP, ALLOWLIST_EDGE_IDB}:
+        raise ValueError(f"unknown snapshot allowlist mode: {allowlist}")
     mirror.mkdir(parents=True, exist_ok=True)
     stats = SnapshotStats()
     manifest_path = mirror / "manifest.json"
@@ -119,37 +262,83 @@ def snapshot_profile(
     files_meta: dict[str, Any] = dict(manifest.get("files") or {})
 
     origin = idb_origin_dir_name()
-    allow_trees = [
-        source / "IndexedDB",
-        # Local Storage may contain tokens; pipeline scrub removes the copy end-of-cycle
-        # after allowlist parsing (PLAN §5.2).
-        source / "Local Storage",
-        source / "Session Storage",
-    ]
-    if include_http_cache:
-        allow_trees.append(source / "Cache")
-    allow_files = [
-        source / "storage" / "root-state.json",
-        source / "local-settings.json",
-        # M1 fixture side-car for localConfig (not present on real Slack)
-        source / "Local Storage" / "localConfig_v2.json",
-        # Always-on M3 synthetic side-cars (session scan; drafts gated at ingest)
-        source / "Session Storage" / "session_entries.json",
-        source / "Local Storage" / "local_entries.json",
-    ]
-    # Opt-in side-cars only — avoid copying/missing-noise when flags are off.
-    if include_http_cache:
-        allow_files.append(source / "Cache" / "cache_entries.json")
-    if include_notifications:
-        allow_files.append(source / "Notifications" / "notifications_win.json")
-        allow_files.append(source / "notifications_win.json")
+    if allowlist == ALLOWLIST_EDGE_IDB:
+        # M5.1: IndexedDB for app.slack.com only — never Local Storage / Cookies / …
+        idb_dir = source / "IndexedDB"
+        if _is_linkish(idb_dir, up_to=source):
+            # Linked IndexedDB parent would make Slack .blob/.leveldb look local.
+            stats.errors.append("IndexedDB: symlink/junction parent skipped")
+            allow_trees = []
+        else:
+            allow_trees = [
+                idb_dir / f"{origin}.blob",
+                idb_dir / f"{origin}.leveldb",
+            ]
+        allow_files: list[Path] = []
+        # Opt-in flags are ignored for browser sources (no HTTP cache / notif from Edge).
+        include_http_cache = False
+        include_notifications = False
+        # Drop leftovers if this mirror was previously ingested under the desktop allowlist.
+        stats.errors.extend(
+            _purge_edge_mirror_extras(
+                mirror,
+                [
+                    mirror / "IndexedDB" / f"{origin}.blob",
+                    mirror / "IndexedDB" / f"{origin}.leveldb",
+                ],
+            )
+        )
+        # Reload manifest after purge.
+        manifest = _load_manifest(manifest_path)
+        files_meta = dict(manifest.get("files") or {})
+    else:
+        allow_trees = [
+            source / "IndexedDB",
+            # Local Storage may contain tokens; pipeline scrub removes the copy end-of-cycle
+            # after allowlist parsing (PLAN §5.2).
+            source / "Local Storage",
+            source / "Session Storage",
+        ]
+        if include_http_cache:
+            allow_trees.append(source / "Cache")
+        allow_files = [
+            source / "storage" / "root-state.json",
+            source / "local-settings.json",
+            # M1 fixture side-car for localConfig (not present on real Slack)
+            source / "Local Storage" / "localConfig_v2.json",
+            # Always-on M3 synthetic side-cars (session scan; drafts gated at ingest)
+            source / "Session Storage" / "session_entries.json",
+            source / "Local Storage" / "local_entries.json",
+        ]
+        # Opt-in side-cars only — avoid copying/missing-noise when flags are off.
+        if include_http_cache:
+            allow_files.append(source / "Cache" / "cache_entries.json")
+        if include_notifications:
+            allow_files.append(source / "Notifications" / "notifications_win.json")
+            allow_files.append(source / "notifications_win.json")
 
-    def handle_file(src_file: Path, rel: Path, *, is_blob: bool) -> None:
+    def handle_file(src_file: Path, rel: Path, *, is_blob: bool, allow_root: Path | None) -> None:
         nonlocal stats
         if src_file.name == "LOCK":
             stats.skipped_lock += 1
             return
         rel_s = rel.as_posix()
+        if allowlist == ALLOWLIST_EDGE_IDB:
+            # Never follow symlinks/junctions out of the Slack-origin IDB trees.
+            if _is_linkish(src_file, up_to=source) or (
+                allow_root is not None
+                and not _resolved_under(src_file, allow_root, profile=source)
+            ):
+                stats.errors.append(f"{rel_s}: symlink or escaped allow root")
+                return
+            # Defence in depth: refuse any credential-shaped relative path.
+            parts = set(rel.parts)
+            if parts & FORBIDDEN_BROWSER_NAME_PARTS:
+                stats.errors.append(f"{rel_s}: forbidden browser path")
+                return
+            if "Local Storage" in rel.parts or "Session Storage" in rel.parts:
+                stats.errors.append(f"{rel_s}: forbidden browser storage")
+                return
         prev = files_meta.get(rel_s)
         if not _should_copy(src_file, prev):
             stats.skipped_unchanged += 1
@@ -186,10 +375,27 @@ def snapshot_profile(
 
     cache_bytes = 0
     for tree in allow_trees:
+        if allowlist == ALLOWLIST_EDGE_IDB and _is_linkish(tree, up_to=source):
+            # Symlinked/junction Slack .blob/.leveldb roots (or linked ancestors) escape.
+            try:
+                rel_tree = tree.relative_to(source).as_posix()
+            except ValueError:
+                rel_tree = tree.name
+            stats.errors.append(f"{rel_tree}: symlink root skipped")
+            continue
         if not tree.exists():
             stats.missing.append(tree.name)
             continue
         for p in tree.rglob("*"):
+            linkish = (
+                _is_linkish(p, up_to=source)
+                if allowlist == ALLOWLIST_EDGE_IDB
+                else p.is_symlink()
+            )
+            if linkish:
+                if allowlist == ALLOWLIST_EDGE_IDB:
+                    stats.errors.append(f"{p.relative_to(source).as_posix()}: symlink skipped")
+                continue
             if not p.is_file():
                 continue
             rel = p.relative_to(source)
@@ -204,13 +410,18 @@ def snapshot_profile(
                     stats.errors.append(f"{rel.as_posix()}: http cache size cap")
                     continue
                 cache_bytes += sz
-            handle_file(p, rel, is_blob=is_blob)
+            handle_file(
+                p,
+                rel,
+                is_blob=is_blob,
+                allow_root=tree if allowlist == ALLOWLIST_EDGE_IDB else None,
+            )
 
     for f in allow_files:
         if not f.exists():
             stats.missing.append(f.as_posix())
             continue
-        handle_file(f, f.relative_to(source), is_blob=False)
+        handle_file(f, f.relative_to(source), is_blob=False, allow_root=None)
 
     # Note: files that disappear from source are NOT removed from mirror.
     stats.files = files_meta
@@ -219,6 +430,7 @@ def snapshot_profile(
         {
             "source": str(source),
             "origin": origin,
+            "allowlist": allowlist,
             "files": files_meta,
             "updated_at": time.time(),
         },
@@ -234,9 +446,7 @@ def assert_source_not_written(source: Path, open_calls: list[tuple[Any, ...]]) -
             continue
         path = str(args[0])
         mode = args[1] if len(args) > 1 else "r"
-        if path.startswith(src) or Path(path).resolve().as_posix().startswith(
-            Path(src).as_posix()
-        ):
+        if path.startswith(src) or Path(path).resolve().as_posix().startswith(Path(src).as_posix()):
             if isinstance(mode, str) and any(c in mode for c in "wax+"):
                 # read modes with '+' are read/write
                 if mode == "rb" or mode == "r" or mode.startswith("r") and "+" not in mode:

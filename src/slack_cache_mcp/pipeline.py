@@ -15,7 +15,12 @@ from slack_cache_mcp.config import Settings
 from slack_cache_mcp.desktop.chromium import httpcache
 from slack_cache_mcp.desktop.chromium.idb_backend import detect_idb_backend, open_idb_backend
 from slack_cache_mcp.desktop.chromium.idb_values import decode_blob_file, idb_origin_dir_name
-from slack_cache_mcp.desktop.locate import SlackProfile, discover_profiles, redact_path
+from slack_cache_mcp.desktop.locate import (
+    SlackProfile,
+    discover_profiles,
+    infer_override_kind,
+    redact_path,
+)
 from slack_cache_mcp.desktop.sanitize import sanitize
 from slack_cache_mcp.desktop.slack import (
     canvas,
@@ -26,7 +31,12 @@ from slack_cache_mcp.desktop.slack import (
     rootstate,
     session_scan,
 )
-from slack_cache_mcp.desktop.snapshot import snapshot_profile
+from slack_cache_mcp.desktop.snapshot import (
+    ALLOWLIST_DESKTOP,
+    ALLOWLIST_EDGE_IDB,
+    SnapshotStats,
+    snapshot_profile,
+)
 from slack_cache_mcp.domain.models import Channel, MessageObservation, Workspace
 from slack_cache_mcp.ingest.coverage import extract_channel_windows, suspected_missing, ts_key
 from slack_cache_mcp.ingest.hlc import HLC
@@ -120,14 +130,28 @@ def _filter_dms(
     return channels, messages
 
 
+def _tag_edge_observations(messages: list[MessageObservation]) -> None:
+    """Mark Edge-browser sightings with edge.* source labels (same ranks as desktop)."""
+    for obs in messages:
+        obs.source = redux.edge_source_label(obs.source)
+        obs.source_rank = redux.SOURCE_RANK.get(obs.source, obs.source_rank)
+
+
 def _apply_coverage_and_suspected(
     repo: SqliteRepository,
     clean: dict[str, Any],
     *,
     state_sha256: str,
     seen_at: str,
+    apply_suspected: bool = True,
+    protect_edge_sightings: bool = True,
 ) -> int:
-    """Update coverage ranges / channel_status and mark suspected deletions. Returns count marked."""
+    """Update coverage ranges / channel_status and mark suspected deletions. Returns count marked.
+
+    Edge streams never drive suspected deletion (gap-fillers, not deletion authority).
+    Desktop streams skip ts that already have ``edge.*`` sightings so a thinner desktop
+    window cannot hide Edge-filled reply bodies.
+    """
     marked_total = 0
     latests = clean.get("channelLatests") if isinstance(clean.get("channelLatests"), dict) else {}
     unreads = clean.get("unreadCounts") if isinstance(clean.get("unreadCounts"), dict) else {}
@@ -167,8 +191,10 @@ def _apply_coverage_and_suspected(
             unread_count=unread,
             seen_at=seen_at,
         )
-        if win.contiguous_to_latest:
+        if apply_suspected and win.contiguous_to_latest:
             missing = suspected_missing(previously_seen=known_in_window, window=win)
+            if protect_edge_sightings and missing:
+                missing -= repo.list_edge_sighted_ts(win.channel_id, missing)
             marked = repo.apply_suspected_deletions(
                 win.channel_id,
                 missing,
@@ -177,6 +203,68 @@ def _apply_coverage_and_suspected(
             )
             marked_total += len(marked)
     return marked_total
+
+
+def _scrub_edge_raw_idb(mirror: Path) -> None:
+    """After Edge ingest, delete raw IndexedDB copies (may contain tokens in Redux blobs).
+
+    Sanitized content already lives in the vault/archive. Manifest entries for IndexedDB
+    are dropped so the next cycle re-copies from the live Edge profile when needed.
+    """
+    idb = mirror / "IndexedDB"
+    if idb.exists():
+        _rmtree_credential_scratch(idb)
+    manifest_path = mirror / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return
+    for key in list(files):
+        if key == "IndexedDB" or str(key).startswith("IndexedDB/"):
+            files.pop(key, None)
+    data["files"] = files
+    manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _record_sightings_from_state(
+    *,
+    repo: SqliteRepository,
+    clean: dict[str, Any],
+    edge_mode: bool,
+    capture_dms: bool,
+    device_id: str,
+    snapshot_id: str,
+    state_sha256: str,
+    seen_at: str,
+    hlc: HLC,
+) -> tuple[int, dict[str, int]]:
+    """Extract messages and upsert sightings (used for new and known state generations)."""
+    _ws, channels, _users, _files, messages, _reactions, _saved = redux.extract_all(clean)
+    _channels, messages = _filter_dms(channels, messages, capture_dms=capture_dms)
+    if edge_mode:
+        _tag_edge_observations(messages)
+    ingested = 0
+    by_source: dict[str, int] = {}
+    for obs in messages:
+        if repo.ingest_observation(
+            obs,
+            device_id=device_id,
+            snapshot_id=snapshot_id,
+            state_sha256=state_sha256,
+            seen_at=seen_at,
+            hlc=hlc.now(),
+        ):
+            ingested += 1
+            by_source[obs.source] = by_source.get(obs.source, 0) + 1
+        else:
+            # Version already known — sighting still recorded; count provenance bumps.
+            by_source[obs.source] = by_source.get(obs.source, 0)
+    return ingested, by_source
 
 
 def _ingest_profile(
@@ -195,23 +283,10 @@ def _ingest_profile(
     assert_data_dir_outside_sources(settings.data_dir, [profile.path])
     assert_data_dir_outside_sources(mirror, [profile.path])
 
-    stats = snapshot_profile(
-        profile.path,
-        mirror,
-        include_http_cache=settings.capture_http_cache,
-        include_notifications=settings.capture_notifications,
-        http_cache_max_bytes=settings.http_cache_max_bytes,
-    )
-    repo.upsert_source(
-        source_id,
-        device_id,
-        profile.kind,
-        redact_path(profile.path),
-        None,
-    )
+    edge_mode = profile.is_edge_browser
+    allowlist = ALLOWLIST_EDGE_IDB if edge_mode else ALLOWLIST_DESKTOP
+    stats = SnapshotStats()
     snapshot_id = str(ulid.new())
-    repo.begin_snapshot(snapshot_id, source_id, trigger)
-
     states_decoded = 0
     decode_errors = 0
     messages_ingested = 0
@@ -239,7 +314,26 @@ def _ingest_profile(
         for k, v in kw.items():
             bucket[k] = bucket.get(k, 0) + v
 
+    # Snapshot + ingest under one try/finally so Edge raw IDB is always scrubbed,
+    # even when setup or decode raises before the main body completes.
     try:
+        stats = snapshot_profile(
+            profile.path,
+            mirror,
+            include_http_cache=settings.capture_http_cache and not edge_mode,
+            include_notifications=settings.capture_notifications and not edge_mode,
+            http_cache_max_bytes=settings.http_cache_max_bytes,
+            allowlist=allowlist,
+        )
+        repo.upsert_source(
+            source_id,
+            device_id,
+            profile.kind,
+            redact_path(profile.path),
+            None,
+        )
+        repo.begin_snapshot(snapshot_id, source_id, trigger)
+
         teams = localstate.load_local_config_teams(mirror)
         root_ws = rootstate.load_root_workspaces(mirror)
         idb_backend_kind = detect_idb_backend(mirror)
@@ -247,7 +341,8 @@ def _ingest_profile(
         blob_root = mirror / "IndexedDB" / f"{idb_origin_dir_name()}.blob"
         if blob_root.is_dir():
             for bf in sorted(blob_root.rglob("*")):
-                if not bf.is_file():
+                # Never follow symlinks (Edge allowlist: reject escapes out of Slack IDB).
+                if bf.is_symlink() or not bf.is_file():
                     continue
                 info, val = decode_blob_file(bf)
                 if info.error or not isinstance(val, dict):
@@ -261,6 +356,22 @@ def _ingest_profile(
                 if repo.has_state_generation(sha):
                     repo.touch_state_generation(sha, seen_at)
                     skipped_known += 1
+                    # Still record multi-source sightings (desktop vs Edge provenance).
+                    n_new, by_src = _record_sightings_from_state(
+                        repo=repo,
+                        clean=clean,
+                        edge_mode=edge_mode,
+                        capture_dms=settings.capture_dms,
+                        device_id=device_id,
+                        snapshot_id=snapshot_id,
+                        state_sha256=sha,
+                        seen_at=seen_at,
+                        hlc=hlc,
+                    )
+                    messages_ingested += n_new
+                    for src_name, n in by_src.items():
+                        if n:
+                            _bump(src_name, messages=n)
                     continue
 
                 generations_new += 1
@@ -269,9 +380,7 @@ def _ingest_profile(
                 if vres and vres.created:
                     vault_writes += 1
 
-                ws, channels, users, files, messages, reactions, saved = redux.extract_all(
-                    clean
-                )
+                ws, channels, users, files, messages, reactions, saved = redux.extract_all(clean)
                 if ws.workspace_key in teams:
                     t = teams[ws.workspace_key]
                     ws.name = ws.name or t.get("name")
@@ -284,6 +393,8 @@ def _ingest_profile(
                 channels, messages = _filter_dms(
                     channels, messages, capture_dms=settings.capture_dms
                 )
+                if edge_mode:
+                    _tag_edge_observations(messages)
 
                 blob_ref = bf.relative_to(blob_root).as_posix()
                 repo.insert_state_generation(
@@ -322,7 +433,12 @@ def _ingest_profile(
                         _bump(obs.source, messages=1)
 
                 suspected_marked += _apply_coverage_and_suspected(
-                    repo, clean, state_sha256=sha, seen_at=seen_at
+                    repo,
+                    clean,
+                    state_sha256=sha,
+                    seen_at=seen_at,
+                    apply_suspected=not edge_mode,
+                    protect_edge_sightings=not edge_mode,
                 )
 
         # Historical / inline IDB records (LevelDB + side-cars)
@@ -340,36 +456,41 @@ def _ingest_profile(
                 if isinstance(rec.value, dict) and (
                     "messages" in rec.value or "bootData" in rec.value
                 ):
-                    # Full Redux state found inline/historical — extract if new
+                    # Full Redux state found inline/historical — extract; always record sightings
                     clean = sanitize(rec.value)
                     assert isinstance(clean, dict)
                     sha = _state_sha(clean)
-                    if not repo.has_state_generation(sha):
-                        ws, channels, users, files, messages, reactions, saved = (
-                            redux.extract_all(clean)
-                        )
-                        channels, messages = _filter_dms(
-                            channels, messages, capture_dms=settings.capture_dms
-                        )
-                        for obs in messages:
-                            obs.source = (
-                                "idb.leveldb.historical"
-                                if rec.state == "deleted"
-                                else (rec.source or "idb.leveldb")
-                            )
-                            obs.source_rank = redux.SOURCE_RANK.get(
-                                obs.source, obs.source_rank
-                            )
-                            if repo.ingest_observation(
-                                obs,
-                                device_id=device_id,
-                                snapshot_id=snapshot_id,
-                                state_sha256=sha,
-                                seen_at=seen_at,
-                                hlc=hlc.now(),
-                            ):
-                                messages_ingested += 1
-                                _bump(obs.source, messages=1)
+                    known = repo.has_state_generation(sha)
+                    if known:
+                        repo.touch_state_generation(sha, seen_at)
+                        skipped_known += 1
+                    ws, channels, users, files, messages, reactions, saved = redux.extract_all(
+                        clean
+                    )
+                    channels, messages = _filter_dms(
+                        channels, messages, capture_dms=settings.capture_dms
+                    )
+                    hist_base = (
+                        "idb.leveldb.historical"
+                        if rec.state == "deleted"
+                        else (rec.source or "idb.leveldb")
+                    )
+                    for obs in messages:
+                        obs.source = hist_base
+                        if edge_mode:
+                            obs.source = redux.edge_source_label(obs.source)
+                        obs.source_rank = redux.SOURCE_RANK.get(obs.source, obs.source_rank)
+                        if repo.ingest_observation(
+                            obs,
+                            device_id=device_id,
+                            snapshot_id=snapshot_id,
+                            state_sha256=sha,
+                            seen_at=seen_at,
+                            hlc=hlc.now(),
+                        ):
+                            messages_ingested += 1
+                            _bump(obs.source, messages=1)
+                    if not known:
                         repo.insert_state_generation(
                             sha,
                             ws.workspace_key,
@@ -380,15 +501,19 @@ def _ingest_profile(
                             vault_path=None,
                         )
                         repo.upsert_workspace(ws, hlc.now(), seen_at, device_id=device_id)
+                        generations_new += 1
                 # Message-shaped single values from historical records
                 if isinstance(rec.value, dict) and redux.is_message(rec.value):
                     cid = rec.value.get("channel")
                     if cid:
+                        hist_src = "idb.leveldb.historical"
+                        if edge_mode:
+                            hist_src = redux.edge_source_label(hist_src)
                         hist_obs = redux.observation_from_message(
                             rec.value,
                             channel_id=str(cid),
                             workspace_key="unknown",
-                            source="idb.leveldb.historical",
+                            source=hist_src,
                         )
                         if hist_obs is not None and repo.ingest_observation(
                             hist_obs,
@@ -399,7 +524,7 @@ def _ingest_profile(
                             hlc=hlc.now(),
                         ):
                             messages_ingested += 1
-                            _bump("idb.leveldb.historical", messages=1)
+                            _bump(hist_src, messages=1)
 
             # Group canvas records by database
             by_db: dict[str, list[Any]] = {}
@@ -417,34 +542,35 @@ def _ingest_profile(
         except Exception:  # noqa: BLE001 — never fail the cycle on optional harvest
             _bump("idb.historical", errors=1)
 
-        # Session Storage scan
-        for obs in session_scan.scan_session_messages(mirror):
-            if repo.ingest_observation(
-                obs,
-                device_id=device_id,
-                snapshot_id=snapshot_id,
-                state_sha256="session",
-                seen_at=seen_at,
-                hlc=hlc.now(),
-            ):
-                messages_ingested += 1
-                _bump("session.storage", messages=1)
+        # Session Storage scan (desktop only — Edge allowlist never copies it)
+        if not edge_mode:
+            for obs in session_scan.scan_session_messages(mirror):
+                if repo.ingest_observation(
+                    obs,
+                    device_id=device_id,
+                    snapshot_id=snapshot_id,
+                    state_sha256="session",
+                    seen_at=seen_at,
+                    hlc=hlc.now(),
+                ):
+                    messages_ingested += 1
+                    _bump("session.storage", messages=1)
 
-        # Opt-in drafts
-        if settings.capture_drafts:
+        # Opt-in drafts (desktop Local Storage only)
+        if settings.capture_drafts and not edge_mode:
             for draft in localstate.load_drafts(mirror):
                 repo.upsert_draft(draft, seen_at)
                 _bump("local.drafts", drafts=1)
 
-        # Opt-in downloads
-        if settings.capture_downloads:
+        # Opt-in downloads (desktop root-state only)
+        if settings.capture_downloads and not edge_mode:
             dl_rows = downloads.load_downloads(mirror)
             for f in downloads.index_local_downloads(dl_rows, extract_text=True):
                 repo.upsert_file(f, hlc.now(), seen_at)
                 _bump("root.downloads", files=1)
 
-        # Opt-in HTTP cache
-        if settings.capture_http_cache:
+        # Opt-in HTTP cache (desktop only)
+        if settings.capture_http_cache and not edge_mode:
             entries = httpcache.extract_cache_entries(
                 mirror, max_bytes_total=settings.http_cache_max_bytes
             )
@@ -454,7 +580,7 @@ def _ingest_profile(
                     pass  # OCR stub; no-op without platform OCR deps
 
         # Opt-in Windows notifications (side-car under mirror only in automated runs)
-        if settings.capture_notifications:
+        if settings.capture_notifications and not edge_mode:
             for obs in notifications_win.extract_notifications(mirror):
                 if repo.ingest_observation(
                     obs,
@@ -488,48 +614,58 @@ def _ingest_profile(
                 device_id=device_id,
             )
             known_keys.add(key)
-    finally:
-        _scrub_credential_scratch(mirror)
 
-    for src_name, counts in yield_counts.items():
-        repo.record_source_yield(
+        for src_name, counts in yield_counts.items():
+            repo.record_source_yield(
+                snapshot_id,
+                src_name,
+                messages=int(counts.get("messages", 0)),
+                files=int(counts.get("files", 0)),
+                canvases=int(counts.get("canvases", 0)),
+                reactions=int(counts.get("reactions", 0)),
+                saved_items=int(counts.get("saved_items", 0)),
+                drafts=int(counts.get("drafts", 0)),
+                cache_entries=int(counts.get("cache_entries", 0)),
+                errors=int(counts.get("errors", 0)),
+            )
+
+        repo.finish_snapshot(
             snapshot_id,
-            src_name,
-            messages=int(counts.get("messages", 0)),
-            files=int(counts.get("files", 0)),
-            canvases=int(counts.get("canvases", 0)),
-            reactions=int(counts.get("reactions", 0)),
-            saved_items=int(counts.get("saved_items", 0)),
-            drafts=int(counts.get("drafts", 0)),
-            cache_entries=int(counts.get("cache_entries", 0)),
-            errors=int(counts.get("errors", 0)),
+            files_copied=stats.copied,
+            bytes_copied=stats.bytes,
+            states_decoded=states_decoded,
+            decode_errors=decode_errors,
+            stats_json=json.dumps(
+                {
+                    "skipped_lock": stats.skipped_lock,
+                    "skipped_unchanged": stats.skipped_unchanged,
+                    "skipped_known_generations": skipped_known,
+                    "generations_new": generations_new,
+                    "vault_writes": vault_writes,
+                    "suspected_marked": suspected_marked,
+                    "errors": stats.errors[:20],
+                    "messages_ingested": messages_ingested,
+                    "primary": profile.primary,
+                    "trigger": trigger,
+                    "idb_backend": idb_backend_kind,
+                    "source_yield": yield_counts,
+                    "allowlist": allowlist,
+                    "kind": profile.kind,
+                }
+            ),
         )
+    finally:
+        # Nest so Edge raw-IDB scrub still runs if credential-scratch cleanup raises.
+        try:
+            _scrub_credential_scratch(mirror)
+        finally:
+            if edge_mode:
+                # Raw Edge IndexedDB blobs can hold tokens inside Redux; drop after sanitize/vault.
+                _scrub_edge_raw_idb(mirror)
 
-    repo.finish_snapshot(
-        snapshot_id,
-        files_copied=stats.copied,
-        bytes_copied=stats.bytes,
-        states_decoded=states_decoded,
-        decode_errors=decode_errors,
-        stats_json=json.dumps(
-            {
-                "skipped_lock": stats.skipped_lock,
-                "skipped_unchanged": stats.skipped_unchanged,
-                "skipped_known_generations": skipped_known,
-                "generations_new": generations_new,
-                "vault_writes": vault_writes,
-                "suspected_marked": suspected_marked,
-                "errors": stats.errors[:20],
-                "messages_ingested": messages_ingested,
-                "primary": profile.primary,
-                "trigger": trigger,
-                "idb_backend": idb_backend_kind,
-                "source_yield": yield_counts,
-            }
-        ),
-    )
     return {
         "source": redact_path(profile.path),
+        "kind": profile.kind,
         "source_id": source_id,
         "snapshot_id": snapshot_id,
         "files_copied": stats.copied,
@@ -551,11 +687,18 @@ def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[s
     profiles = discover_profiles(overrides=settings.source_overrides or None)
     valid = [p for p in profiles if p.valid]
     if not valid and settings.source_overrides:
-        valid = [
-            SlackProfile(path=Path(p), kind="override", valid=True, primary=True)
-            for p in settings.source_overrides
-            if Path(p).exists()
-        ]
+        # Force-valid only for non-Edge overrides. Edge paths without Slack IDB must not
+        # fall back to the desktop allowlist (would copy Local Storage / other origins).
+        forced: list[SlackProfile] = []
+        for raw in settings.source_overrides:
+            path = Path(raw)
+            if not path.exists():
+                continue
+            kind = infer_override_kind(path)
+            if kind == "win-edge":
+                continue
+            forced.append(SlackProfile(path=path, kind=kind, valid=True, primary=True))
+        valid = forced
     if not valid:
         return {"error": "no_valid_profiles", "profiles": [], "trigger": trigger}
 
@@ -601,9 +744,7 @@ def run_snapshot_cycle(settings: Settings, *, trigger: str = "manual") -> dict[s
         "states_decoded": sum(s["states_decoded"] for s in per_source),
         "decode_errors": sum(s["decode_errors"] for s in per_source),
         "messages_ingested": sum(s["messages_ingested"] for s in per_source),
-        "skipped_known_generations": sum(
-            s["skipped_known_generations"] for s in per_source
-        ),
+        "skipped_known_generations": sum(s["skipped_known_generations"] for s in per_source),
         "generations_new": sum(s["generations_new"] for s in per_source),
         "vault_writes": sum(s["vault_writes"] for s in per_source),
         "suspected_marked": sum(s["suspected_marked"] for s in per_source),

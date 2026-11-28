@@ -21,7 +21,7 @@ from slack_cache_mcp.domain.models import (
 )
 from slack_cache_mcp.ingest.hashing import content_sha256, normalize_ts, search_text_from_message
 
-# PLAN §8.3 source ranks
+# PLAN §8.3 source ranks (edge.* mirrors desktop ranks for M5.1 Edge IDB stream)
 SOURCE_RANK = {
     "redux.messages": 100,
     "redux.threads": 90,
@@ -42,6 +42,15 @@ SOURCE_RANK = {
     "notif.win": 30,
     "redux.channelLatests": 20,
 }
+# Edge browser sightings: same ranks, distinct labels so one device keeps both streams.
+SOURCE_RANK.update({f"edge.{k}": v for k, v in list(SOURCE_RANK.items())})
+
+
+def edge_source_label(source: str) -> str:
+    """Prefix a Redux/IDB source label for Edge browser provenance."""
+    if source.startswith("edge."):
+        return source
+    return f"edge.{source}"
 
 KNOWN_SLICES = frozenset(
     {

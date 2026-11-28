@@ -615,6 +615,126 @@ def build_synthetic_profile(dest: Path, *, wipe: bool = True) -> Path:
     return dest
 
 
+def build_desktop_missing_reply_profile(dest: Path, *, wipe: bool = True) -> Path:
+    """Desktop-shaped profile: thread root has reply_count but no reply body (A/B gap)."""
+    dest = Path(dest)
+    if wipe and dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    idb_level = dest / "IndexedDB" / "https_app.slack.com_0.indexeddb.leveldb"
+    idb_blob = dest / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob"
+    idb_level.mkdir(parents=True)
+    (idb_level / "CURRENT").write_text("MANIFEST-000001\n", encoding="utf-8")
+    (idb_level / "MANIFEST-000001").write_bytes(b"\x00")
+    (idb_level / "000003.log").write_bytes(b"\x00")
+    (idb_level / "LOCK").write_text("held", encoding="utf-8")
+
+    state = _workspace_state(
+        workspace_key="T0SYNTHAAA",
+        team_id="T0SYNTHAAA",
+        user_id="U0SELF0001",
+        team_name="Synth Team A",
+        domain="synth-a",
+        guest=False,
+    )
+    # Strip reply body; keep metadata on root (desktop gap Maxim observed).
+    pub = state["messages"]["C0SYNTHPUB1"]
+    pub.pop("1763400001.000200", None)
+    root = pub["1763400000.000100"]
+    root["reply_count"] = 1
+    root["latest_reply"] = "1763400001.000200"
+    # Drop reply bodies from threads/allThreads too (metadata-only desktop gap).
+    for slice_name in ("threads", "allThreads"):
+        bucket = state.get(slice_name)
+        if isinstance(bucket, dict):
+            chan = bucket.get("C0SYNTHPUB1")
+            if isinstance(chan, dict) and "1763400000.000100" in chan:
+                chan["1763400000.000100"] = {
+                    "replies": [root],
+                    "reply_count": 1,
+                    "latest_reply": "1763400001.000200",
+                }
+    write_blob(idb_blob / "1" / "00" / "1", state, v8_version=16)
+
+    (dest / "storage").mkdir(parents=True)
+    (dest / "storage" / "root-state.json").write_text("{}", encoding="utf-8")
+    (dest / "local-settings.json").write_text("{}", encoding="utf-8")
+    return dest
+
+
+def build_edge_browser_profile(
+    dest: Path,
+    *,
+    wipe: bool = True,
+    with_reply_body: bool = True,
+) -> Path:
+    """Edge Chromium Default-shaped tree with Slack IDB + credential bait files.
+
+    Only IndexedDB/https_app.slack.com_* is a legitimate source; bait files must never
+    be copied by the edge-idb allowlist.
+    """
+    dest = Path(dest)
+    if wipe and dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    idb_level = dest / "IndexedDB" / "https_app.slack.com_0.indexeddb.leveldb"
+    idb_blob = dest / "IndexedDB" / "https_app.slack.com_0.indexeddb.blob"
+    idb_level.mkdir(parents=True)
+    (idb_level / "CURRENT").write_text("MANIFEST-000001\n", encoding="utf-8")
+    (idb_level / "MANIFEST-000001").write_bytes(b"\x00")
+    (idb_level / "000003.log").write_bytes(b"\x00")
+    (idb_level / "LOCK").write_text("held", encoding="utf-8")
+
+    state = _workspace_state(
+        workspace_key="T0SYNTHAAA",
+        team_id="T0SYNTHAAA",
+        user_id="U0SELF0001",
+        team_name="Synth Team A",
+        domain="synth-a",
+        guest=False,
+    )
+    if with_reply_body:
+        # Ensure the reply body Edge A/B found is present (and an Edge-only extra).
+        state["messages"]["C0SYNTHPUB1"]["1763400001.000200"] = _msg(
+            "1763400001.000200",
+            "U0OTHER01",
+            "synthetic reply agreeing",
+            channel="C0SYNTHPUB1",
+            thread_ts="1763400000.000100",
+        )
+        state["messages"]["C0SYNTHPUB1"]["1763400999.000100"] = _msg(
+            "1763400999.000100",
+            "U0OTHER01",
+            "edge-only reply body about widgets",
+            channel="C0SYNTHPUB1",
+            thread_ts="1763400000.000100",
+        )
+    write_blob(idb_blob / "1" / "00" / "1", state, v8_version=16)
+
+    # Unrelated origin under IndexedDB — must not be copied by edge-idb allowlist.
+    other = dest / "IndexedDB" / "https_other.example_0.indexeddb.leveldb"
+    other.mkdir(parents=True)
+    (other / "CURRENT").write_text("MANIFEST-000001\n", encoding="utf-8")
+    (other / "secret.log").write_text("should-not-copy", encoding="utf-8")
+
+    # Credential bait (never copied)
+    (dest / "Cookies").write_text("d=fake; xoxd-FAKECOOKIE", encoding="utf-8")
+    (dest / "Local State").write_text('{"os_crypt": {"encrypted_key": "x"}}', encoding="utf-8")
+    (dest / "Network").mkdir(parents=True)
+    (dest / "Network" / "Cookies").write_text("network-cookies", encoding="utf-8")
+    (dest / "Login Data").write_bytes(b"SQLite format 3\x00")
+    ls = dest / "Local Storage" / "leveldb"
+    ls.mkdir(parents=True)
+    (ls / "CURRENT").write_text("MANIFEST-000001\n", encoding="utf-8")
+    (dest / "Local Storage" / "localConfig_v2.json").write_text(
+        json.dumps({"token": FAKE_XOXC, "api_token": FAKE_XOXC}),
+        encoding="utf-8",
+    )
+    return dest
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1] / "fixtures" / "synthetic" / "profile"
     build_synthetic_profile(root)

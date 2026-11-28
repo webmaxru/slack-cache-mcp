@@ -12,6 +12,7 @@ from typing import Any
 from slack_cache_mcp.config import Settings
 from slack_cache_mcp.desktop.chromium.idb_values import idb_origin_dir_name
 from slack_cache_mcp.desktop.locate import discover_profiles
+from slack_cache_mcp.desktop.snapshot import _is_linkish
 from slack_cache_mcp.logutil import log_event, setup_daemon_logging
 from slack_cache_mcp.pipeline import run_snapshot_cycle
 from slack_cache_mcp.single_instance import AlreadyRunningError, acquire, release
@@ -47,15 +48,37 @@ class _DebouncedTrigger:
                 self._timer = None
 
 
-def _watch_roots(profile: Path) -> list[Path]:
+def _watch_roots(profile: Path, *, edge_browser: bool = False) -> list[Path]:
     origin = idb_origin_dir_name()
     roots = [
         profile / "IndexedDB" / f"{origin}.blob",
         profile / "IndexedDB" / f"{origin}.leveldb",
-        profile / "Local Storage" / "leveldb",
-        profile / "storage",
     ]
-    return [r for r in roots if r.exists()]
+    if edge_browser:
+        # Same containment as Edge snapshot: linked IndexedDB/ancestors are out of bounds.
+        idb = profile / "IndexedDB"
+        if _is_linkish(idb, up_to=profile):
+            return []
+        return [
+            r
+            for r in roots
+            if r.exists() and not _is_linkish(r, up_to=profile)
+        ]
+    # Desktop-only extras: never watch these for Edge (credential-adjacent).
+    roots.extend(
+        [
+            profile / "Local Storage" / "leveldb",
+            profile / "storage",
+        ]
+    )
+    return [r for r in roots if r.exists() and not r.is_symlink()]
+
+
+def _watch_root_key(root: Path) -> str:
+    try:
+        return str(root.resolve())
+    except OSError:
+        return str(root)
 
 
 def run_daemon(
@@ -311,6 +334,8 @@ def run_daemon(
 
     debouncer = _DebouncedTrigger(WATCH_DEBOUNCE_S, _request_watch)
     observer = None
+    watched_keys: set[str] = set()
+    handler: Any = None
     try:
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
@@ -324,23 +349,56 @@ def run_daemon(
                     return
                 debouncer.ping()
 
-        profiles = discover_profiles(overrides=settings.source_overrides or None)
-        valid = [p for p in profiles if p.valid]
+        handler = Handler()
         observer = Observer()
-        watched = 0
-        for p in valid:
-            for root in _watch_roots(p.path):
-                observer.schedule(Handler(), str(root), recursive=True)
-                watched += 1
-        if watched:
-            observer.start()
-        log_event(logger, "daemon_start", watched_roots=watched, profiles=len(valid))
+        log_event(logger, "daemon_start", watched_roots=0, profiles=0)
     except Exception as exc:
         log_event(logger, "watcher_unavailable", error=type(exc).__name__)
         observer = None
 
-    # Initial full pass
+    def _reconcile_watchers() -> int:
+        """Schedule watchers for newly discovered profiles / Slack IDB dirs."""
+        if observer is None or handler is None:
+            return 0
+        profiles = discover_profiles(overrides=settings.source_overrides or None)
+        valid = [p for p in profiles if p.valid]
+        added = 0
+        for p in valid:
+            for root in _watch_roots(p.path, edge_browser=p.is_edge_browser):
+                key = _watch_root_key(root)
+                if key in watched_keys:
+                    continue
+                try:
+                    observer.schedule(handler, str(root), recursive=True)
+                except Exception as exc:  # noqa: BLE001
+                    log_event(
+                        logger,
+                        "watcher_schedule_error",
+                        error=type(exc).__name__,
+                        root=str(root),
+                    )
+                    continue
+                watched_keys.add(key)
+                added += 1
+        if added:
+            with contextlib.suppress(RuntimeError):
+                # Idempotent if already running.
+                if not observer.is_alive():
+                    observer.start()
+            log_event(
+                logger,
+                "watcher_reconcile",
+                added=added,
+                watched_roots=len(watched_keys),
+                profiles=len(valid),
+            )
+        return added
+
+    # Seed watchers for profiles valid at start, then run the first full pass.
+    _reconcile_watchers()
     _run("full")
+    # Edge Slack IDB may appear after the first ingest; pick up new roots.
+    _reconcile_watchers()
     last_full = time.monotonic()
 
     try:
@@ -360,6 +418,8 @@ def run_daemon(
                 _run("full")
             else:
                 _run("poll")
+            # Profiles / Slack IndexedDB dirs can appear between polls (e.g. first Edge open).
+            _reconcile_watchers()
     finally:
         debouncer.cancel()
         if observer is not None:

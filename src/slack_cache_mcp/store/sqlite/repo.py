@@ -1437,6 +1437,33 @@ class SqliteRepository:
         ).fetchone()
         return int(row["c"]) if row else 0
 
+    def list_edge_sighted_ts(self, channel_id: str, candidates: set[str]) -> set[str]:
+        """Return subset of ``candidates`` with a *live* ``edge.*`` sighting.
+
+        Excludes historical/deleted LevelDB provenance (``%historical%``) so stale
+        Edge tombstones cannot block desktop suspected-deletion.
+        """
+        if not candidates:
+            return set()
+        out: set[str] = set()
+        # Chunk IN lists for SQLite variable limits.
+        items = list(candidates)
+        for i in range(0, len(items), 400):
+            chunk = items[i : i + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT ts FROM message_sightings
+                WHERE channel_id=?
+                  AND source LIKE 'edge.%'
+                  AND source NOT LIKE '%historical%'
+                  AND ts IN ({placeholders})
+                """,
+                (channel_id, *chunk),
+            ).fetchall()
+            out.update(str(r["ts"]) for r in rows)
+        return out
+
     def list_known_message_ts(
         self,
         channel_id: str,
@@ -3233,6 +3260,22 @@ class SqliteRepository:
             state_hash = compute_state_hash(self)
         except Exception:
             state_hash = None
+        sources = [
+            {
+                "source_id": r["source_id"],
+                "kind": r["kind"],
+                "path_hint": r["path_hint"],
+                "first_seen": r["first_seen"],
+                "last_seen": r["last_seen"],
+            }
+            for r in self._conn.execute(
+                """
+                SELECT source_id, kind, path_hint, first_seen, last_seen
+                FROM sources
+                ORDER BY kind, path_hint
+                """
+            ).fetchall()
+        ]
         return {
             "messages": count,
             "workspaces": len(self.list_workspaces()),
@@ -3247,6 +3290,7 @@ class SqliteRepository:
             # Provide structured per-channel info separately (stable type: dict|None)
             "channel_status": channel_block,
             "devices": devices,
+            "sources": sources,
             "state_hash": state_hash,
             "schema_version": SCHEMA_VERSION,
         }
