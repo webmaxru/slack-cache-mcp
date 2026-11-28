@@ -19,11 +19,15 @@ from slack_cache_mcp.sync.onedrive import (
     EXCHANGE_DIR_ENV,
     default_exchange_dir,
     ensure_exchange_dir,
+    exchange_peer_key,
     exchange_status,
     is_cloud_placeholder,
     list_bundle_paths,
 )
 from slack_cache_mcp.sync.state_hash import compute_state_hash
+
+_FILE_ATTRIBUTE_UNPINNED = 0x00100000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
 
 def test_default_exchange_dir_under_userprofile(tmp_path: Path, monkeypatch) -> None:
@@ -246,3 +250,91 @@ def test_status_missing_exchange_without_create(tmp_path: Path, monkeypatch) -> 
     assert not missing.exists()
     assert default_exchange_dir() == missing
     assert EXCHANGE_DIR_ENV in os.environ
+
+
+def test_default_create_requires_onedrive_root(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv(EXCHANGE_DIR_ENV, raising=False)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # No OneDrive - Microsoft directory under the fake profile.
+    try:
+        ensure_exchange_dir(create=True)
+        raise AssertionError("expected FileNotFoundError")
+    except FileNotFoundError as exc:
+        assert "OneDrive root not found" in str(exc)
+    assert not (tmp_path / "OneDrive - Microsoft").exists()
+
+
+def test_exchange_peer_key_scopes_default_folder(tmp_path: Path) -> None:
+    a = exchange_peer_key(tmp_path / "ex-a")
+    b = exchange_peer_key(tmp_path / "ex-b")
+    assert a.startswith("folder:")
+    assert a != b
+    assert exchange_peer_key(tmp_path / "ex-a", peer="usb") == "usb"
+
+
+def test_full_reexport_retains_prior_bundles(tmp_path: Path) -> None:
+    exchange = tmp_path / "ex"
+    exchange.mkdir()
+    data = tmp_path / "data"
+    repo = SqliteRepository(data / "archive.db")
+    identity = ensure_local_device(repo, data)
+    _seed_one_message(repo, device_id=identity.device_id)
+    first = export_bundle(repo, identity=identity, to_dir=exchange, peer="folder")
+    assert first["ok"]
+    first_path = Path(first["path"])
+    assert first_path.is_file()
+    # Reset push cursor (as peers add does) and export again.
+    repo.reset_push_cursors()
+    second = export_bundle(repo, identity=identity, to_dir=exchange, peer="folder")
+    assert second["ok"]
+    assert Path(second["path"]).is_file()
+    assert first_path.is_file(), "prior immutable bundle must remain"
+    assert first_path != Path(second["path"])
+    assert len(list(exchange.glob("bundle-*.jsonl.zst.age"))) >= 2
+    repo.close()
+
+
+def test_import_skips_already_processed_ciphertext(tmp_path: Path) -> None:
+    exchange = tmp_path / "ex"
+    exchange.mkdir()
+    a_data = tmp_path / "a"
+    b_data = tmp_path / "b"
+    a_repo = SqliteRepository(a_data / "archive.db")
+    b_repo = SqliteRepository(b_data / "archive.db")
+    a_id = ensure_local_device(a_repo, a_data)
+    b_id = ensure_local_device(b_repo, b_data)
+    register_peer(a_repo, b_id.public_info())
+    register_peer(b_repo, a_id.public_info())
+    _seed_one_message(a_repo, device_id=a_id.device_id)
+    export_bundle(a_repo, identity=a_id, to_dir=exchange)
+    first = import_bundles(b_repo, identity=b_id, from_dir=exchange)
+    assert first["files_imported"] >= 1
+    second = import_bundles(b_repo, identity=b_id, from_dir=exchange)
+    assert second["files_imported"] == 0
+    assert second["files_skipped_known"] >= 1
+    assert second["ok"] is True
+    a_repo.close()
+    b_repo.close()
+
+
+def test_unpinned_attribute_is_not_online_only(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "local.age"
+    f.write_bytes(b"abc")
+
+    def _unpinned(_path: Path) -> int:
+        return _FILE_ATTRIBUTE_UNPINNED
+
+    monkeypatch.setattr(
+        "slack_cache_mcp.sync.onedrive.file_attributes",
+        _unpinned,
+    )
+    assert is_cloud_placeholder(f) is False
+
+    def _recall(_path: Path) -> int:
+        return _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+    monkeypatch.setattr(
+        "slack_cache_mcp.sync.onedrive.file_attributes",
+        _recall,
+    )
+    assert is_cloud_placeholder(f) is True

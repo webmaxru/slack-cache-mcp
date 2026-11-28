@@ -8,6 +8,7 @@ or shared cursors here.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ BUNDLE_GLOB = "bundle-*.jsonl.zst.age"
 # Windows Files On-Demand attributes (winnt.h).
 _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 _FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
-_FILE_ATTRIBUTE_UNPINNED = 0x00100000
+_FILE_ATTRIBUTE_UNPINNED = 0x00100000  # retention policy — not hydration
 _INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
 
 _PIN_HINT = (
@@ -54,6 +55,11 @@ def user_profile() -> Path:
     return Path.home()
 
 
+def default_onedrive_root(*, userprofile: Path | None = None) -> Path:
+    root = Path(userprofile) if userprofile is not None else user_profile()
+    return root / _DEFAULT_SEGMENTS[0]
+
+
 def default_exchange_dir(*, userprofile: Path | None = None) -> Path:
     """Resolve the default OneDrive exchange path (does not create it).
 
@@ -68,15 +74,45 @@ def default_exchange_dir(*, userprofile: Path | None = None) -> Path:
     return root.joinpath(*_DEFAULT_SEGMENTS)
 
 
+def exchange_peer_key(exchange_dir: Path, peer: str = "folder") -> str:
+    """Scope the default ``folder`` push/pull cursor to the exchange path.
+
+    Explicit ``--peer`` values are preserved unchanged so operators can share a
+    watermark across destinations when they intend to.
+    """
+    if peer != "folder":
+        return peer
+    try:
+        resolved = str(Path(exchange_dir).resolve())
+    except OSError:
+        resolved = str(exchange_dir)
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    return f"folder:{digest}"
+
+
 def ensure_exchange_dir(
     path: Path | None = None,
     *,
     create: bool = True,
     write_readme: bool = True,
 ) -> Path:
-    """Return the exchange directory, creating it (and a short README) if needed."""
-    target = Path(path) if path is not None else default_exchange_dir()
+    """Return the exchange directory, creating it (and a short README) if needed.
+
+    Implicit default-path creation requires the built-in OneDrive root to exist
+    so we never invent a non-synced ``OneDrive - Microsoft`` tree. Explicit
+    ``path`` arguments and ``SLACKCACHE_EXCHANGE_DIR`` may create freely.
+    """
+    explicit = path is not None
+    env_override = EXCHANGE_DIR_ENV in os.environ
+    target = Path(path) if explicit else default_exchange_dir()
     if create:
+        if not explicit and not env_override:
+            root = default_onedrive_root()
+            if not root.is_dir():
+                raise FileNotFoundError(
+                    f"OneDrive root not found: {root}. "
+                    f"Sign in to OneDrive, or set {EXCHANGE_DIR_ENV} / pass an explicit path."
+                )
         target.mkdir(parents=True, exist_ok=True)
         if write_readme:
             readme = target / "README.txt"
@@ -116,15 +152,12 @@ def is_cloud_placeholder(path: Path) -> bool | None:
     """True if the path looks like an online-only OneDrive placeholder.
 
     Returns None when the platform cannot tell (non-Windows / attribute missing).
+    ``FILE_ATTRIBUTE_UNPINNED`` is ignored — it is a retention hint, not hydration.
     """
     attrs = file_attributes(path)
     if attrs is None:
         return None
-    mask = (
-        _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
-        | _FILE_ATTRIBUTE_RECALL_ON_OPEN
-        | _FILE_ATTRIBUTE_UNPINNED
-    )
+    mask = _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | _FILE_ATTRIBUTE_RECALL_ON_OPEN
     return bool(attrs & mask)
 
 
@@ -142,13 +175,13 @@ def exchange_status(
     """Counts-only status for the exchange folder (no message text, no network)."""
     path = Path(exchange_dir) if exchange_dir is not None else default_exchange_dir()
     if create:
-        ensure_exchange_dir(path, create=True)
+        ensure_exchange_dir(
+            exchange_dir if exchange_dir is not None else None,
+            create=True,
+        )
 
     exists = path.is_dir()
     parent = path.parent
-    onedrive_root = path
-    for _ in range(len(_DEFAULT_SEGMENTS)):
-        onedrive_root = onedrive_root.parent
 
     bundles = list_bundle_paths(path) if exists else []
     online_only = 0

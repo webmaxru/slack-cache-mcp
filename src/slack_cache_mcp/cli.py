@@ -492,14 +492,18 @@ def sync_peers_cmd(
 def _resolve_exchange_dir(explicit: Path | None, *, create: bool) -> Path:
     from slack_cache_mcp.sync.onedrive import default_exchange_dir, ensure_exchange_dir
 
-    if explicit is not None:
-        path = Path(explicit)
+    try:
+        if explicit is not None:
+            path = Path(explicit)
+            if create:
+                ensure_exchange_dir(path, create=True)
+            return path
         if create:
-            ensure_exchange_dir(path, create=True)
-        return path
-    if create:
-        return ensure_exchange_dir(create=True)
-    return default_exchange_dir()
+            return ensure_exchange_dir(create=True)
+        return default_exchange_dir()
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
 
 
 @sync_app.command("export")
@@ -517,12 +521,14 @@ def sync_export_cmd(
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
     from slack_cache_mcp.sync.bundle import ensure_local_device, export_bundle
+    from slack_cache_mcp.sync.onedrive import exchange_peer_key
 
     exchange = _resolve_exchange_dir(to_dir, create=True)
+    peer_key = exchange_peer_key(exchange, peer)
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db)
     identity = ensure_local_device(repo, settings.data_dir)
-    result = export_bundle(repo, identity=identity, to_dir=exchange, peer=peer)
+    result = export_bundle(repo, identity=identity, to_dir=exchange, peer=peer_key)
     result["exchange_dir"] = str(exchange)
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
@@ -545,6 +551,7 @@ def sync_import_cmd(
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
     from slack_cache_mcp.sync.bundle import ensure_local_device, import_bundles
+    from slack_cache_mcp.sync.onedrive import exchange_peer_key
 
     exchange = _resolve_exchange_dir(from_dir, create=False)
     if not exchange.is_dir():
@@ -554,10 +561,11 @@ def sync_import_cmd(
             err=True,
         )
         raise typer.Exit(1)
+    peer_key = exchange_peer_key(exchange, peer)
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db)
     identity = ensure_local_device(repo, settings.data_dir)
-    result = import_bundles(repo, identity=identity, from_dir=exchange, peer=peer)
+    result = import_bundles(repo, identity=identity, from_dir=exchange, peer=peer_key)
     result["exchange_dir"] = str(exchange)
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
@@ -612,13 +620,16 @@ def sync_status_cmd(
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
     from slack_cache_mcp.sync.onedrive import exchange_status
-    from slack_cache_mcp.sync.state_hash import compute_state_hash
 
-    folder = exchange_status(exchange_dir, create=create)
+    try:
+        folder = exchange_status(exchange_dir, create=create)
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     settings = load_settings(data_dir=data_dir)
     payload: dict[str, object] = {"exchange": folder}
     if settings.archive_db.is_file():
-        repo = SqliteRepository(settings.archive_db)
+        repo = SqliteRepository(settings.archive_db, read_only=True)
         try:
             status = repo.cache_status()
             payload["archive"] = {
@@ -627,7 +638,7 @@ def sync_status_cmd(
                 "schema_version": status.get("schema_version"),
                 "devices": status.get("devices"),
                 "cursors": repo.list_sync_cursors(),
-                "state_hash": compute_state_hash(repo),
+                "state_hash": status.get("state_hash"),
             }
         finally:
             repo.close()

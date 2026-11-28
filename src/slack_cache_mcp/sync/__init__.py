@@ -16,6 +16,7 @@ from slack_cache_mcp.sync.onedrive import (
     EXCHANGE_DIR_ENV,
     default_exchange_dir,
     ensure_exchange_dir,
+    exchange_peer_key,
     exchange_status,
 )
 from slack_cache_mcp.sync.state_hash import compute_state_hash
@@ -28,6 +29,7 @@ __all__ = [
     "default_exchange_dir",
     "ensure_exchange_dir",
     "ensure_local_device",
+    "exchange_peer_key",
     "exchange_status",
     "export_bundle",
     "import_bundles",
