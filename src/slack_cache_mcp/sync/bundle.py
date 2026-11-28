@@ -197,9 +197,6 @@ def _export_bundle_locked(
     recipients = list_age_recipients(repo)
     if identity.age_recipient not in recipients:
         recipients.append(identity.age_recipient)
-    recipient_fp = hashlib.sha256(
-        "\n".join(sorted(recipients)).encode("utf-8")
-    ).hexdigest()
 
     envelope = build_signed_envelope(
         identity=identity,
@@ -224,27 +221,14 @@ def _export_bundle_locked(
     tmp_path.write_bytes(ciphertext)
     tmp_path.rename(path)
 
-    # Peer-add during export: generation and/or recipient set may change even when
-    # the push cursor was already ``0`` (CAS alone cannot see that).
-    recipients_now = list_age_recipients(repo)
-    if identity.age_recipient not in recipients_now:
-        recipients_now.append(identity.age_recipient)
-    recipient_fp_now = hashlib.sha256(
-        "\n".join(sorted(recipients_now)).encode("utf-8")
-    ).hexdigest()
-    generation_now = repo.get_sync_peer_generation()
-    peers_changed = (
-        generation_now != peer_generation or recipient_fp_now != recipient_fp
+    # Atomic generation check + cursor advance (closes the race where peers add
+    # lands between a non-atomic check and CAS when the cursor is already 0).
+    cursor_advanced = repo.advance_push_cursor_if_generation(
+        peer,
+        expected_cursor=expected_cursor,
+        new_cursor=str(to_seq),
+        expected_generation=peer_generation,
     )
-    cursor_advanced = False
-    if peers_changed:
-        # Keep / restore a zero push cursor so the next export is a full re-send
-        # encrypted to the updated recipient set.
-        repo.set_sync_cursor(peer, "push", "0")
-    else:
-        cursor_advanced = repo.cas_sync_cursor(
-            peer, "push", expected=expected_cursor, new=str(to_seq)
-        )
     return {
         "ok": True,
         "exported": len(rows),
@@ -256,7 +240,7 @@ def _export_bundle_locked(
         "backfill": backfill,
         "content_sha256": hashlib.sha256(ciphertext).hexdigest(),
         "cursor_advanced": cursor_advanced,
-        "peers_changed": peers_changed,
+        "peers_changed": not cursor_advanced,
     }
 
 
@@ -316,6 +300,11 @@ def import_bundles(
             except Exception as dec_exc:
                 # Retained write-once history may omit this device as recipient.
                 if _is_undecryptable(dec_exc):
+                    # Record receipts so later pulls do not re-read / rehydrate.
+                    repo.set_sync_cursor(name_receipt, "pull", "undecryptable")
+                    repo.set_sync_cursor(
+                        _bundle_receipt_peer(content_sha), "pull", "undecryptable"
+                    )
                     skipped_undecryptable += 1
                     continue
                 raise

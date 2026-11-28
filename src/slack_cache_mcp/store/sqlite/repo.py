@@ -661,6 +661,68 @@ class SqliteRepository:
                 self._conn.execute("ROLLBACK")
             raise
 
+    def advance_push_cursor_if_generation(
+        self,
+        peer: str,
+        *,
+        expected_cursor: str,
+        new_cursor: str,
+        expected_generation: int,
+    ) -> bool:
+        """Atomically advance a push cursor only if peer generation is unchanged.
+
+        If the generation changed (peers add / recipient reset), force this peer's
+        push cursor to ``0`` and return False so the next export is a full re-send.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            gen_row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                ("sync_peer_generation",),
+            ).fetchone()
+            gen = 0
+            if gen_row is not None:
+                with contextlib.suppress(ValueError):
+                    gen = int(str(gen_row["value"]))
+            now = _utc_now()
+            if gen != expected_generation:
+                self._conn.execute(
+                    """
+                    INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                    VALUES (?, 'push', '0', ?)
+                    ON CONFLICT(peer, direction) DO UPDATE SET
+                      cursor='0',
+                      updated_at=excluded.updated_at
+                    """,
+                    (peer, now),
+                )
+                self._conn.commit()
+                return False
+            cur_row = self._conn.execute(
+                "SELECT cursor FROM sync_cursors WHERE peer=? AND direction='push'",
+                (peer,),
+            ).fetchone()
+            current = str(cur_row["cursor"]) if cur_row else "0"
+            if current != expected_cursor:
+                self._conn.execute("ROLLBACK")
+                return False
+            self._conn.execute(
+                """
+                INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                VALUES (?, 'push', ?, ?)
+                ON CONFLICT(peer, direction) DO UPDATE SET
+                  cursor=excluded.cursor,
+                  updated_at=excluded.updated_at
+                """,
+                (peer, new_cursor, now),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("ROLLBACK")
+            raise
+
     def list_sync_cursors(self) -> list[dict[str, str]]:
         """Return push/pull watermarks (counts/ids only — no message text)."""
         rows = self._conn.execute(
