@@ -131,11 +131,12 @@ Maxim chose **OneDrive-first** for living multi-laptop sync before object storag
 ### Hard rules
 Write-once `bundle-*.jsonl.zst.age` only in OneDrive. No `archive.db`, vault, `device.secrets`, or shared cursor/manifest files. Cursors stay in local SQLite. Pin exchange folder **Always keep on this device** for offline import. Peer JSON exchanged once out of band (`show-device` → `peers add`), not auto-trusted from the cloud folder.
 
-### Copilot round-1 hardening (PR #8)
+### Copilot round-1/2 hardening (PR #8)
 - Default `folder` push/pull cursors are scoped per exchange path (`folder:<path-hash>`); explicit `--peer` unchanged.
-- Full re-exports never delete or overwrite prior `.age` objects; filenames include a content digest. Import soft-skips undecryptable retained history and skips already-applied ciphertext via local `bundlesha:` receipts.
-- Implicit default-path creation requires the real `OneDrive - Microsoft` root; env/`--to` overrides may create freely.
-- Pull watermarks are monotonic and advance only after a clean apply; `sync status` opens the archive read-only and reuses `cache_status().state_hash`.
+- Full re-exports never delete or overwrite prior `.age` objects; filenames include a content digest. Import soft-skips only pyrage “No matching keys found”; truncated/corrupt blobs stay hard errors. Filename receipts avoid re-reading known objects; `bundlesha:` receipts remain as a second key.
+- Implicit default-path creation requires the real `OneDrive - Microsoft` root; non-empty env/`--to` overrides may create freely (blank `SLACKCACHE_EXCHANGE_DIR` is ignored).
+- Push cursor advances via CAS so a mid-export `peers add` reset is preserved; pull watermarks use atomic max-bump and advance only after a clean apply.
+- `sync status` opens the archive read-only and reuses `cache_status().state_hash`.
 - Hydration probe ignores `FILE_ATTRIBUTE_UNPINNED` (retention ≠ online-only).
 
 ## 2026-11-27 — M5.1 Edge browser IndexedDB ingest

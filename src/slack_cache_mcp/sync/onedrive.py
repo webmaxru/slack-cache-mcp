@@ -60,16 +60,27 @@ def default_onedrive_root(*, userprofile: Path | None = None) -> Path:
     return root / _DEFAULT_SEGMENTS[0]
 
 
+def _env_exchange_override() -> Path | None:
+    """Return a non-empty ``SLACKCACHE_EXCHANGE_DIR`` override, else None."""
+    raw = os.environ.get(EXCHANGE_DIR_ENV)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    return Path(stripped).expanduser()
+
+
 def default_exchange_dir(*, userprofile: Path | None = None) -> Path:
     """Resolve the default OneDrive exchange path (does not create it).
 
     Order:
-    1. ``SLACKCACHE_EXCHANGE_DIR`` if set (absolute or expanduser).
+    1. non-empty ``SLACKCACHE_EXCHANGE_DIR`` (absolute or expanduser).
     2. ``%USERPROFILE%\\OneDrive - Microsoft\\Projects\\slackcache``.
     """
-    override = os.environ.get(EXCHANGE_DIR_ENV)
-    if override:
-        return Path(override).expanduser()
+    override = _env_exchange_override()
+    if override is not None:
+        return override
     root = Path(userprofile) if userprofile is not None else user_profile()
     return root.joinpath(*_DEFAULT_SEGMENTS)
 
@@ -103,8 +114,9 @@ def ensure_exchange_dir(
     ``path`` arguments and ``SLACKCACHE_EXCHANGE_DIR`` may create freely.
     """
     explicit = path is not None
-    env_override = EXCHANGE_DIR_ENV in os.environ
-    target = Path(path) if explicit else default_exchange_dir()
+    env_override = _env_exchange_override() is not None
+    # Narrow via `path is not None` (not a separate bool) so mypy accepts Path(...).
+    target = Path(path) if path is not None else default_exchange_dir()
     if create:
         if not explicit and not env_override:
             root = default_onedrive_root()
@@ -210,7 +222,7 @@ def exchange_status(
         "exists": exists,
         "created": create and exists,
         "parent_exists": parent.exists(),
-        "env_override": EXCHANGE_DIR_ENV in os.environ,
+        "env_override": _env_exchange_override() is not None,
         "env_var": EXCHANGE_DIR_ENV,
         "bundle_glob": BUNDLE_GLOB,
         "bundle_count": len(bundles),

@@ -43,6 +43,20 @@ def test_exchange_dir_env_override(tmp_path: Path, monkeypatch) -> None:
     assert default_exchange_dir() == custom
 
 
+def test_empty_env_override_is_ignored(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv(EXCHANGE_DIR_ENV, "   ")
+    assert default_exchange_dir() == (
+        tmp_path / "OneDrive - Microsoft" / "Projects" / "slackcache"
+    )
+    # Empty override must not bypass the OneDrive-root existence check.
+    try:
+        ensure_exchange_dir(create=True)
+        raise AssertionError("expected FileNotFoundError")
+    except FileNotFoundError:
+        pass
+
+
 def test_ensure_exchange_dir_creates_readme(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(EXCHANGE_DIR_ENV, str(tmp_path / "exchange"))
     path = ensure_exchange_dir(create=True)

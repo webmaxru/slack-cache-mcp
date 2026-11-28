@@ -146,6 +146,7 @@ def _export_bundle_locked(
 
     cursor_raw = repo.get_sync_cursor(peer, "push")
     since_seq = int(cursor_raw) if cursor_raw is not None else 0
+    expected_cursor = str(since_seq)
     rows = repo.list_change_log_since(device_id=identity.device_id, since_seq=since_seq)
     # Stable dependency order inside the bundle (workspace → channel → …).
     _order = {
@@ -218,7 +219,11 @@ def _export_bundle_locked(
     tmp_path = to_dir / f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     tmp_path.write_bytes(ciphertext)
     tmp_path.rename(path)
-    repo.set_sync_cursor(peer, "push", str(to_seq))
+    # CAS: if peers add reset the cursor mid-export, leave the reset intact so the
+    # next export re-sends full history to the new recipient set.
+    cursor_advanced = repo.cas_sync_cursor(
+        peer, "push", expected=expected_cursor, new=str(to_seq)
+    )
     return {
         "ok": True,
         "exported": len(rows),
@@ -229,6 +234,7 @@ def _export_bundle_locked(
         "recipients": len(recipients),
         "backfill": backfill,
         "content_sha256": hashlib.sha256(ciphertext).hexdigest(),
+        "cursor_advanced": cursor_advanced,
     }
 
 
@@ -237,17 +243,12 @@ def _bundle_receipt_peer(content_sha256: str) -> str:
 
 
 def _is_undecryptable(exc: BaseException) -> bool:
-    """True when ciphertext is intact but not for this age identity (retained history)."""
-    msg = str(exc).lower()
-    needles = (
-        "no matching keys",
-        "no matching",
-        "failed to decrypt",
-        "decryption failed",
-        "incorrect identity",
-        "no recipient",
-    )
-    return any(n in msg for n in needles)
+    """True only for intact ciphertext that omits this age identity (retained history).
+
+    Truncated/corrupted blobs must remain hard errors (fail closed).
+    """
+    # pyrage DecryptError: "No matching keys found"
+    return "no matching keys" in str(exc).lower()
 
 
 def import_bundles(
@@ -277,9 +278,15 @@ def import_bundles(
 
     for path in files:
         try:
+            # Filename receipt avoids re-reading / rehydrating known write-once objects.
+            name_receipt = f"bundlename:{path.name}"
+            if repo.get_sync_cursor(name_receipt, "pull") is not None:
+                skipped_known += 1
+                continue
             ciphertext = path.read_bytes()
             content_sha = hashlib.sha256(ciphertext).hexdigest()
             if repo.get_sync_cursor(_bundle_receipt_peer(content_sha), "pull") is not None:
+                repo.set_sync_cursor(name_receipt, "pull", content_sha)
                 skipped_known += 1
                 continue
             try:
@@ -297,8 +304,9 @@ def import_bundles(
             if not sender_id:
                 raise ValueError("bundle missing device_id")
             if sender_id == identity.device_id:
-                # Own ciphertext: record receipt so we do not re-read every pull.
+                # Own ciphertext: record receipts so we do not re-read every pull.
                 repo.set_sync_cursor(_bundle_receipt_peer(content_sha), "pull", "1")
+                repo.set_sync_cursor(name_receipt, "pull", content_sha)
                 skipped_own += 1
                 continue
             registered = repo.get_device(sender_id)
@@ -344,17 +352,15 @@ def import_bundles(
             apply_ok = False
 
     if apply_ok:
-        for _path, header, _rows, sender_id, content_sha in verified:
+        for path, header, _rows, sender_id, content_sha in verified:
             imported_files += 1
             to_seq_raw = header.get("to_seq")
             if to_seq_raw is not None:
-                to_seq = int(to_seq_raw)
-                cursor_key = f"{peer}:{sender_id}"
-                prev_raw = repo.get_sync_cursor(cursor_key, "pull")
-                prev = int(prev_raw) if prev_raw is not None else 0
-                if to_seq > prev:
-                    repo.set_sync_cursor(cursor_key, "pull", str(to_seq))
+                repo.bump_sync_cursor_max(
+                    f"{peer}:{sender_id}", "pull", str(int(to_seq_raw))
+                )
             repo.set_sync_cursor(_bundle_receipt_peer(content_sha), "pull", "1")
+            repo.set_sync_cursor(f"bundlename:{path.name}", "pull", content_sha)
 
     # Persist merged HLC so subsequent local ingest dominates imported clocks.
     tick = hlc_clock.now()
