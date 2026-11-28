@@ -20,7 +20,7 @@ Copied `.cursor/offline-only.mdc` to `.cursor/rules/offline-only.mdc` to match P
 CPython 3.12.11 on the Windows self-hosted worker does not emit a `urllib.Request` audit event when constructing `urllib.request.Request`. Netguard still blocks `http.client.connect`, `socket.connect`, `socket.getaddrinfo`, `webbrowser.open`, and non-allowlisted `subprocess.Popen`. Product code must not import `urllib.request` (import-linter + AST).
 
 ### Local uv index mirror
-`files.pythonhosted.org` TLS handshake fails on this Windows worker; `uv.toml` defaults the index to Tsinghua for local sync. GitHub Actions CI uses the default PyPI CDN.
+`files.pythonhosted.org` (Fastly wheel CDN) TLS handshake fails on Maxim's Windows corp laptop (`HandshakeFailure` / alert 40 for curl, OpenSSL, Python ssl, and uv). `pypi.org` simple API still works; `UV_NATIVE_TLS=1` does not help. Fix is **user-local** (not committed): User env `UV_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple/` and/or `%APPDATA%\uv\uv.toml` (same URL as `ProgramData\pip\pip.ini`). Optional gitignored project `uv.toml` may list that feed and Tsinghua as non-default extras. CI uses official PyPI. Ops note: Project store `docs/m6-laptop2-uv-tls.md`.
 
 ### import-linter forbidden modules
 `import-linter` rejects external **subpackages** (e.g. `urllib.request`, `http.client`) as `forbidden_modules`. Those stay covered by `tests/test_no_network_imports.py` AST scan. The import-linter contract forbids top-level network client packages (`requests`, `httpx`, …).
