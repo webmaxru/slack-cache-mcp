@@ -416,7 +416,10 @@ def rebuild_cmd(
         raise typer.Exit(code=1)
 
 
-sync_app = typer.Typer(help="Multi-device sync (local age-encrypted bundles)", no_args_is_help=True)
+sync_app = typer.Typer(
+    help="Multi-device sync (age bundles; OneDrive exchange by default)",
+    no_args_is_help=True,
+)
 app.add_typer(sync_app, name="sync")
 
 
@@ -486,9 +489,30 @@ def sync_peers_cmd(
     typer.echo(json.dumps({"ok": True, "device_id": peer.device_id}, indent=2))
 
 
+def _resolve_exchange_dir(explicit: Path | None, *, create: bool) -> Path:
+    from slack_cache_mcp.sync.onedrive import default_exchange_dir, ensure_exchange_dir
+
+    try:
+        if explicit is not None:
+            path = Path(explicit)
+            if create:
+                ensure_exchange_dir(path, create=True)
+            return path
+        if create:
+            return ensure_exchange_dir(create=True)
+        return default_exchange_dir()
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+
 @sync_app.command("export")
 def sync_export_cmd(
-    to_dir: Path = typer.Option(..., "--to", help="Folder for age-encrypted bundles"),
+    to_dir: Path | None = typer.Option(
+        None,
+        "--to",
+        help="Folder for age-encrypted bundles (default: OneDrive Projects\\slackcache)",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir"),
     peer: str = typer.Option("folder", "--peer", help="Push cursor peer name"),
 ) -> None:
@@ -497,11 +521,15 @@ def sync_export_cmd(
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
     from slack_cache_mcp.sync.bundle import ensure_local_device, export_bundle
+    from slack_cache_mcp.sync.onedrive import exchange_peer_key
 
+    exchange = _resolve_exchange_dir(to_dir, create=True)
+    peer_key = exchange_peer_key(exchange, peer)
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db)
     identity = ensure_local_device(repo, settings.data_dir)
-    result = export_bundle(repo, identity=identity, to_dir=to_dir, peer=peer)
+    result = export_bundle(repo, identity=identity, to_dir=exchange, peer=peer_key)
+    result["exchange_dir"] = str(exchange)
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
     if not result.get("ok"):
@@ -510,7 +538,11 @@ def sync_export_cmd(
 
 @sync_app.command("import")
 def sync_import_cmd(
-    from_dir: Path = typer.Option(..., "--from", help="Folder containing peer bundles"),
+    from_dir: Path | None = typer.Option(
+        None,
+        "--from",
+        help="Folder containing peer bundles (default: OneDrive Projects\\slackcache)",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir"),
     peer: str = typer.Option("folder", "--peer", help="Pull cursor peer prefix"),
 ) -> None:
@@ -519,15 +551,103 @@ def sync_import_cmd(
     from slack_cache_mcp.config import load_settings
     from slack_cache_mcp.store.sqlite.repo import SqliteRepository
     from slack_cache_mcp.sync.bundle import ensure_local_device, import_bundles
+    from slack_cache_mcp.sync.onedrive import exchange_peer_key
 
+    exchange = _resolve_exchange_dir(from_dir, create=False)
+    if not exchange.is_dir():
+        typer.echo(
+            f"exchange folder missing: {exchange}\n"
+            "Create it with `slackcache sync push` (or pass --from).",
+            err=True,
+        )
+        raise typer.Exit(1)
+    peer_key = exchange_peer_key(exchange, peer)
     settings = load_settings(data_dir=data_dir)
     repo = SqliteRepository(settings.archive_db)
     identity = ensure_local_device(repo, settings.data_dir)
-    result = import_bundles(repo, identity=identity, from_dir=from_dir, peer=peer)
+    result = import_bundles(repo, identity=identity, from_dir=exchange, peer=peer_key)
+    result["exchange_dir"] = str(exchange)
     repo.close()
     typer.echo(json.dumps(result, indent=2, default=str))
     if not result.get("ok"):
         raise typer.Exit(1)
+
+
+@sync_app.command("push")
+def sync_push_cmd(
+    to_dir: Path | None = typer.Option(
+        None,
+        "--to",
+        help="Override exchange folder (default: OneDrive Projects\\slackcache)",
+    ),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    peer: str = typer.Option("folder", "--peer", help="Push cursor peer name"),
+) -> None:
+    """Export new bundles into the OneDrive exchange folder (M6.0 living)."""
+    sync_export_cmd(to_dir=to_dir, data_dir=data_dir, peer=peer)
+
+
+@sync_app.command("pull")
+def sync_pull_cmd(
+    from_dir: Path | None = typer.Option(
+        None,
+        "--from",
+        help="Override exchange folder (default: OneDrive Projects\\slackcache)",
+    ),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    peer: str = typer.Option("folder", "--peer", help="Pull cursor peer prefix"),
+) -> None:
+    """Import peer bundles from the OneDrive exchange folder (M6.0 living)."""
+    sync_import_cmd(from_dir=from_dir, data_dir=data_dir, peer=peer)
+
+
+@sync_app.command("status")
+def sync_status_cmd(
+    exchange_dir: Path | None = typer.Option(
+        None,
+        "--dir",
+        help="Exchange folder to inspect (default: OneDrive Projects\\slackcache)",
+    ),
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    create: bool = typer.Option(
+        False,
+        "--create",
+        help="Create the default exchange folder (+ README) if missing",
+    ),
+) -> None:
+    """Show exchange-folder + local sync cursor status (counts only)."""
+    _boot()
+    from slack_cache_mcp.config import load_settings
+    from slack_cache_mcp.store.sqlite.repo import SqliteRepository
+    from slack_cache_mcp.sync.onedrive import exchange_status
+
+    try:
+        folder = exchange_status(exchange_dir, create=create)
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    settings = load_settings(data_dir=data_dir)
+    payload: dict[str, object] = {"exchange": folder}
+    if settings.archive_db.is_file():
+        repo = SqliteRepository(settings.archive_db, read_only=True)
+        try:
+            status = repo.cache_status()
+            payload["archive"] = {
+                "data_dir": str(settings.data_dir),
+                "present": True,
+                "schema_version": status.get("schema_version"),
+                "devices": status.get("devices"),
+                "cursors": repo.list_sync_cursors(),
+                "state_hash": status.get("state_hash"),
+            }
+        finally:
+            repo.close()
+    else:
+        payload["archive"] = {
+            "data_dir": str(settings.data_dir),
+            "present": False,
+        }
+    typer.echo(json.dumps(payload, indent=2, default=str))
 
 
 models_app = typer.Typer(help="Local embedding model management", no_args_is_help=True)

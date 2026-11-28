@@ -592,6 +592,163 @@ class SqliteRepository:
         )
         self._conn.commit()
 
+    def cas_sync_cursor(
+        self,
+        peer: str,
+        direction: str,
+        *,
+        expected: str,
+        new: str,
+    ) -> bool:
+        """Compare-and-swap a sync cursor under ``BEGIN IMMEDIATE``.
+
+        Returns True when the cursor was updated from ``expected`` to ``new``.
+        Missing rows are treated as ``expected == "0"``.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT cursor FROM sync_cursors WHERE peer=? AND direction=?",
+                (peer, direction),
+            ).fetchone()
+            current = str(row["cursor"]) if row else "0"
+            if current != expected:
+                self._conn.execute("ROLLBACK")
+                return False
+            now = _utc_now()
+            self._conn.execute(
+                """
+                INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(peer, direction) DO UPDATE SET
+                  cursor=excluded.cursor,
+                  updated_at=excluded.updated_at
+                """,
+                (peer, direction, new, now),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def bump_sync_cursor_max(self, peer: str, direction: str, cursor: str) -> str:
+        """Atomically keep the numeric max of the existing cursor and ``cursor``."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT cursor FROM sync_cursors WHERE peer=? AND direction=?",
+                (peer, direction),
+            ).fetchone()
+            prev = int(str(row["cursor"])) if row else 0
+            nxt = max(prev, int(cursor))
+            now = _utc_now()
+            self._conn.execute(
+                """
+                INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(peer, direction) DO UPDATE SET
+                  cursor=excluded.cursor,
+                  updated_at=excluded.updated_at
+                """,
+                (peer, direction, str(nxt), now),
+            )
+            self._conn.commit()
+            return str(nxt)
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def advance_push_cursor_if_generation(
+        self,
+        peer: str,
+        *,
+        expected_cursor: str,
+        new_cursor: str,
+        expected_generation: int,
+    ) -> bool:
+        """Atomically advance a push cursor only if peer generation is unchanged.
+
+        If the generation changed (peers add / recipient reset), force this peer's
+        push cursor to ``0`` and return False so the next export is a full re-send.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            gen_row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                ("sync_peer_generation",),
+            ).fetchone()
+            gen = 0
+            if gen_row is not None:
+                with contextlib.suppress(ValueError):
+                    gen = int(str(gen_row["value"]))
+            now = _utc_now()
+            if gen != expected_generation:
+                self._conn.execute(
+                    """
+                    INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                    VALUES (?, 'push', '0', ?)
+                    ON CONFLICT(peer, direction) DO UPDATE SET
+                      cursor='0',
+                      updated_at=excluded.updated_at
+                    """,
+                    (peer, now),
+                )
+                self._conn.commit()
+                return False
+            cur_row = self._conn.execute(
+                "SELECT cursor FROM sync_cursors WHERE peer=? AND direction='push'",
+                (peer,),
+            ).fetchone()
+            current = str(cur_row["cursor"]) if cur_row else "0"
+            if current != expected_cursor:
+                self._conn.execute("ROLLBACK")
+                return False
+            self._conn.execute(
+                """
+                INSERT INTO sync_cursors(peer, direction, cursor, updated_at)
+                VALUES (?, 'push', ?, ?)
+                ON CONFLICT(peer, direction) DO UPDATE SET
+                  cursor=excluded.cursor,
+                  updated_at=excluded.updated_at
+                """,
+                (peer, new_cursor, now),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def list_sync_cursors(self) -> list[dict[str, str]]:
+        """Return push/pull watermarks (counts/ids only — no message text)."""
+        rows = self._conn.execute(
+            """
+            SELECT peer, direction, cursor, updated_at
+            FROM sync_cursors
+            ORDER BY peer, direction
+            """
+        ).fetchall()
+        return [
+            {
+                "peer": str(r["peer"]),
+                "direction": str(r["direction"]),
+                "cursor": str(r["cursor"]),
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    def get_sync_peer_generation(self) -> int:
+        raw = self.get_meta("sync_peer_generation")
+        try:
+            return int(raw) if raw is not None else 0
+        except ValueError:
+            return 0
+
     def reset_push_cursors(self) -> int:
         """Reset every push cursor so the next export re-sends full history."""
         cur = self._conn.execute(
@@ -610,6 +767,16 @@ class SqliteRepository:
               cursor='0', updated_at=excluded.updated_at
             """,
             (_utc_now(),),
+        )
+        # Generation bump detects peer-add during an in-flight export even when
+        # the cursor was already ``0`` / missing (CAS alone is insufficient).
+        gen = self.get_sync_peer_generation() + 1
+        self._conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("sync_peer_generation", str(gen)),
         )
         self._conn.commit()
         return int(cur.rowcount or 0)

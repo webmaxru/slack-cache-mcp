@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import time
@@ -145,6 +146,8 @@ def _export_bundle_locked(
 
     cursor_raw = repo.get_sync_cursor(peer, "push")
     since_seq = int(cursor_raw) if cursor_raw is not None else 0
+    expected_cursor = str(since_seq)
+    peer_generation = repo.get_sync_peer_generation()
     rows = repo.list_change_log_since(device_id=identity.device_id, since_seq=since_seq)
     # Stable dependency order inside the bundle (workspace → channel → …).
     _order = {
@@ -202,19 +205,30 @@ def _export_bundle_locked(
         rows=serializable,
     )
     ciphertext = age_encrypt(envelope, recipients)
-    name = f"bundle-{identity.device_id}-{from_seq}-{to_seq}.jsonl.zst.age"
+    # Content digest keeps re-exports unique (write-once; never overwrite/delete).
+    digest = hashlib.sha256(ciphertext).hexdigest()[:12]
+    name = f"bundle-{identity.device_id}-{from_seq}-{to_seq}-{digest}.jsonl.zst.age"
     path = to_dir / name
-    # Atomic publish: unique temp then replace so concurrent exporters cannot
-    # clobber each other, and a crash cannot truncate an existing bundle.
+    if path.exists():
+        # Extremely unlikely hash collision / retry: keep both objects immutable.
+        name = (
+            f"bundle-{identity.device_id}-{from_seq}-{to_seq}-"
+            f"{digest}-{time.time_ns()}.jsonl.zst.age"
+        )
+        path = to_dir / name
+    # Atomic publish via unique temp then rename into place (no replace-over-existing).
     tmp_path = to_dir / f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     tmp_path.write_bytes(ciphertext)
-    tmp_path.replace(path)
-    if since_seq <= 0:
-        for stale in to_dir.glob(f"bundle-{identity.device_id}-*.jsonl.zst.age"):
-            if stale.name != name:
-                with contextlib.suppress(OSError):
-                    stale.unlink()
-    repo.set_sync_cursor(peer, "push", str(to_seq))
+    tmp_path.rename(path)
+
+    # Atomic generation check + cursor advance (closes the race where peers add
+    # lands between a non-atomic check and CAS when the cursor is already 0).
+    cursor_advanced = repo.advance_push_cursor_if_generation(
+        peer,
+        expected_cursor=expected_cursor,
+        new_cursor=str(to_seq),
+        expected_generation=peer_generation,
+    )
     return {
         "ok": True,
         "exported": len(rows),
@@ -224,7 +238,23 @@ def _export_bundle_locked(
         "peer": peer,
         "recipients": len(recipients),
         "backfill": backfill,
+        "content_sha256": hashlib.sha256(ciphertext).hexdigest(),
+        "cursor_advanced": cursor_advanced,
+        "peers_changed": not cursor_advanced,
     }
+
+
+def _bundle_receipt_peer(content_sha256: str) -> str:
+    return f"bundlesha:{content_sha256}"
+
+
+def _is_undecryptable(exc: BaseException) -> bool:
+    """True only for intact ciphertext that omits this age identity (retained history).
+
+    Truncated/corrupted blobs must remain hard errors (fail closed).
+    """
+    # pyrage DecryptError: "No matching keys found"
+    return "no matching keys" in str(exc).lower()
 
 
 def import_bundles(
@@ -245,19 +275,39 @@ def import_bundles(
     imported_files = 0
     total_applied = 0
     total_skipped = 0
+    skipped_known = 0
+    skipped_undecryptable = 0
+    skipped_own = 0
     errors: list[dict[str, str]] = []
-    # Verify all bundles first, then apply rows in global dependency order so a
-    # channel file that sorts before its workspace file still succeeds in one pass.
-    verified: list[tuple[Path, dict[str, Any], list[dict[str, Any]], str]] = []
+    # Verify first (skip known/undecryptable/own), then apply in dependency order.
+    verified: list[tuple[Path, dict[str, Any], list[dict[str, Any]], str, str]] = []
 
     for path in files:
         try:
+            # Filename receipt avoids re-reading / rehydrating known write-once objects.
+            name_receipt = f"bundlename:{path.name}"
+            if repo.get_sync_cursor(name_receipt, "pull") is not None:
+                skipped_known += 1
+                continue
             ciphertext = path.read_bytes()
-            # Decrypt failures are always reported. Late-peer / superseded bundles
-            # must be removed from the exchange folder after a full re-export —
-            # we never infer identity or coverage from unauthenticated filenames.
-            envelope_bytes = age_decrypt(ciphertext, identity.age_identity)
-            # Peek device_id before full verify so we can pin the registered key.
+            content_sha = hashlib.sha256(ciphertext).hexdigest()
+            if repo.get_sync_cursor(_bundle_receipt_peer(content_sha), "pull") is not None:
+                repo.set_sync_cursor(name_receipt, "pull", content_sha)
+                skipped_known += 1
+                continue
+            try:
+                envelope_bytes = age_decrypt(ciphertext, identity.age_identity)
+            except Exception as dec_exc:
+                # Retained write-once history may omit this device as recipient.
+                if _is_undecryptable(dec_exc):
+                    # Record receipts so later pulls do not re-read / rehydrate.
+                    repo.set_sync_cursor(name_receipt, "pull", "undecryptable")
+                    repo.set_sync_cursor(
+                        _bundle_receipt_peer(content_sha), "pull", "undecryptable"
+                    )
+                    skipped_undecryptable += 1
+                    continue
+                raise
             peek = json.loads(envelope_bytes.decode("utf-8"))
             if not isinstance(peek, dict):
                 raise ValueError("invalid envelope")
@@ -265,6 +315,10 @@ def import_bundles(
             if not sender_id:
                 raise ValueError("bundle missing device_id")
             if sender_id == identity.device_id:
+                # Own ciphertext: record receipts so we do not re-read every pull.
+                repo.set_sync_cursor(_bundle_receipt_peer(content_sha), "pull", "1")
+                repo.set_sync_cursor(name_receipt, "pull", content_sha)
+                skipped_own += 1
                 continue
             registered = repo.get_device(sender_id)
             if registered is None or not registered.get("public_key"):
@@ -288,24 +342,36 @@ def import_bundles(
                     raise ValueError(
                         "change_log row device_id does not match authenticated sender"
                     )
-            verified.append((path, header, rows, sender_id))
+            verified.append((path, header, rows, sender_id, content_sha))
         except Exception as exc:
             errors.append({"path": str(path), "error": str(exc)})
 
+    # Apply all verified rows together (workspace→channel dependency order), then
+    # advance watermarks only when the apply batch had no row failures.
     all_rows: list[dict[str, Any]] = []
-    for _path, _header, rows, _sender_id in verified:
+    for _path, _header, rows, _sender_id, _sha in verified:
         all_rows.extend(rows)
+    apply_ok = True
     if all_rows:
         stats = apply_change_rows(repo, all_rows, hlc_clock=hlc_clock)
         total_applied += int(stats["applied"])
         total_skipped += int(stats["skipped"])
         for err in stats.get("errors") or []:
+            apply_ok = False
             errors.append({"path": str(from_dir), "error": str(err)})
-        for _path, header, _rows, sender_id in verified:
+        if int(stats.get("failed") or 0) > 0:
+            apply_ok = False
+
+    if apply_ok:
+        for path, header, _rows, sender_id, content_sha in verified:
             imported_files += 1
-            to_seq = header.get("to_seq")
-            if to_seq is not None:
-                repo.set_sync_cursor(f"{peer}:{sender_id}", "pull", str(to_seq))
+            to_seq_raw = header.get("to_seq")
+            if to_seq_raw is not None:
+                repo.bump_sync_cursor_max(
+                    f"{peer}:{sender_id}", "pull", str(int(to_seq_raw))
+                )
+            repo.set_sync_cursor(_bundle_receipt_peer(content_sha), "pull", "1")
+            repo.set_sync_cursor(f"bundlename:{path.name}", "pull", content_sha)
 
     # Persist merged HLC so subsequent local ingest dominates imported clocks.
     tick = hlc_clock.now()
@@ -315,6 +381,9 @@ def import_bundles(
         "ok": not errors,
         "files_seen": len(files),
         "files_imported": imported_files,
+        "files_skipped_known": skipped_known,
+        "files_skipped_undecryptable": skipped_undecryptable,
+        "files_skipped_own": skipped_own,
         "applied": total_applied,
         "skipped": total_skipped,
         "errors": errors,

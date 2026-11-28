@@ -114,8 +114,30 @@ Import rejects unknown senders and signing/age key mismatches against `sync peer
 - `sync peers add` resets **all** push cursors. Decrypt failures are always errors (remove superseded folder bundles after full re-export).
 - Import rejects forged row authors and sighting payload `device_id` mismatches.
 - Apply reprojects + refreshes search docs inside the same transaction; sightings merge times into version rows; version outbox stays free of sighting timestamps; epoch bounds are ignored as unknown.
-- Directory upserts maintain `field_hlcs_json`. Unclocked values use sentinel `*`. Repair migration (policy `v7-*`) preserves real table clocks, restores dominating `(value, clock)` pairs only for unknown table clocks, bumps `directory_clock_epoch`, and rebuilds local directory outbox with `clock_epoch` + one-shot `clock_repair`. Receivers force-apply only facts that carry repair authority (higher epoch or `clock_repair`); lower-epoch clocks are null-fill only. Full re-exports write the new bundle before deleting older local files; incremental exports retain history. Bundle `from_seq`/`to_seq` use min/max sequence; import verifies all files then applies rows in global entity order with per-row failure isolation. Channel outbox emits legacy `aliases` plus `alias_records`; backfill repairs object-only rows.
+- Directory upserts maintain `field_hlcs_json`. Unclocked values use sentinel `*`. Repair migration (policy `v7-*`) preserves real table clocks, restores dominating `(value, clock)` pairs only for unknown table clocks, bumps `directory_clock_epoch`, and rebuilds local directory outbox with `clock_epoch` + one-shot `clock_repair`. Receivers force-apply only facts that carry repair authority (higher epoch or `clock_repair`); lower-epoch clocks are null-fill only. Full re-exports write a new immutable bundle (content-digest filename) and retain older objects (no delete/overwrite). Incremental exports retain history. Bundle `from_seq`/`to_seq` use min/max sequence; import verifies then applies rows in global entity order with per-row failure isolation; pull watermarks stay monotonic and advance only after a clean apply. Channel outbox emits legacy `aliases` plus `alias_records`; backfill repairs object-only rows.
 - Watermark updates use `BEGIN IMMEDIATE` compare-and-swap across connections.
+
+## 2026-11-28 — M6.0 OneDrive exchange (folder living)
+
+### Hub choice
+Maxim chose **OneDrive-first** for living multi-laptop sync before object storage (R2). Reuse M5 age bundles; no Microsoft Graph API; filesystem path only.
+
+### Default path
+`%USERPROFILE%\OneDrive - Microsoft\Projects\slackcache` (expand `USERPROFILE`; create on `sync push` / `export` when omitted). Override: env `SLACKCACHE_EXCHANGE_DIR` (tests, USB, Personal OneDrive roots).
+
+### CLI
+`sync export` / `import` accept optional `--to` / `--from` (default = exchange path). Aliases `sync push` / `pull`. `sync status` shows folder existence, bundle counts, optional Win32 hydration flags, pin hint, and local `sync_cursors` — never message text.
+
+### Hard rules
+Write-once `bundle-*.jsonl.zst.age` only in OneDrive. No `archive.db`, vault, `device.secrets`, or shared cursor/manifest files. Cursors stay in local SQLite. Pin exchange folder **Always keep on this device** for offline import. Peer JSON exchanged once out of band (`show-device` → `peers add`), not auto-trusted from the cloud folder.
+
+### Copilot round-1/2 hardening (PR #8)
+- Default `folder` push/pull cursors are scoped per exchange path (`folder:<path-hash>`); explicit `--peer` unchanged.
+- Full re-exports never delete or overwrite prior `.age` objects; filenames include a content digest. Import soft-skips only pyrage “No matching keys found”; truncated/corrupt blobs stay hard errors. Filename receipts avoid re-reading known objects; `bundlesha:` receipts remain as a second key.
+- Implicit default-path creation requires the real `OneDrive - Microsoft` root; non-empty env/`--to` overrides may create freely (blank `SLACKCACHE_EXCHANGE_DIR` is ignored).
+- Push cursor advances via CAS so a mid-export `peers add` reset is preserved; pull watermarks use atomic max-bump and advance only after a clean apply.
+- `sync status` opens the archive read-only and reuses `cache_status().state_hash`.
+- Hydration probe ignores `FILE_ATTRIBUTE_UNPINNED` (retention ≠ online-only).
 
 ## 2026-11-27 — M5.1 Edge browser IndexedDB ingest
 

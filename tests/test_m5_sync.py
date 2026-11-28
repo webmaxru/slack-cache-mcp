@@ -181,11 +181,11 @@ def test_bundle_export_import_roundtrip(tmp_path: Path) -> None:
     ).fetchall()
     assert [m["text"] for m in msgs] == ["hello from A", "second from A"]
 
-    # Re-import is idempotent.
+    # Re-import is idempotent (content-sha receipts skip unchanged ciphertext).
     again = import_bundles(repo_b, identity=id_b, from_dir=folder)
     assert again["ok"]
     assert again["applied"] == 0
-    assert again["skipped"] >= 2
+    assert again.get("files_skipped_known", 0) >= 1 or again["skipped"] >= 2
 
     repo_a.close()
     repo_b.close()

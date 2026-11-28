@@ -12,13 +12,25 @@ from slack_cache_mcp.sync.bundle import (
     register_peer,
 )
 from slack_cache_mcp.sync.device import DeviceIdentity, DevicePublicInfo, load_or_create_device
+from slack_cache_mcp.sync.onedrive import (
+    EXCHANGE_DIR_ENV,
+    default_exchange_dir,
+    ensure_exchange_dir,
+    exchange_peer_key,
+    exchange_status,
+)
 from slack_cache_mcp.sync.state_hash import compute_state_hash
 
 __all__ = [
+    "EXCHANGE_DIR_ENV",
     "DeviceIdentity",
     "DevicePublicInfo",
     "compute_state_hash",
+    "default_exchange_dir",
+    "ensure_exchange_dir",
     "ensure_local_device",
+    "exchange_peer_key",
+    "exchange_status",
     "export_bundle",
     "import_bundles",
     "load_or_create_device",
